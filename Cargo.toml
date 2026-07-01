@@ -10,7 +10,7 @@ members = [
 [workspace.package]
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/splice-shell/splice-shell"
+repository = "https://github.com/decode2/splice-shell"
 
 [workspace.dependencies]
 # cookie 0.18.1, pulled by Tauri 2.11.x, is not compatible with time 0.3.52's
