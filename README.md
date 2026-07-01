@@ -50,3 +50,7 @@ Windows installers are produced under:
 ```txt
 target/release/bundle/
 ```
+
+## License
+
+Splice Shell is licensed under the [Apache License 2.0](LICENSE).

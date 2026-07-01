@@ -34,8 +34,8 @@ cargo test
 cargo check --workspace
 ```
 
-## Current limitation
+## Current status
 
-The scaffold intentionally does not implement ConPTY yet.
+Terminal hosting is implemented. Splice Shell launches a real shell through Windows ConPTY, renders output with xterm.js, sends keyboard input, and handles resize. Clipboard image extraction and adapter-routed paste are in place on top of that foundation.
 
-That is the next milestone because terminal hosting is the foundation. Image paste comes after we can launch, render, write to, and resize a real terminal process.
+See [`docs/mvp.md`](mvp.md) for the full list of what the MVP supports and what is intentionally out of scope.
