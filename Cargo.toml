@@ -15,4 +15,4 @@ repository = "https://github.com/decode2/splice-shell"
 [workspace.dependencies]
 # cookie 0.18.1, pulled by Tauri 2.11.x, is not compatible with time 0.3.52's
 # updated parsing API. Keep this pinned until Tauri/cookie resolves it upstream.
-time = "=0.3.44"
+time = "=0.3.53"
