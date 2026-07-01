@@ -161,33 +161,32 @@ fn live_pty_ctrl_c_interrupts_command_without_closing_shell() {
 #[cfg(windows)]
 #[test]
 fn conpty_default_shell_can_find_user_cli_paths_when_prefixed() {
-    let user_profile = std::env::var("USERPROFILE").expect("USERPROFILE should be set");
-    let local_app_data = std::env::var("LOCALAPPDATA").expect("LOCALAPPDATA should be set");
-    let path_prefix = [
-        format!("{user_profile}\\.local\\bin"),
-        format!("{user_profile}\\scoop\\shims"),
-        format!("{user_profile}\\scoop\\apps\\nodejs\\current\\bin"),
-        format!("{local_app_data}\\agy\\bin"),
-    ]
-    .join(";");
+    // A prefixed PATH must be honored by the ConPTY shell so that CLIs the user
+    // has installed (Claude, Codex, ...) resolve. Keep the test hermetic: drop a
+    // stand-in executable in a temp directory, prefix PATH with that directory,
+    // and assert the shell resolves it. This proves PATH prefixing works through
+    // the ConPTY boundary without depending on any real CLI being installed.
+    let stub_dir = std::env::temp_dir().join(format!("splice-pty-path-{}", std::process::id()));
+    std::fs::create_dir_all(&stub_dir).expect("stub PATH directory should be creatable");
+    std::fs::write(
+        stub_dir.join("splice-fake-cli.cmd"),
+        "@echo splice-fake-cli\r\n",
+    )
+    .expect("stub CLI should be writable");
+
+    let path_prefix = stub_dir.display().to_string();
     let output = splice_pty::run_conpty_command_with_input(
         "cmd.exe",
         &["/D", "/K", &format!("set PATH={path_prefix};%PATH%")],
-        "where claude\r\nwhere codex\r\nwhere agy\r\nexit\r\n",
+        "where splice-fake-cli\r\nexit\r\n",
         splice_pty::TerminalSize::new(100, 30).expect("valid terminal size"),
     )
     .expect("ConPTY shell should run with prefixed PATH");
 
+    let _ = std::fs::remove_dir_all(&stub_dir);
+
     assert!(
-        output.contains("claude.exe"),
-        "expected prefixed PATH to find claude, got: {output:?}"
-    );
-    assert!(
-        output.contains("codex"),
-        "expected prefixed PATH to find codex, got: {output:?}"
-    );
-    assert!(
-        output.contains("agy.exe"),
-        "expected prefixed PATH to find agy, got: {output:?}"
+        output.contains("splice-fake-cli.cmd"),
+        "expected prefixed PATH to resolve the stub CLI, got: {output:?}"
     );
 }
