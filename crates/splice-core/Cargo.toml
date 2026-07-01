@@ -1,0 +1,9 @@
+[package]
+name = "splice-core"
+version = "0.1.0"
+description = "Core domain types for Splice Shell"
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+
+[dependencies]

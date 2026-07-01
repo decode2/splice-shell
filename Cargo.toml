@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+  "apps/desktop/src-tauri",
+  "crates/splice-core",
+  "crates/splice-pty",
+  "crates/splice-clipboard"
+]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/splice-shell/splice-shell"
+
+[workspace.dependencies]
+# cookie 0.18.1, pulled by Tauri 2.11.x, is not compatible with time 0.3.52's
+# updated parsing API. Keep this pinned until Tauri/cookie resolves it upstream.
+time = "=0.3.44"
