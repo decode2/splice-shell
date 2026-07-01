@@ -194,7 +194,7 @@ mod windows_conpty {
         ffi::c_void,
         mem::size_of,
         ptr::null_mut,
-        sync::Mutex,
+        sync::{Arc, Mutex},
         thread::{self, JoinHandle},
         time::Duration,
     };
@@ -230,7 +230,13 @@ mod windows_conpty {
     }
 
     struct PtySessionInner {
-        input_write: OwnedHandle,
+        // Wrapped in `Arc` so `write`/`interrupt` can clone a strong
+        // reference while holding the session lock, then release the lock
+        // before performing the blocking `WriteFile` call. This keeps the
+        // handle alive (no use-after-close) even if `close()` runs
+        // concurrently and drops `PtySessionInner`, without forcing
+        // `interrupt()` to wait behind a blocked `write()`.
+        input_write: Arc<OwnedHandle>,
         process: OwnedHandle,
         _process_thread: OwnedHandle,
         conpty: OwnedPseudoConsole,
@@ -273,7 +279,7 @@ mod windows_conpty {
 
             Ok(Self {
                 inner: Mutex::new(Some(PtySessionInner {
-                    input_write: handles.input_write,
+                    input_write: Arc::new(handles.input_write),
                     process: handles.process,
                     _process_thread: handles.process_thread,
                     conpty: handles.conpty,
@@ -285,30 +291,43 @@ mod windows_conpty {
         }
 
         pub fn write(&self, data: &str) -> Result<(), PtyError> {
-            let guard = self
-                .inner
-                .lock()
-                .map_err(|_| PtyError::Io(std::io::Error::other("PTY session lock poisoned")))?;
-            let inner = guard.as_ref().ok_or(PtyError::SessionClosed)?;
-            if !inner.is_running() {
-                return Err(PtyError::SessionClosed);
-            }
+            // Hold the session lock only long enough to read out the input
+            // pipe handle; the blocking `WriteFile` call runs after the lock
+            // is released so a hung child cannot stall other session
+            // operations (e.g. `interrupt`) that need the same lock.
+            let input_write = {
+                let guard = self.inner.lock().map_err(|_| {
+                    PtyError::Io(std::io::Error::other("PTY session lock poisoned"))
+                })?;
+                let inner = guard.as_ref().ok_or(PtyError::SessionClosed)?;
+                if !inner.is_running() {
+                    return Err(PtyError::SessionClosed);
+                }
 
-            write_all(inner.input_write.raw(), data.as_bytes())
+                Arc::clone(&inner.input_write)
+            };
+
+            write_all(input_write.raw(), data.as_bytes())
         }
 
         pub fn interrupt(&self) -> Result<(), PtyError> {
-            let guard = self
-                .inner
-                .lock()
-                .map_err(|_| PtyError::Io(std::io::Error::other("PTY session lock poisoned")))?;
-            let inner = guard.as_ref().ok_or(PtyError::SessionClosed)?;
-            if !inner.is_running() {
-                return Err(PtyError::SessionClosed);
-            }
+            // Same rationale as `write`: release the session lock before the
+            // blocking pipe write and the console-attach dance below, so a
+            // hung child's blocked `write()` cannot also block `interrupt()`.
+            let (input_write, root_process_id) = {
+                let guard = self.inner.lock().map_err(|_| {
+                    PtyError::Io(std::io::Error::other("PTY session lock poisoned"))
+                })?;
+                let inner = guard.as_ref().ok_or(PtyError::SessionClosed)?;
+                if !inner.is_running() {
+                    return Err(PtyError::SessionClosed);
+                }
 
-            let input_result = write_all(inner.input_write.raw(), b"\x03");
-            let signal_result = send_console_interrupt(inner.root_process_id);
+                (Arc::clone(&inner.input_write), inner.root_process_id)
+            };
+
+            let input_result = write_all(input_write.raw(), b"\x03");
+            let signal_result = send_console_interrupt(root_process_id);
 
             match (input_result, signal_result) {
                 (Ok(()), _) | (_, Ok(())) => Ok(()),
@@ -515,16 +534,24 @@ mod windows_conpty {
         let mut command_line = command_line(program, args)?;
         let mut input_read = HANDLE::default();
         let mut input_write = HANDLE::default();
+
+        unsafe {
+            CreatePipe(&mut input_read, &mut input_write, None, 0)?;
+        }
+
+        // Wrap the first pipe pair immediately so a failure from the second
+        // `CreatePipe` call below closes them via `Drop` instead of leaking
+        // the raw handles.
+        let input_read = OwnedHandle::new(input_read);
+        let input_write = OwnedHandle::new(input_write);
+
         let mut output_read = HANDLE::default();
         let mut output_write = HANDLE::default();
 
         unsafe {
-            CreatePipe(&mut input_read, &mut input_write, None, 0)?;
             CreatePipe(&mut output_read, &mut output_write, None, 0)?;
         }
 
-        let input_read = OwnedHandle::new(input_read);
-        let input_write = OwnedHandle::new(input_write);
         let output_read = OwnedHandle::new(output_read);
         let output_write = OwnedHandle::new(output_write);
 
@@ -750,6 +777,27 @@ mod windows_conpty {
                     None,
                     &mut attribute_list_size,
                 )?;
+            }
+
+            let mut startup_info = STARTUPINFOEXW::default();
+            startup_info.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+            startup_info.StartupInfo.hStdInput.0 = null_mut();
+            startup_info.StartupInfo.hStdOutput.0 = null_mut();
+            startup_info.StartupInfo.hStdError.0 = null_mut();
+            startup_info.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
+            startup_info.lpAttributeList = attribute_list;
+
+            // Construct `Self` as soon as the attribute list is initialized
+            // (before `UpdateProcThreadAttribute`) so that `Drop` runs
+            // `DeleteProcThreadAttributeList` even if the update call below
+            // fails. Otherwise an early `?` return would leak the list's
+            // heap allocation and its OS-side registration.
+            let attribute_list_owner = Self {
+                _storage: storage,
+                startup_info,
+            };
+
+            unsafe {
                 UpdateProcThreadAttribute(
                     attribute_list,
                     0,
@@ -761,18 +809,7 @@ mod windows_conpty {
                 )?;
             }
 
-            let mut startup_info = STARTUPINFOEXW::default();
-            startup_info.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
-            startup_info.StartupInfo.hStdInput.0 = null_mut();
-            startup_info.StartupInfo.hStdOutput.0 = null_mut();
-            startup_info.StartupInfo.hStdError.0 = null_mut();
-            startup_info.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
-            startup_info.lpAttributeList = attribute_list;
-
-            Ok(Self {
-                _storage: storage,
-                startup_info,
-            })
+            Ok(attribute_list_owner)
         }
 
         fn startup_info_mut(&mut self) -> &mut STARTUPINFOEXW {
@@ -961,6 +998,15 @@ mod windows_conpty {
     }
 
     unsafe impl Send for OwnedHandle {}
+
+    // Needed so `PtySessionInner.input_write` can be `Arc<OwnedHandle>`
+    // (`write`/`interrupt` clone the `Arc` across threads before releasing
+    // the session lock; see Finding 4). Sound because `raw()` only hands out
+    // a `Copy` `HANDLE` behind `&self` and the Win32 APIs used on it
+    // (`WriteFile`) are safe to call concurrently from multiple threads on
+    // the same handle; the only exclusive access, `Drop`/`into_raw`, already
+    // requires `&mut self`/`self` and is governed by `Arc`'s own refcounting.
+    unsafe impl Sync for OwnedHandle {}
 
     struct OwnedPseudoConsole(HPCON);
 

@@ -176,8 +176,10 @@ fn pty_resize(state: State<'_, PtyState>, cols: u16, rows: u16) -> Result<(), St
     with_pty_session(&state, |session| session.resize(size))
 }
 
+// Liveness poll only; real PTY output is streamed via the `pty-output`
+// event, not returned from this command.
 #[tauri::command]
-fn pty_read(state: State<'_, PtyState>) -> Result<Vec<String>, String> {
+fn pty_read(state: State<'_, PtyState>) -> Result<(), String> {
     {
         let mut guard = state
             .session
@@ -197,7 +199,7 @@ fn pty_read(state: State<'_, PtyState>) -> Result<Vec<String>, String> {
         }
     }
 
-    Ok(Vec::new())
+    Ok(())
 }
 
 #[tauri::command]

@@ -46,7 +46,7 @@ export function resizePty(size: { cols: number; rows: number }) {
 }
 
 export function readPty() {
-  return invoke<string[]>("pty_read");
+  return invoke<void>("pty_read");
 }
 
 export function killPty() {
