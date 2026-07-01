@@ -218,7 +218,9 @@ export function TerminalView({
       container: terminalElement,
       onInput: sendTerminalInput,
       onResize: (size) => {
-        void handlersRef.current.onResize(size);
+        void Promise.resolve(handlersRef.current.onResize(size)).catch((error) => {
+          terminal.write(`\r\nPTY resize failed: ${String(error)}\r\n`);
+        });
       },
     });
 

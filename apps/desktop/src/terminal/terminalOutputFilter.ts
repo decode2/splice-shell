@@ -8,6 +8,12 @@ export type TerminalOutputFilter = {
   flush: () => TerminalOutputAction[];
 };
 
+// Pass-through seam: PTY output is currently forwarded to xterm verbatim, with no
+// interpretation of ANSI/DEC sequences (alternate screen, synchronized output, etc.).
+// The write/flush contract exists so a future filter can buffer partial escape
+// sequences split across chunks and flush any held-back tail on teardown, without
+// changing the call sites in TerminalView. Until such filtering is needed, both
+// operations are no-ops beyond wrapping/unwrapping the chunk.
 export function createTerminalOutputFilter(): TerminalOutputFilter {
   return {
     write: parseTerminalOutputActions,
