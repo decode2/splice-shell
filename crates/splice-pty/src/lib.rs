@@ -252,9 +252,23 @@ mod windows_conpty {
             let handles = spawn_process(program, args, size)?;
             let output_reader = SendHandle(handles.output_read.into_raw());
             let reader = thread::spawn(move || {
+                // Accumulate raw bytes and only decode up to a UTF-8 character
+                // boundary, holding back any multibyte sequence split across a
+                // chunk boundary until the next read completes it.
+                let mut pending: Vec<u8> = Vec::new();
                 let _ = read_chunks_from_send(output_reader, |bytes| {
-                    on_output(String::from_utf8_lossy(bytes).into_owned());
+                    pending.extend_from_slice(bytes);
+                    let split = pending.len() - incomplete_utf8_tail_len(&pending);
+                    if split > 0 {
+                        on_output(String::from_utf8_lossy(&pending[..split]).into_owned());
+                        pending.drain(..split);
+                    }
                 });
+                // Flush trailing bytes at EOF; an incomplete sequence here will
+                // never complete, so decode it lossily rather than drop it.
+                if !pending.is_empty() {
+                    on_output(String::from_utf8_lossy(&pending).into_owned());
+                }
             });
 
             Ok(Self {
@@ -883,6 +897,41 @@ mod windows_conpty {
         Ok(())
     }
 
+    /// Number of trailing bytes that begin an as-yet-incomplete UTF-8 sequence.
+    ///
+    /// ConPTY output is read in fixed-size chunks, so a multibyte character can
+    /// straddle a chunk boundary. Decoding each raw chunk independently would
+    /// turn that split character into replacement characters. This returns how
+    /// many bytes at the end of `buf` must be held back until the next chunk
+    /// arrives; everything before them can be decoded now (`from_utf8_lossy`
+    /// still replaces any genuinely invalid interior bytes). Returns 0 when
+    /// `buf` ends on a character boundary or the trailing bytes are invalid
+    /// rather than incomplete. The hold-back is at most 3 bytes.
+    fn incomplete_utf8_tail_len(buf: &[u8]) -> usize {
+        let max_lookback = buf.len().min(3);
+        for back in 1..=max_lookback {
+            let byte = buf[buf.len() - back];
+            // Skip continuation bytes (0b10xx_xxxx) to find the lead byte.
+            if byte & 0b1100_0000 == 0b1000_0000 {
+                continue;
+            }
+            let expected = if byte & 0b1000_0000 == 0 {
+                1
+            } else if byte & 0b1110_0000 == 0b1100_0000 {
+                2
+            } else if byte & 0b1111_0000 == 0b1110_0000 {
+                3
+            } else if byte & 0b1111_1000 == 0b1111_0000 {
+                4
+            } else {
+                // Not a valid lead byte: let lossy decoding handle it now.
+                return 0;
+            };
+            return if back < expected { back } else { 0 };
+        }
+        0
+    }
+
     struct OwnedHandle(HANDLE);
 
     impl OwnedHandle {
@@ -1005,6 +1054,35 @@ mod windows_conpty {
                 .collect::<Vec<_>>();
 
             assert_eq!(names, vec!["node.exe", "codex.exe", "cmd.exe"]);
+        }
+
+        #[test]
+        fn incomplete_utf8_tail_len_holds_back_split_two_byte_sequence() {
+            // "é" is 0xC3 0xA9. A lone lead byte must be held back.
+            assert_eq!(incomplete_utf8_tail_len(&[b'a', 0xC3]), 1);
+            // The completed sequence holds nothing back.
+            assert_eq!(incomplete_utf8_tail_len(&[b'a', 0xC3, 0xA9]), 0);
+        }
+
+        #[test]
+        fn incomplete_utf8_tail_len_handles_three_and_four_byte_sequences() {
+            // "€" = E2 82 AC: 1 byte present -> hold 1, 2 present -> hold 2.
+            assert_eq!(incomplete_utf8_tail_len(&[0xE2]), 1);
+            assert_eq!(incomplete_utf8_tail_len(&[0xE2, 0x82]), 2);
+            assert_eq!(incomplete_utf8_tail_len(&[0xE2, 0x82, 0xAC]), 0);
+            // "😀" = F0 9F 98 80: 3 of 4 bytes present -> hold 3.
+            assert_eq!(incomplete_utf8_tail_len(&[0xF0, 0x9F, 0x98]), 3);
+            assert_eq!(incomplete_utf8_tail_len(&[0xF0, 0x9F, 0x98, 0x80]), 0);
+        }
+
+        #[test]
+        fn incomplete_utf8_tail_len_ignores_ascii_and_invalid_tails() {
+            assert_eq!(incomplete_utf8_tail_len(b"plain ascii"), 0);
+            assert_eq!(incomplete_utf8_tail_len(&[]), 0);
+            // A stray continuation byte is invalid, not incomplete.
+            assert_eq!(incomplete_utf8_tail_len(&[b'a', 0x80]), 0);
+            // An invalid lead byte is left for lossy decoding, not held back.
+            assert_eq!(incomplete_utf8_tail_len(&[0xFF]), 0);
         }
     }
 }
