@@ -220,11 +220,17 @@ fn open_path(path: String) -> Result<(), String> {
         return Err(format!("Path does not exist: {}", path.display()));
     }
 
+    // Reveal the file in Explorer (`/select,`) instead of launching it.
+    // These paths are extracted from untrusted terminal output (including AI
+    // CLI output), and launching a path with the default handler would run
+    // shell-associated files (.exe/.bat/.ps1/.lnk) on a single click. Revealing
+    // keeps the "locate what the CLI mentioned" affordance without ever
+    // executing the target.
     Command::new("explorer.exe")
-        .arg(path)
+        .arg(format!("/select,{}", path.display()))
         .spawn()
         .map(|_| ())
-        .map_err(|error| format!("Failed to open path: {error}"))
+        .map_err(|error| format!("Failed to reveal path: {error}"))
 }
 
 fn with_pty_session<F>(state: &State<'_, PtyState>, operation: F) -> Result<(), String>
