@@ -1,0 +1,20 @@
+{
+  "name": "splice-shell",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Windows-first terminal for fluid image paste into interactive AI CLIs.",
+  "scripts": {
+    "dev": "npm --workspace apps/desktop run dev",
+    "build": "npm --workspace apps/desktop run build",
+    "preview": "npm --workspace apps/desktop run preview",
+    "tauri": "npm --workspace apps/desktop run tauri",
+    "test": "npm --workspaces run test --if-present",
+    "typecheck": "npm --workspaces run typecheck --if-present"
+  },
+  "workspaces": [
+    "apps/*"
+  ],
+  "engines": {
+    "node": ">=22"
+  }
+}

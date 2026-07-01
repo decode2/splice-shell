@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+target/
+apps/desktop/dist/
+apps/desktop/src-tauri/target/
+
+# Tauri generated assets
+apps/desktop/src-tauri/gen/
+
+# Local agent/index state
+.atl/
+.codegraph/
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
