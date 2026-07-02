@@ -74,6 +74,7 @@ fn run_ai_cli_case(case: &AiCliCase) {
         move |output| {
             let _ = sender.send(output);
         },
+        |_id| {},
     )
     .unwrap_or_else(|error| panic!("{}: shell should start: {error}", case.command));
 

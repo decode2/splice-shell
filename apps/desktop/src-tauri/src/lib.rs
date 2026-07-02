@@ -6,17 +6,24 @@ use std::{
     process::Command,
     sync::{Arc, Mutex},
 };
-use tauri::{Emitter, State};
+use tauri::{Emitter, Manager, State};
 
 const PTY_OUTPUT_EVENT: &str = "pty-output";
+const PTY_EXIT_EVENT: &str = "pty-exit";
 
 struct PtyState {
     // Commands must lock this mutex only long enough to clone the `Arc`
     // (or take it on teardown) and release the guard BEFORE calling any
     // potentially blocking `PtySession` method. Otherwise a hung child
-    // blocking `pty_write` would stall `pty_interrupt`/`pty_resize`/
-    // `pty_read` behind this lock — the same stall the library layer
-    // already eliminates internally with the identical `Arc` pattern.
+    // blocking `pty_write` would stall `pty_interrupt`/`pty_resize` behind
+    // this lock — the same stall the library layer already eliminates
+    // internally with the identical `Arc` pattern.
+    //
+    // Session death is no longer polled from the frontend. Each `PtySession`
+    // runs a waiter thread that pushes a `pty-exit` event on natural exit
+    // (see `pty_spawn`); the natural-exit path also clears this state itself
+    // (`clear_and_close_session_by_id`) so a dead session's ConPTY/pipe/job
+    // handles never linger.
     session: Mutex<Option<Arc<PtySession>>>,
 }
 
@@ -78,7 +85,7 @@ fn pty_spawn(
     rows: u16,
     program: Option<String>,
     args: Option<Vec<String>>,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let size = TerminalSize::new(cols, rows).map_err(|error| format!("{error:?}"))?;
     let command = resolve_pty_command(program, args);
     let command_args = command.args.iter().map(String::as_str).collect::<Vec<_>>();
@@ -94,18 +101,90 @@ fn pty_spawn(
         previous_session.close();
     }
 
-    let session = PtySession::spawn(&command.program, &command_args, size, move |output| {
-        let _ = app.emit(PTY_OUTPUT_EVENT, output);
-    })
+    let output_app = app.clone();
+    let cleanup_app = app.clone();
+    let exit_app = app;
+    let session = PtySession::spawn(
+        &command.program,
+        &command_args,
+        size,
+        move |output| {
+            let _ = output_app.emit(PTY_OUTPUT_EVENT, output);
+        },
+        move |id| {
+            // Natural exit: push the id to the frontend so it can decide
+            // whether to restart (it ignores stale ids).
+            let _ = exit_app.emit(PTY_EXIT_EVENT, id);
+            // Then proactively tear down the dead session's backend state so
+            // its ConPTY/pipe/job handles and reader thread do not linger if
+            // the frontend never restarts. This MUST run on a detached thread,
+            // never inline on the waiter thread that invoked this callback:
+            // `session.close()` joins that very waiter thread, so an inline
+            // call would self-join and deadlock. `clear_and_close_session_by_id`
+            // is id-scoped and `Option::take`-idempotent, so it is a harmless
+            // no-op if a newer spawn already replaced (or another path already
+            // closed) the session.
+            let cleanup_app = exit_app.clone();
+            std::thread::spawn(move || {
+                clear_and_close_session_by_id(&cleanup_app, id);
+            });
+        },
+    )
     .map_err(|error| error.to_string())?;
 
-    let mut guard = state
-        .session
-        .lock()
-        .map_err(|_| "PTY state lock poisoned".to_owned())?;
-    *guard = Some(Arc::new(session));
+    let id = session.id();
 
-    Ok(())
+    {
+        let mut guard = state
+            .session
+            .lock()
+            .map_err(|_| "PTY state lock poisoned".to_owned())?;
+        *guard = Some(Arc::new(session));
+    }
+
+    // Instant-exit race: if the child died before we stored it, its detached
+    // `clear_and_close_session_by_id(id)` cleanup already ran while
+    // `state.session` was still `None` (a no-op), and we just stored a dead
+    // session whose ConPTY/pipe/job handles and reader/waiter threads would
+    // otherwise linger until the next interaction. Now that it is stored,
+    // re-check liveness and, if it is not running, clear+close it immediately.
+    // `is_running()` only errs on a poisoned lock or an already-closed session,
+    // so a non-`Ok(true)` result is treated as dead. The teardown reuses the
+    // id-scoped, `Option::take`-idempotent `clear_and_close_session_by_id`, so
+    // a replacement spawned concurrently is never torn down, and its `close()`
+    // runs with the state lock released (no thread-join deadlock).
+    let still_running = clone_pty_session(&state)?
+        .and_then(|session| session.is_running().ok())
+        .unwrap_or(false);
+    if !still_running {
+        clear_and_close_session_by_id(&cleanup_app, id);
+    }
+
+    Ok(id)
+}
+
+/// Remove and close the stored session only if it is still the exact session
+/// with `id` that just exited, so a replacement spawned concurrently by
+/// `pty_spawn` is never torn down by a stale natural-exit path. Runs on a
+/// detached thread off the waiter thread (see `pty_spawn`); `close()` here
+/// joins the now-finished waiter and releases the dead session's handles.
+fn clear_and_close_session_by_id(app: &tauri::AppHandle, id: u64) {
+    let state = app.state::<PtyState>();
+    let session = {
+        let Ok(mut guard) = state.session.lock() else {
+            return;
+        };
+        if guard.as_ref().is_some_and(|current| current.id() == id) {
+            guard.take()
+        } else {
+            None
+        }
+    };
+    // Close outside the lock: teardown blocks on process shutdown and the
+    // reader/waiter-thread joins, and must not stall concurrent PTY commands.
+    if let Some(session) = session {
+        session.close();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,25 +261,6 @@ fn pty_interrupt(state: State<'_, PtyState>) -> Result<(), String> {
 fn pty_resize(state: State<'_, PtyState>, cols: u16, rows: u16) -> Result<(), String> {
     let size = TerminalSize::new(cols, rows).map_err(|error| format!("{error:?}"))?;
     with_pty_session(&state, |session| session.resize(size))
-}
-
-// Liveness poll only; real PTY output is streamed via the `pty-output`
-// event, not returned from this command.
-#[tauri::command]
-fn pty_read(state: State<'_, PtyState>) -> Result<(), String> {
-    let Some(session) = clone_pty_session(&state)? else {
-        return Ok(());
-    };
-
-    // Liveness check and teardown run on the clone with the state lock
-    // released, so they cannot stall other PTY commands.
-    if !session.is_running().map_err(|error| error.to_string())? {
-        clear_pty_session_if_current(&state, &session);
-        session.close();
-        return Err("PTY session closed; start a new terminal session".to_owned());
-    }
-
-    Ok(())
 }
 
 #[tauri::command]
@@ -356,7 +416,6 @@ pub fn run() {
             pty_write,
             pty_interrupt,
             pty_resize,
-            pty_read,
             pty_kill,
             open_path
         ])

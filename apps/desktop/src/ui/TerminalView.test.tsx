@@ -4,7 +4,7 @@ import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ActivePasteTargetState } from "../paste/activePasteTarget";
 import type { PastePreviewState } from "../paste/pastePreview";
-import { PTY_OUTPUT_EVENT } from "../terminal/ptyClient";
+import { PTY_EXIT_EVENT, PTY_OUTPUT_EVENT } from "../terminal/ptyClient";
 import { TerminalView } from "./TerminalView";
 
 // jsdom does not implement requestAnimationFrame. TerminalView's output scheduler
@@ -20,8 +20,8 @@ if (typeof window.cancelAnimationFrame !== "function") {
 
 type InvokeArgs = unknown;
 type InvokeMock = (command: string, args?: InvokeArgs, options?: unknown) => Promise<unknown>;
-type PtyOutputHandler = (event: { event: string; id: number; payload: unknown }) => void;
-type ListenMock = (event: string, handler: PtyOutputHandler) => Promise<() => void>;
+type PtyEventHandler = (event: { event: string; id: number; payload: unknown }) => void;
+type ListenMock = (event: string, handler: PtyEventHandler) => Promise<() => void>;
 
 const mocks = vi.hoisted(() => ({
   invoke: vi.fn<InvokeMock>(),
@@ -142,26 +142,52 @@ const idlePasteState: PastePreviewState = {
   message: "Paste preview idle",
 };
 
-let capturedOutputHandlers: PtyOutputHandler[] = [];
+let capturedOutputHandlers: PtyEventHandler[] = [];
+let capturedExitHandlers: PtyEventHandler[] = [];
+let nextSpawnId = 0;
 
 function getInvokeCallsFor(command: string) {
   return mocks.invoke.mock.calls.filter(([calledCommand]) => calledCommand === command);
 }
 
+// Emits a `pty-exit` event to the most recently registered exit handler,
+// mirroring how the Tauri backend pushes the exiting session's monotonic id.
+function emitPtyExit(sessionId: number) {
+  const exitHandler = capturedExitHandlers.at(-1);
+  act(() => {
+    exitHandler?.({ event: PTY_EXIT_EVENT, id: 0, payload: sessionId });
+  });
+}
+
+// Flush the microtask + macrotask queues so an async restart (spawnPty await +
+// finally) settles before the test inspects invoke calls.
+async function flushAsync() {
+  await act(async () => {
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
+  });
+}
+
 beforeEach(() => {
   capturedOutputHandlers = [];
+  capturedExitHandlers = [];
+  nextSpawnId = 0;
 
   mocks.invoke.mockReset();
   mocks.invoke.mockImplementation((command) => {
-    if (command === "pty_read") {
-      return Promise.resolve<string[]>([]);
+    if (command === "pty_spawn") {
+      nextSpawnId += 1;
+      return Promise.resolve(nextSpawnId);
     }
     return Promise.resolve(undefined);
   });
 
   mocks.listen.mockReset();
-  mocks.listen.mockImplementation((_event, handler) => {
-    capturedOutputHandlers.push(handler);
+  mocks.listen.mockImplementation((event, handler) => {
+    if (event === PTY_EXIT_EVENT) {
+      capturedExitHandlers.push(handler);
+    } else {
+      capturedOutputHandlers.push(handler);
+    }
     return Promise.resolve(mocks.unlisten);
   });
 
@@ -233,8 +259,14 @@ describe("TerminalView PTY lifecycle", () => {
       unmount();
     });
 
+    // The frontend no longer polls `pty_read`; liveness is pushed via
+    // `pty-exit`, so that command must never be invoked.
+    expect(getInvokeCallsFor("pty_read")).toHaveLength(0);
+
     expect(getInvokeCallsFor("pty_kill")).toHaveLength(1);
-    expect(mocks.unlisten).toHaveBeenCalledTimes(1);
+    // Two listeners are registered (pty-output and pty-exit); both are torn
+    // down on unmount.
+    expect(mocks.unlisten).toHaveBeenCalledTimes(2);
     expect(mocks.terminalDispose).toHaveBeenCalledTimes(1);
     expect(mocks.fitAddonDispose).toHaveBeenCalledTimes(1);
   });
@@ -253,7 +285,9 @@ describe("TerminalView PTY lifecycle", () => {
       expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
     });
 
-    expect(mocks.listen).toHaveBeenCalledTimes(2);
+    // Two listeners (pty-output + pty-exit) registered per mount; StrictMode
+    // mounts twice in development, so listen is called four times.
+    expect(mocks.listen).toHaveBeenCalledTimes(4);
 
     act(() => {
       unmount();
@@ -262,5 +296,246 @@ describe("TerminalView PTY lifecycle", () => {
     expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
     expect(getInvokeCallsFor("pty_kill").length).toBeGreaterThanOrEqual(1);
     expect(mocks.terminalDispose.mock.calls.length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe("TerminalView pty-exit driven restart", () => {
+  it("restarts the shell when the current session emits pty-exit", async () => {
+    render(
+      <TerminalView activePasteTargetState={readyPasteTarget} pasteState={idlePasteState} />,
+    );
+
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
+    });
+    await waitFor(() => {
+      expect(capturedExitHandlers.length).toBeGreaterThan(0);
+    });
+
+    // The first spawn resolved to id 1; an exit for id 1 is the live session.
+    emitPtyExit(1);
+
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(2);
+    });
+  });
+
+  it("ignores a stale pty-exit for an already-superseded session", async () => {
+    render(
+      <TerminalView activePasteTargetState={readyPasteTarget} pasteState={idlePasteState} />,
+    );
+
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
+    });
+
+    // Restart once so the current session id advances to 2.
+    emitPtyExit(1);
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(2);
+    });
+
+    // A late exit for the old session (id 1 < current id 2) must be ignored.
+    emitPtyExit(1);
+    await flushAsync();
+
+    expect(getInvokeCallsFor("pty_spawn")).toHaveLength(2);
+  });
+
+  it("ignores pty-exit that arrives after unmount", async () => {
+    const { unmount } = render(
+      <TerminalView activePasteTargetState={readyPasteTarget} pasteState={idlePasteState} />,
+    );
+
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
+    });
+
+    act(() => {
+      unmount();
+    });
+
+    emitPtyExit(1);
+    await flushAsync();
+
+    // Disposed: no restart spawn beyond the original.
+    expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
+  });
+
+  it("caps consecutive restarts to prevent a restart storm", async () => {
+    render(
+      <TerminalView activePasteTargetState={readyPasteTarget} pasteState={idlePasteState} />,
+    );
+
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
+    });
+
+    // Each exit for the current session (ids are sequential, so the current id
+    // equals the current spawn count) triggers one restart. With no PTY output
+    // in between, nothing resets the counter, so the cap must halt restarts.
+    let lastSpawnCount = getInvokeCallsFor("pty_spawn").length;
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      emitPtyExit(lastSpawnCount);
+      await flushAsync();
+      const spawnCount = getInvokeCallsFor("pty_spawn").length;
+      if (spawnCount === lastSpawnCount) {
+        break;
+      }
+      lastSpawnCount = spawnCount;
+    }
+
+    // Some restarts happened, but the cap kept them bounded (initial + at most
+    // a handful of restarts) rather than spinning forever.
+    expect(lastSpawnCount).toBeGreaterThan(1);
+    expect(lastSpawnCount).toBeLessThanOrEqual(6);
+  });
+
+  it("does not reset the restart-storm cap for output that arrives before the minimum healthy uptime", async () => {
+    // Pin the clock so every spawn and its output share the same timestamp:
+    // the session's uptime is always 0, i.e. below MIN_HEALTHY_UPTIME_MS. A
+    // shell that prints a banner THEN dies on every launch must NOT get its
+    // storm counter reset by that pre-uptime output, otherwise the cap never
+    // trips and restarts spin forever.
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    try {
+      render(
+        <TerminalView activePasteTargetState={readyPasteTarget} pasteState={idlePasteState} />,
+      );
+
+      await waitFor(() => {
+        expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
+      });
+      await waitFor(() => {
+        expect(capturedOutputHandlers.length).toBeGreaterThan(0);
+        expect(capturedExitHandlers.length).toBeGreaterThan(0);
+      });
+
+      let lastSpawnCount = getInvokeCallsFor("pty_spawn").length;
+      for (let attempt = 0; attempt < 12; attempt += 1) {
+        const outputHandler = capturedOutputHandlers.at(-1);
+        act(() => {
+          outputHandler?.({
+            event: PTY_OUTPUT_EVENT,
+            id: lastSpawnCount,
+            payload: "boot banner\r\n",
+          });
+        });
+        emitPtyExit(lastSpawnCount);
+        await flushAsync();
+        const spawnCount = getInvokeCallsFor("pty_spawn").length;
+        if (spawnCount === lastSpawnCount) {
+          break;
+        }
+        lastSpawnCount = spawnCount;
+      }
+
+      // Output that arrived before the min uptime did not reset the counter, so
+      // the cap halted the storm (initial + at most a handful of restarts).
+      expect(lastSpawnCount).toBeGreaterThan(1);
+      expect(lastSpawnCount).toBeLessThanOrEqual(6);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it("restarts once when a session's pty-exit arrives before its spawn is recorded", async () => {
+    let resolveSpawn1: (() => void) | undefined;
+    let spawnId = 0;
+    mocks.invoke.mockImplementation((command) => {
+      if (command === "pty_spawn") {
+        spawnId += 1;
+        const thisId = spawnId;
+        if (thisId === 1) {
+          // Defer session 1's spawn so its pty-exit can land BEFORE the
+          // frontend records currentSessionId = 1.
+          return new Promise<number>((resolve) => {
+            resolveSpawn1 = () => resolve(thisId);
+          });
+        }
+        return Promise.resolve(thisId);
+      }
+      return Promise.resolve(undefined);
+    });
+
+    render(
+      <TerminalView activePasteTargetState={readyPasteTarget} pasteState={idlePasteState} />,
+    );
+
+    // Listeners are registered before the (still-pending) first spawn.
+    await waitFor(() => {
+      expect(capturedExitHandlers.length).toBeGreaterThan(0);
+    });
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
+    });
+
+    // Backend reports session 1 died instantly — BEFORE spawnPty resolved, so
+    // currentSessionId is still undefined. The exit must be stashed, not dropped.
+    emitPtyExit(1);
+    await flushAsync();
+    expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
+
+    // The spawn now resolves and records id 1; the stashed exit drives exactly
+    // one restart (spawn #2), not a storm.
+    await act(async () => {
+      resolveSpawn1?.();
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    });
+
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(2);
+    });
+    await flushAsync();
+    expect(getInvokeCallsFor("pty_spawn")).toHaveLength(2);
+  });
+
+  it("coalesces a pty-exit that arrives mid-restart into exactly one more restart", async () => {
+    let resolveDeferredSpawn: (() => void) | undefined;
+    let spawnId = 0;
+    mocks.invoke.mockImplementation((command) => {
+      if (command === "pty_spawn") {
+        spawnId += 1;
+        const thisId = spawnId;
+        if (spawnId === 1) {
+          return Promise.resolve(thisId);
+        }
+        // Defer the first restart's spawn so an exit can land mid-flight.
+        return new Promise<number>((resolve) => {
+          resolveDeferredSpawn = () => resolve(thisId);
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    render(
+      <TerminalView activePasteTargetState={readyPasteTarget} pasteState={idlePasteState} />,
+    );
+
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
+    });
+
+    // First exit starts a restart whose spawn (#2) is deferred.
+    emitPtyExit(1);
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(2);
+    });
+
+    // A second exit for the still-current session lands while the restart is
+    // in flight; it must be coalesced, not dropped.
+    emitPtyExit(1);
+    await flushAsync();
+
+    // Resolving the deferred spawn finishes the first restart; the coalesced
+    // pending exit then drives exactly one additional restart (spawn #3).
+    await act(async () => {
+      resolveDeferredSpawn?.();
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    });
+
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(3);
+    });
   });
 });

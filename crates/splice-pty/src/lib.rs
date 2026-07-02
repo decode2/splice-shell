@@ -117,16 +117,22 @@ pub struct PtySession;
 
 #[cfg(not(windows))]
 impl PtySession {
-    pub fn spawn<F>(
+    pub fn spawn<F, G>(
         _program: &str,
         _args: &[&str],
         _size: TerminalSize,
         _on_output: F,
+        _on_exit: G,
     ) -> Result<Self, PtyError>
     where
         F: FnMut(String) + Send + 'static,
+        G: FnOnce(u64) + Send + 'static,
     {
         Err(PtyError::UnsupportedPlatform)
+    }
+
+    pub fn id(&self) -> u64 {
+        0
     }
 
     pub fn write(&self, _data: &str) -> Result<(), PtyError> {
@@ -194,14 +200,19 @@ mod windows_conpty {
         ffi::c_void,
         mem::size_of,
         ptr::null_mut,
-        sync::{Arc, Mutex},
+        sync::{
+            atomic::{AtomicBool, AtomicU64, Ordering},
+            Arc, Mutex,
+        },
         thread::{self, JoinHandle},
         time::Duration,
     };
     use windows::{
         core::{PCWSTR, PWSTR},
         Win32::{
-            Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE},
+            Foundation::{
+                CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, INVALID_HANDLE_VALUE,
+            },
             Storage::FileSystem::{ReadFile, WriteFile},
             System::{
                 Console::{
@@ -220,7 +231,7 @@ mod windows_conpty {
                 },
                 Pipes::CreatePipe,
                 Threading::{
-                    CreateProcessW, DeleteProcThreadAttributeList,
+                    CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess,
                     InitializeProcThreadAttributeList, ResumeThread, TerminateProcess,
                     UpdateProcThreadAttribute, WaitForSingleObject, CREATE_SUSPENDED,
                     CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
@@ -231,8 +242,32 @@ mod windows_conpty {
         },
     };
 
+    /// Process-wide monotonic source of `PtySession` ids. Assigned at spawn
+    /// via `fetch_add`, exposed through `PtySession::id()`, echoed back from
+    /// the Tauri `pty_spawn` command, and carried in the `pty-exit` event
+    /// payload so the frontend can distinguish a live session's exit from a
+    /// stale (already-superseded) one. Starts at 1 so 0 stays available as a
+    /// sentinel for callers that need one.
+    static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
+
     pub struct PtySession {
         inner: Mutex<Option<PtySessionInner>>,
+        // Published `true` by `close()` BEFORE it terminates the child, so the
+        // per-session waiter thread — when its wait is released by that
+        // teardown rather than by the child exiting on its own — suppresses
+        // the natural-exit `on_exit` callback. Stored OUTSIDE `inner` on
+        // purpose: the waiter must be able to read it without ever locking the
+        // session mutex, which keeps the waiter off `inner` entirely and makes
+        // a lock cycle with `close()` impossible.
+        closing: Arc<AtomicBool>,
+        // Join handle for this session's waiter thread. `close()` joins it (via
+        // `Option::take`, so it is idempotent across `close()`/`Drop`) so
+        // neither the thread nor the process handle it waits on outlives the
+        // session. Kept outside `inner` so the join never runs while the
+        // session lock is held.
+        waiter: Mutex<Option<JoinHandle<()>>>,
+        // Monotonic id assigned at spawn (see `SESSION_COUNTER`).
+        id: u64,
     }
 
     struct PtySessionInner {
@@ -260,16 +295,53 @@ mod windows_conpty {
     }
 
     impl PtySession {
-        pub fn spawn<F>(
+        pub fn spawn<F, G>(
             program: &str,
             args: &[&str],
             size: TerminalSize,
             mut on_output: F,
+            on_exit: G,
         ) -> Result<Self, PtyError>
         where
             F: FnMut(String) + Send + 'static,
+            G: FnOnce(u64) + Send + 'static,
         {
             let handles = spawn_process(program, args, size)?;
+            let id = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+            // Start the exit waiter only AFTER `spawn_process` returned `Ok`,
+            // so its early resume-failure path (which terminates the child and
+            // returns `Err`) never leaves a waiter parked on a handle that will
+            // never be observed by a live session. Duplicate the child process
+            // handle into an independent `OwnedHandle` and MOVE it into the
+            // waiter thread: the waiter is its sole owner and closes it when it
+            // ends, so this handle is deliberately NOT stored in
+            // `PtySessionInner` (exactly one owner).
+            let closing = Arc::new(AtomicBool::new(false));
+            let closing_for_waiter = Arc::clone(&closing);
+            let waiter_process = duplicate_process_handle(handles.process.raw())?;
+            let waiter_handle = SendHandle(waiter_process.into_raw());
+            let waiter = thread::spawn(move || {
+                // Sole owner of the duplicated process handle; dropped (and
+                // thus `CloseHandle`d) when this thread ends. This closure
+                // captures only lightweight data (`id`, an `Arc<AtomicBool>`,
+                // the duplicated handle, and `on_exit`) — never `inner` and
+                // never an `Arc<PtySession>` — so it can never form a lock
+                // cycle with `close()`.
+                let process = OwnedHandle::new(waiter_handle.into_inner());
+                unsafe {
+                    WaitForSingleObject(process.raw(), INFINITE);
+                }
+                // Only a NATURAL exit fires the callback. If `close()`
+                // published `closing` before terminating the child, this wait
+                // was released by that intentional teardown, so suppress
+                // `on_exit` (no spurious frontend restart). SeqCst pairs with
+                // the SeqCst store in `close()`.
+                if !closing_for_waiter.load(Ordering::SeqCst) {
+                    on_exit(id);
+                }
+            });
+
             let output_reader = SendHandle(handles.output_read.into_raw());
             let reader = thread::spawn(move || {
                 // Accumulate raw bytes and only decode up to a UTF-8 character
@@ -302,7 +374,16 @@ mod windows_conpty {
                     root_process_name: program.to_owned(),
                     job: handles.job,
                 })),
+                closing,
+                waiter: Mutex::new(Some(waiter)),
+                id,
             })
+        }
+
+        /// Monotonic id assigned to this session at spawn. Stable for the
+        /// session's lifetime and carried in the `pty-exit` event payload.
+        pub fn id(&self) -> u64 {
+            self.id
         }
 
         pub fn write(&self, data: &str) -> Result<(), PtyError> {
@@ -370,20 +451,6 @@ mod windows_conpty {
             Ok(inner.is_running())
         }
 
-        pub fn wait(&self) -> Result<(), PtyError> {
-            let guard = self
-                .inner
-                .lock()
-                .map_err(|_| PtyError::Io(std::io::Error::other("PTY session lock poisoned")))?;
-            let inner = guard.as_ref().ok_or(PtyError::SessionClosed)?;
-
-            unsafe {
-                WaitForSingleObject(inner.process.raw(), INFINITE);
-            }
-
-            Ok(())
-        }
-
         pub fn active_process_name(&self) -> Result<String, PtyError> {
             let guard = self
                 .inner
@@ -411,6 +478,15 @@ mod windows_conpty {
         }
 
         pub fn close(&self) {
+            // Publish the closing intent BEFORE any teardown so the waiter
+            // thread, when its wait is released by the `TerminateProcess`
+            // below, observes it and suppresses the natural-exit callback.
+            // SeqCst pairs with the waiter's SeqCst load. Must run at the very
+            // top, before `terminate_process_tree`/`TerminateProcess` and the
+            // job drop, otherwise the waiter could wake and fire `on_exit`
+            // during teardown.
+            self.closing.store(true, Ordering::SeqCst);
+
             if let Ok(mut guard) = self.inner.lock() {
                 if let Some(mut inner) = guard.take() {
                     unsafe {
@@ -442,6 +518,21 @@ mod windows_conpty {
                     if let Some(reader) = inner.reader.take() {
                         let _ = reader.join();
                     }
+                }
+            }
+
+            // Join the waiter AFTER releasing the inner lock so neither the
+            // thread nor the duplicated process handle it owns outlives the
+            // session. Deadlock-free: the waiter's wait was released by the
+            // `TerminateProcess` above (or the child already exited), and the
+            // waiter never touches `inner`, so this join cannot cycle on the
+            // session lock. Idempotent via `Option::take`, matching
+            // `close()`/`Drop`. INVARIANT: `close()` is never called from the
+            // waiter thread itself (the waiter holds no `Arc<PtySession>`), so
+            // this can never self-join.
+            if let Ok(mut waiter_guard) = self.waiter.lock() {
+                if let Some(waiter) = waiter_guard.take() {
+                    let _ = waiter.join();
                 }
             }
         }
@@ -683,6 +774,29 @@ mod windows_conpty {
             conpty,
             job,
         })
+    }
+
+    /// Duplicates the child process handle into an independent, owned handle
+    /// the waiter thread can block on with `WaitForSingleObject` without racing
+    /// the main session handle stored in `PtySessionInner` (which `close()`
+    /// may terminate and drop concurrently). `DUPLICATE_SAME_ACCESS` copies the
+    /// source access rights, which include `SYNCHRONIZE`, so the duplicate is
+    /// waitable. Both source and target process are the current process.
+    fn duplicate_process_handle(process: HANDLE) -> Result<OwnedHandle, PtyError> {
+        let mut duplicate = HANDLE::default();
+        unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                process,
+                GetCurrentProcess(),
+                &mut duplicate,
+                0,
+                false,
+                DUPLICATE_SAME_ACCESS,
+            )?;
+        }
+
+        Ok(OwnedHandle::new(duplicate))
     }
 
     /// Creates a Job Object configured with

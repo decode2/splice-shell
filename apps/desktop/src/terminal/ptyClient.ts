@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
 export const PTY_OUTPUT_EVENT = "pty-output";
+export const PTY_EXIT_EVENT = "pty-exit";
 
 export type PtyLaunchCommand = {
   program: string;
@@ -11,6 +12,15 @@ export function isPtyOutputPayload(payload: unknown): payload is string {
   return typeof payload === "string";
 }
 
+// The backend `pty-exit` event carries the exiting session's monotonic id
+// (a number). The frontend compares it against the current session id to
+// ignore stale exits from already-superseded sessions.
+export function isPtyExitPayload(payload: unknown): payload is number {
+  return typeof payload === "number";
+}
+
+// Resolves to the newly spawned session's monotonic id, which the caller
+// records so it can match later `pty-exit` events against the live session.
 export function spawnPty({
   cols,
   rows,
@@ -20,7 +30,7 @@ export function spawnPty({
   rows: number;
   command?: PtyLaunchCommand;
 }) {
-  return invoke<void>("pty_spawn", {
+  return invoke<number>("pty_spawn", {
     cols,
     rows,
     program: command?.program,
@@ -43,10 +53,6 @@ export function resizePty(size: { cols: number; rows: number }) {
     cols: size.cols,
     rows: size.rows,
   });
-}
-
-export function readPty() {
-  return invoke<void>("pty_read");
 }
 
 export function killPty() {

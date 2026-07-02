@@ -47,6 +47,7 @@ fn live_pty_session_writes_input_and_streams_output() {
         move |output| {
             let _ = sender.send(output);
         },
+        |_id| {},
     )
     .expect("live ConPTY session should start");
 
@@ -84,6 +85,7 @@ fn live_pty_session_forwards_arrow_up_to_shell_history() {
         move |output| {
             let _ = sender.send(output);
         },
+        |_id| {},
     )
     .expect("live ConPTY session should start");
 
@@ -127,6 +129,7 @@ fn live_pty_ctrl_c_interrupts_command_without_closing_shell() {
         move |output| {
             let _ = sender.send(output);
         },
+        |_id| {},
     )
     .expect("live ConPTY session should start");
 
@@ -227,6 +230,7 @@ fn live_pty_session_kills_grandchild_process_tree_on_close() {
         move |output| {
             let _ = sender.send(output);
         },
+        |_id| {},
     )
     .expect("live ConPTY session should start");
 
@@ -320,6 +324,7 @@ fn pty_spawn_close_cycles_do_not_leak_process_handles() {
             &["/D", "/K"],
             splice_pty::TerminalSize::new(80, 24).expect("valid terminal size"),
             |_output| {},
+            |_id| {},
         )
         .expect("PTY session should spawn for the handle-leak regression test");
         session.close();
@@ -358,6 +363,144 @@ fn pty_spawn_close_cycles_do_not_leak_process_handles() {
         "expected process handle count to stay within {HANDLE_COUNT_SLACK} of baseline \
          ({baseline}) after {ITERATIONS} PtySession spawn+close cycles, got {final_count} \
          (delta {}); this indicates PtySession::close()/Drop is leaking OS handles",
+        final_count.saturating_sub(baseline)
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn waiter_thread_fires_on_exit_when_child_exits_naturally() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    // A child that exits on its own must drive the per-session waiter thread
+    // to invoke `on_exit` with this session's id — the backend-push that
+    // replaces the old frontend liveness poll.
+    let (exit_tx, exit_rx) = mpsc::channel::<u64>();
+    let session = splice_pty::PtySession::spawn(
+        "cmd.exe",
+        &["/D", "/C", "exit"],
+        splice_pty::TerminalSize::new(80, 24).expect("valid terminal size"),
+        |_output| {},
+        move |id| {
+            let _ = exit_tx.send(id);
+        },
+    )
+    .expect("short-lived ConPTY session should start");
+
+    let session_id = session.id();
+
+    let exited_id = exit_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("waiter thread should invoke on_exit after the child exits naturally");
+
+    assert_eq!(
+        exited_id, session_id,
+        "on_exit must receive the exiting session's monotonic id"
+    );
+
+    session.close();
+}
+
+#[cfg(windows)]
+#[test]
+fn intentional_close_suppresses_on_exit_callback() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    // A `cmd /D /K` shell waits for input and never exits on its own, so the
+    // only thing that can release the waiter is `close()`'s TerminateProcess.
+    // Because `close()` publishes `closing = true` *before* terminating the
+    // child, the waiter must observe it and suppress `on_exit`: an intentional
+    // teardown is not a natural exit and must not trigger a frontend restart.
+    let fired = Arc::new(AtomicBool::new(false));
+    let fired_in_callback = Arc::clone(&fired);
+    let session = splice_pty::PtySession::spawn(
+        "cmd.exe",
+        &["/D", "/K"],
+        splice_pty::TerminalSize::new(80, 24).expect("valid terminal size"),
+        |_output| {},
+        move |_id| {
+            fired_in_callback.store(true, Ordering::SeqCst);
+        },
+    )
+    .expect("live ConPTY session should start");
+
+    // Let the shell come fully up so the waiter is parked in its wait, then
+    // tear the session down intentionally.
+    std::thread::sleep(Duration::from_millis(300));
+    session.close();
+
+    // `close()` joins the waiter before returning, so by now the waiter has
+    // run to completion and either fired or suppressed the callback.
+    assert!(
+        !fired.load(Ordering::SeqCst),
+        "intentional close() must suppress the natural-exit on_exit callback"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn natural_exit_spawn_close_cycles_do_not_leak_handles_or_threads() {
+    // Natural-exit variant of `pty_spawn_close_cycles_do_not_leak_process_handles`.
+    // The waiter thread duplicates the child process handle and waits on it;
+    // `close()`/`Drop` must join the waiter and release that duplicated handle
+    // every cycle. If the waiter thread or its handle ever leaks, this
+    // process's open-handle count grows across many natural-exit cycles.
+    use std::sync::mpsc;
+    use std::time::Duration;
+    use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+
+    fn handle_count() -> u32 {
+        let mut count: u32 = 0;
+        unsafe {
+            GetProcessHandleCount(GetCurrentProcess(), &mut count)
+                .expect("GetProcessHandleCount should succeed for the current process");
+        }
+        count
+    }
+
+    fn spawn_wait_natural_exit_and_close() {
+        let (exit_tx, exit_rx) = mpsc::channel::<u64>();
+        let session = splice_pty::PtySession::spawn(
+            "cmd.exe",
+            &["/D", "/C", "exit"],
+            splice_pty::TerminalSize::new(80, 24).expect("valid terminal size"),
+            |_output| {},
+            move |id| {
+                let _ = exit_tx.send(id);
+            },
+        )
+        .expect("PTY session should spawn for the natural-exit handle-leak test");
+
+        // Wait for the natural exit so the waiter has fired `on_exit` and is
+        // finishing; then `close()` must join it and free its handle.
+        let _ = exit_rx.recv_timeout(Duration::from_secs(10));
+        session.close();
+    }
+
+    const WARMUP_ITERATIONS: usize = 5;
+    for _ in 0..WARMUP_ITERATIONS {
+        spawn_wait_natural_exit_and_close();
+    }
+
+    let baseline = handle_count();
+
+    const ITERATIONS: usize = 40;
+    for _ in 0..ITERATIONS {
+        spawn_wait_natural_exit_and_close();
+    }
+
+    let final_count = handle_count();
+    const HANDLE_COUNT_SLACK: u32 = 10;
+
+    assert!(
+        final_count <= baseline + HANDLE_COUNT_SLACK,
+        "expected process handle count to stay within {HANDLE_COUNT_SLACK} of baseline \
+         ({baseline}) after {ITERATIONS} natural-exit spawn+close cycles, got {final_count} \
+         (delta {}); this indicates the waiter thread or its duplicated process handle is \
+         leaking",
         final_count.saturating_sub(baseline)
     );
 }

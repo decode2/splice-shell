@@ -11,9 +11,10 @@ import { shouldRefreshTargetAfterInput } from "../terminal/inputActivity";
 import { isTerminalInterruptShortcut } from "../terminal/keyboardShortcuts";
 import {
   killPty,
+  isPtyExitPayload,
   isPtyOutputPayload,
+  PTY_EXIT_EVENT,
   PTY_OUTPUT_EVENT,
-  readPty,
   resizePty,
   spawnPty,
   writePty,
@@ -135,13 +136,36 @@ export function TerminalView({
     let inputClosed = false;
     let restartInFlight = false;
     let ptyGeneration = 0;
+    let currentSessionId: number | undefined;
+    // Restart-storm guard. The removed 500ms liveness poll was an implicit
+    // throttle; without it, a shell that exits instantly on every launch would
+    // spin `restartPty` forever. Cap consecutive restarts and reset the counter
+    // only when a session proves healthy — output alone is not enough, because
+    // a shell that prints a banner and immediately dies would otherwise reset
+    // the counter every cycle and defeat the cap. The reset is gated on a
+    // minimum uptime (see `writePtyOutput` / `MIN_HEALTHY_UPTIME_MS`).
+    let consecutiveRestarts = 0;
+    // Wall-clock timestamp of the last spawn, used to measure session uptime
+    // for the storm-guard reset gate above. Set in `startPty`.
+    let spawnTime = 0;
+    // A `pty-exit` can arrive for a session id we have not recorded yet: an
+    // instant-exit child emits `pty-exit(N)` BEFORE `spawnPty` resolves and
+    // sets `currentSessionId = N`. The (FnOnce) event would be dropped forever,
+    // leaving a dead terminal. Stash such a newer-than-recorded id here so
+    // `startPty` can act on it the moment it records that id.
+    let lastUnmatchedExitId: number | undefined;
+    // Set when a `pty-exit` for the live session lands while a restart is
+    // already in flight, so the restart is coalesced (see `restartPty`).
+    let pendingExit = false;
     let unlistenPtyOutput: UnlistenFn | undefined;
+    let unlistenPtyExit: UnlistenFn | undefined;
     const outputFilter = createTerminalOutputFilter();
+    const MAX_CONSECUTIVE_RESTARTS = 5;
+    // A session must stay up at least this long before its output is taken as
+    // proof of health. Output before this window is likely a dying shell's
+    // banner/error and must not reset the restart-storm counter.
+    const MIN_HEALTHY_UPTIME_MS = 2000;
 
-    const sleep = (delayMs: number) =>
-      new Promise<void>((resolve) => {
-        window.setTimeout(resolve, delayMs);
-      });
     const writeTerminalChunk = (chunk: string) => {
       terminal.write(chunk);
     };
@@ -159,21 +183,62 @@ export function TerminalView({
         setHasPtyOutput(true);
       }
 
+      // A session that has stayed up past the min-uptime threshold and is now
+      // producing output is genuinely healthy, so clear the restart-storm
+      // counter: a later, legitimate one-off restart should not be counted
+      // against a burst of instant-exit failures from long ago. Output that
+      // arrives within the first `MIN_HEALTHY_UPTIME_MS` is NOT trusted — a
+      // shell that prints then instantly dies must keep accumulating restarts
+      // toward the cap, otherwise the storm guard is defeated by any output.
+      if (Date.now() - spawnTime > MIN_HEALTHY_UPTIME_MS) {
+        consecutiveRestarts = 0;
+      }
+
       writeTerminalActions(outputFilter.write(chunk));
     };
     const startPty = async () => {
-      await spawnPty({ cols: terminal.cols, rows: terminal.rows });
+      const spawnedSessionId = await spawnPty({ cols: terminal.cols, rows: terminal.rows });
+      currentSessionId = spawnedSessionId;
+      spawnTime = Date.now();
       ptyGeneration += 1;
       inputClosed = false;
       handlersRef.current.onPtyReady?.();
+
+      // A `pty-exit` for this exact session may have raced ahead of `spawnPty`
+      // resolving (instant-exit child) and been stashed by `handlePtyExit`.
+      // Now that the id is recorded, treat it as an immediate exit and restart.
+      // This shares the restart path, so the storm cap still bounds an
+      // instant-exit shell instead of letting it loop forever.
+      if (lastUnmatchedExitId === spawnedSessionId) {
+        lastUnmatchedExitId = undefined;
+        inputClosed = true;
+        void restartPty();
+      }
     };
     const restartPty = async () => {
-      if (restartInFlight || disposed) {
+      if (disposed) {
+        return;
+      }
+
+      // A restart already running: coalesce this request. `restartPty`'s
+      // finally re-checks `pendingExit` and runs exactly one more restart, so
+      // an exit that races an in-flight restart is never dropped nor allowed
+      // to stack into overlapping spawns.
+      if (restartInFlight) {
+        pendingExit = true;
         return;
       }
 
       restartInFlight = true;
       try {
+        consecutiveRestarts += 1;
+        if (consecutiveRestarts > MAX_CONSECUTIVE_RESTARTS) {
+          terminal.write(
+            "\r\nPTY session keeps exiting immediately; automatic restart stopped.\r\n",
+          );
+          return;
+        }
+
         terminal.write("\r\nPTY session ended. Starting a new shell...\r\n");
         await startPty();
         terminal.write("\r\nNew shell session started.\r\n");
@@ -181,6 +246,10 @@ export function TerminalView({
         terminal.write(`\r\nFailed to restart ConPTY session: ${String(error)}\r\n`);
       } finally {
         restartInFlight = false;
+        if (pendingExit && !disposed) {
+          pendingExit = false;
+          void restartPty();
+        }
       }
     };
 
@@ -242,28 +311,30 @@ export function TerminalView({
       webglAddon = undefined;
     }
 
-    const monitorPtySession = async () => {
-      while (!disposed) {
-        try {
-          await readPty();
-          if (disposed) {
-            break;
-          }
-
-          await sleep(500);
-        } catch (error) {
-          if (!disposed) {
-            if (isClosedPtyInputError(error)) {
-              inputClosed = true;
-              await restartPty();
-              continue;
-            }
-
-            terminal.write(`\r\nPTY output read failed: ${String(error)}\r\n`);
-            await sleep(100);
-          }
-        }
+    // A `pty-exit` event carries the exiting session's monotonic id. Ids
+    // increase monotonically, so the payload is compared against the live id:
+    //   - below current  → stale exit from an already-superseded session; ignore.
+    //   - equal to current → the live shell died; mark input closed and restart.
+    //   - above current, or none recorded yet → an instant-exit child whose
+    //     `pty-exit` raced ahead of `spawnPty` resolving. Do NOT drop it (the
+    //     event is FnOnce and never re-fires); stash it so `startPty` restarts
+    //     the moment it records that id.
+    const handlePtyExit = (payload: unknown) => {
+      if (disposed || !isPtyExitPayload(payload)) {
+        return;
       }
+
+      if (currentSessionId !== undefined && payload < currentSessionId) {
+        return;
+      }
+
+      if (payload === currentSessionId) {
+        inputClosed = true;
+        void restartPty();
+        return;
+      }
+
+      lastUnmatchedExitId = payload;
     };
 
     const handlePaste = (event: ClipboardEvent) => {
@@ -296,28 +367,34 @@ export function TerminalView({
     terminalElement.addEventListener("paste", handlePaste, { capture: true });
     terminalElement.addEventListener("keydown", handleTerminalKeyDown, { capture: true });
 
-    void listen(PTY_OUTPUT_EVENT, (event) => {
-      if (!disposed && isPtyOutputPayload(event.payload)) {
-        writePtyOutput(event.payload);
-      }
-    })
-      .then((unlisten) => {
+    // Register BOTH the output and exit listeners before the first spawn, so
+    // no `pty-output` or `pty-exit` event can be missed in the window between
+    // spawning and subscribing.
+    void Promise.all([
+      listen(PTY_OUTPUT_EVENT, (event) => {
+        if (!disposed && isPtyOutputPayload(event.payload)) {
+          writePtyOutput(event.payload);
+        }
+      }),
+      listen(PTY_EXIT_EVENT, (event) => {
+        handlePtyExit(event.payload);
+      }),
+    ])
+      .then(([outputUnlisten, exitUnlisten]) => {
         if (disposed) {
-          unlisten();
+          outputUnlisten();
+          exitUnlisten();
           return;
         }
 
-        unlistenPtyOutput = unlisten;
-        void startPty()
-          .then(() => {
-            void monitorPtySession();
-          })
-          .catch((error) => {
-            terminal.write(`\r\nFailed to start ConPTY session: ${String(error)}\r\n`);
-          });
+        unlistenPtyOutput = outputUnlisten;
+        unlistenPtyExit = exitUnlisten;
+        void startPty().catch((error) => {
+          terminal.write(`\r\nFailed to start ConPTY session: ${String(error)}\r\n`);
+        });
       })
       .catch((error) => {
-        terminal.write(`\r\nFailed to subscribe to PTY output: ${String(error)}\r\n`);
+        terminal.write(`\r\nFailed to subscribe to PTY events: ${String(error)}\r\n`);
       });
 
     return () => {
@@ -329,6 +406,7 @@ export function TerminalView({
       terminalElement.removeEventListener("paste", handlePaste, { capture: true });
       terminalElement.removeEventListener("keydown", handleTerminalKeyDown, { capture: true });
       unlistenPtyOutput?.();
+      unlistenPtyExit?.();
       void killPty();
       fileLinkProvider.dispose();
       webglAddon?.dispose();

@@ -28,6 +28,7 @@ fn main() {
         move |output| {
             let _ = sender.send(output);
         },
+        |_id| {},
     )
     .expect("shell should start");
 
