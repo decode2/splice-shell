@@ -289,6 +289,79 @@ fn live_pty_session_kills_grandchild_process_tree_on_close() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn pty_spawn_close_cycles_do_not_leak_process_handles() {
+    // Regression test for the "no memory/handle leaks" invariant:
+    // `PtySession::spawn` allocates several OS handles per session (input
+    // pipe, output pipe, process, primary thread, pseudoconsole, and now a
+    // Job Object) plus a reader thread, and `close()`/`Drop` must tear all
+    // of it down. If `close()` ever stops closing one of those handles, this
+    // test proves it by watching this *process's own* open-handle count
+    // grow across many spawn+close cycles.
+    use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+
+    fn handle_count() -> u32 {
+        let mut count: u32 = 0;
+        unsafe {
+            GetProcessHandleCount(GetCurrentProcess(), &mut count)
+                .expect("GetProcessHandleCount should succeed for the current process");
+        }
+        count
+    }
+
+    fn spawn_and_close_pty_session() {
+        // `close()` forcibly terminates the child (`TerminateProcess`) and
+        // joins the reader thread before returning, so there is no need to
+        // write an `exit` command first: every handle/thread this session
+        // owns must be gone by the time this function returns.
+        let session = splice_pty::PtySession::spawn(
+            "cmd.exe",
+            &["/D", "/K"],
+            splice_pty::TerminalSize::new(80, 24).expect("valid terminal size"),
+            |_output| {},
+        )
+        .expect("PTY session should spawn for the handle-leak regression test");
+        session.close();
+    }
+
+    // Warm up first so lazy one-time allocations (thread pool spin-up,
+    // first-use console/ToolHelp subsystem initialization, allocator arena
+    // growth, etc.) happen *before* the baseline is measured, not during the
+    // measured loop where they'd be misread as a per-session leak.
+    const WARMUP_ITERATIONS: usize = 5;
+    for _ in 0..WARMUP_ITERATIONS {
+        spawn_and_close_pty_session();
+    }
+
+    let baseline = handle_count();
+
+    // Enough iterations that a real per-session leak (even one stray handle
+    // per `close()`) would dwarf `HANDLE_COUNT_SLACK` below, while staying
+    // small enough to keep this test fast (a few seconds).
+    const ITERATIONS: usize = 40;
+    for _ in 0..ITERATIONS {
+        spawn_and_close_pty_session();
+    }
+
+    let final_count = handle_count();
+
+    // Handle counts jitter by a small amount run-to-run from unrelated
+    // activity in this test process (allocator/runtime bookkeeping, other
+    // threads, etc.). This slack absorbs that jitter but is far below the
+    // ~ITERATIONS handles a genuine per-session leak would add: leaking just
+    // one handle per `close()` over 40 iterations would blow past it by 4x.
+    const HANDLE_COUNT_SLACK: u32 = 10;
+
+    assert!(
+        final_count <= baseline + HANDLE_COUNT_SLACK,
+        "expected process handle count to stay within {HANDLE_COUNT_SLACK} of baseline \
+         ({baseline}) after {ITERATIONS} PtySession spawn+close cycles, got {final_count} \
+         (delta {}); this indicates PtySession::close()/Drop is leaking OS handles",
+        final_count.saturating_sub(baseline)
+    );
+}
+
 /// Finds `marker` in `output` and parses the run of ASCII digits immediately
 /// following it as a `u32`.
 ///

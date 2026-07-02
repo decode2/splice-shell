@@ -20,3 +20,13 @@ windows = { version = "0.61.3", features = [
   "Win32_System_Pipes",
   "Win32_System_Threading"
 ] }
+
+[target.'cfg(windows)'.dev-dependencies]
+# Test-only: the handle-leak regression test in tests/conpty_smoke.rs reads
+# the current process's OS handle count via GetProcessHandleCount to prove
+# PtySession::spawn/close cycles don't leak handles. Kept as a dev-dependency
+# (not a normal dependency) because nothing in the library itself needs it.
+windows = { version = "0.61.3", features = [
+  "Win32_Foundation",
+  "Win32_System_Threading"
+] }
