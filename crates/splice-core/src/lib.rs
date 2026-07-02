@@ -174,13 +174,13 @@ mod tests {
     fn registry_routes_codex_image_as_file_reference() {
         let registry = AdapterRegistry::with_builtin_adapters();
         let image = ImagePaste {
-            path: "C:/Temp/splice pasted/image.bmp".to_owned(),
-            mime_type: "image/bmp".to_owned(),
+            path: "C:/Temp/splice pasted/image.png".to_owned(),
+            mime_type: "image/png".to_owned(),
         };
 
         assert_eq!(
             registry.route_paste("codex.exe", &PastePayload::Image(image)),
-            PasteRoute::Text("Image file: \"C:/Temp/splice pasted/image.bmp\"\r".to_owned())
+            PasteRoute::Text("Image file: \"C:/Temp/splice pasted/image.png\"\r".to_owned())
         );
     }
 
@@ -199,14 +199,14 @@ mod tests {
     fn registry_refuses_unknown_image_process_instead_of_guessing() {
         let registry = AdapterRegistry::new(Vec::new());
         let image = ImagePaste {
-            path: "C:/Temp/image.bmp".to_owned(),
-            mime_type: "image/bmp".to_owned(),
+            path: "C:/Temp/image.png".to_owned(),
+            mime_type: "image/png".to_owned(),
         };
 
         assert_eq!(
             registry.route_paste("unknown.exe", &PastePayload::Image(image)),
             PasteRoute::UnsupportedImage {
-                path: "C:/Temp/image.bmp".to_owned()
+                path: "C:/Temp/image.png".to_owned()
             }
         );
     }

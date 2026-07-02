@@ -435,14 +435,14 @@ mod tests {
     #[test]
     fn preview_paste_payload_returns_text_for_supported_cli() {
         let payload = PastePayload::Image(splice_core::ImagePaste {
-            path: "C:/Temp/splice/image.bmp".to_owned(),
-            mime_type: "image/bmp".to_owned(),
+            path: "C:/Temp/splice/image.png".to_owned(),
+            mime_type: "image/png".to_owned(),
         });
 
         assert_eq!(
             preview_paste_payload("codex.exe", &payload),
             PastePreview::Ready {
-                text: "Image file: C:/Temp/splice/image.bmp\r".to_owned(),
+                text: "Image file: C:/Temp/splice/image.png\r".to_owned(),
                 process_name: "codex.exe".to_owned(),
                 adapter_name: "codex-cli".to_owned()
             }
@@ -452,14 +452,14 @@ mod tests {
     #[test]
     fn preview_paste_payload_refuses_unknown_image_process() {
         let payload = PastePayload::Image(splice_core::ImagePaste {
-            path: "C:/Temp/splice/image.bmp".to_owned(),
-            mime_type: "image/bmp".to_owned(),
+            path: "C:/Temp/splice/image.png".to_owned(),
+            mime_type: "image/png".to_owned(),
         });
 
         assert_eq!(
             preview_paste_payload("unknown.exe", &payload),
             PastePreview::UnsupportedImage {
-                path: "C:/Temp/splice/image.bmp".to_owned(),
+                path: "C:/Temp/splice/image.png".to_owned(),
                 process_name: "unknown.exe".to_owned()
             }
         );

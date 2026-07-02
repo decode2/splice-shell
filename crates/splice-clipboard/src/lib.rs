@@ -24,7 +24,7 @@ pub enum ClipboardError {
     Windows(windows::core::Error),
     Io(std::io::Error),
     EmptyClipboardImage,
-    InvalidDib(&'static str),
+    Image(image::ImageError),
     UnsupportedPlatform,
 }
 
@@ -35,7 +35,7 @@ impl std::fmt::Display for ClipboardError {
             Self::Windows(error) => write!(f, "Windows clipboard error: {error}"),
             Self::Io(error) => write!(f, "I/O error: {error}"),
             Self::EmptyClipboardImage => write!(f, "clipboard does not contain image data"),
-            Self::InvalidDib(reason) => write!(f, "invalid DIB image: {reason}"),
+            Self::Image(error) => write!(f, "clipboard image decode/encode error: {error}"),
             Self::UnsupportedPlatform => {
                 write!(f, "clipboard image extraction is only supported on Windows")
             }
@@ -51,6 +51,12 @@ impl From<std::io::Error> for ClipboardError {
     }
 }
 
+impl From<image::ImageError> for ClipboardError {
+    fn from(error: image::ImageError) -> Self {
+        Self::Image(error)
+    }
+}
+
 #[cfg(windows)]
 impl From<windows::core::Error> for ClipboardError {
     fn from(error: windows::core::Error) -> Self {
@@ -62,12 +68,9 @@ pub fn read_clipboard_image_to_temp_dir(
     temp_dir: &Path,
 ) -> Result<ClipboardPayload, ClipboardError> {
     let dib = read_clipboard_dib_bytes()?;
-    let path = persist_dib_as_bmp(temp_dir, &dib)?;
-
-    Ok(ClipboardPayload::Image(ImagePaste {
-        path: path.to_string_lossy().into_owned(),
-        mime_type: "image/bmp".to_owned(),
-    }))
+    Ok(ClipboardPayload::Image(image_paste_from_dib(
+        temp_dir, &dib,
+    )?))
 }
 
 pub fn read_clipboard_image_paste_payload(temp_dir: &Path) -> Result<PastePayload, ClipboardError> {
@@ -78,13 +81,172 @@ pub fn read_clipboard_image_paste_payload(temp_dir: &Path) -> Result<PastePayloa
     }
 }
 
-fn persist_dib_as_bmp(temp_dir: &Path, dib: &[u8]) -> Result<std::path::PathBuf, ClipboardError> {
-    let bmp = dib_to_bmp(dib)?;
+fn image_paste_from_dib(temp_dir: &Path, dib: &[u8]) -> Result<ImagePaste, ClipboardError> {
+    let path = persist_dib_as_png(temp_dir, dib)?;
+    Ok(ImagePaste {
+        path: path.to_string_lossy().into_owned(),
+        mime_type: "image/png".to_owned(),
+    })
+}
+
+fn persist_dib_as_png(temp_dir: &Path, dib: &[u8]) -> Result<std::path::PathBuf, ClipboardError> {
+    // Decode + encode fully before touching the filesystem so a decode error
+    // never leaves a partial or stale file behind.
+    let png = dib_to_png(dib)?;
     fs::create_dir_all(temp_dir)?;
 
     let path = temp_dir.join(unique_clipboard_image_name());
-    fs::write(&path, bmp)?;
+    fs::write(&path, png)?;
     Ok(path)
+}
+
+// Byte offset WITHIN a raw DIB where the pixel data begins.
+//
+// BmpDecoder's new_without_file_header entry point GUESSES this offset, and for
+// BI_BITFIELDS with a V4/V5 header it unconditionally assumes the Windows
+// "long" layout (a redundant 12-byte RGB mask trailer after the header, pixels
+// at header+12). That corrupts the equally valid "short" layout (pixels
+// immediately after the header) that apps like Paint.NET write. We compute the
+// real offset ourselves and hand it to the decoder via a synthetic BMP file
+// header (bfOffBits), which the decoder treats as authoritative — so the guess
+// never runs.
+//
+// All reads are length-guarded: a header too short to parse yields a best-effort
+// offset and the decode itself fails cleanly downstream (never a panic).
+fn dib_pixel_offset(dib: &[u8]) -> usize {
+    let read_u32 = |at: usize| -> Option<u32> {
+        dib.get(at..at + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let read_i32 = |at: usize| -> Option<i32> {
+        dib.get(at..at + 4)
+            .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let read_u16 = |at: usize| -> Option<u16> {
+        dib.get(at..at + 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+    };
+
+    // A DIB missing its header size field is malformed; return 0 and let the
+    // decoder surface the error.
+    let Some(header_size) = read_u32(0).map(|value| value as usize) else {
+        return 0;
+    };
+    let width = read_i32(4).unwrap_or(0);
+    let height = read_i32(8).unwrap_or(0);
+    let bit_count = read_u16(14).unwrap_or(0);
+    let compression = read_u32(16).unwrap_or(0);
+    let clr_used = read_u32(32).unwrap_or(0);
+
+    // Indexed formats (1/4/8 bpp) carry a color palette between the header and the
+    // pixels. clr_used == 0 is the Windows convention for "full 2^bpp palette", so a
+    // naive clr_used*4 would compute zero palette bytes and land the pixel offset
+    // inside the palette — silently decoding garbage. Default to the full table.
+    let palette_entries = if (1..=8).contains(&bit_count) && clr_used == 0 {
+        1usize << bit_count
+    } else {
+        clr_used as usize
+    };
+    let palette_bytes = palette_entries.saturating_mul(4);
+    let candidate = header_size.saturating_add(palette_bytes);
+
+    // BI_BITFIELDS
+    if compression == 3 {
+        // Classic BITMAPINFOHEADER always carries a real 12-byte mask block after
+        // the header; pixels follow it.
+        if header_size == 40 {
+            return candidate.saturating_add(12);
+        }
+
+        // V4 (108) / V5 (124): the masks already live inside the header, so a
+        // trailing 12-byte block is redundant and MAY or MAY NOT be present.
+        // Disambiguate: treat as "long" only if the DIB is big enough to hold a
+        // trailer PLUS the full pixel buffer AND the 12 bytes at the header end
+        // actually equal the header's R/G/B masks. Size alone is unreliable
+        // (GlobalSize over-reports allocation granularity), hence the mask check.
+        if header_size >= 108 {
+            let stride = (((width as i64) * (bit_count as i64) + 31) / 32 * 4).max(0) as usize;
+            let expected = stride.saturating_mul(height.unsigned_abs() as usize);
+
+            let masks_match = || {
+                read_u32(40) == read_u32(candidate)
+                    && read_u32(44) == read_u32(candidate + 4)
+                    && read_u32(48) == read_u32(candidate + 8)
+                    && read_u32(40).is_some()
+            };
+
+            let is_long = dib
+                .len()
+                .checked_sub(candidate)
+                .is_some_and(|remaining| remaining >= 12usize.saturating_add(expected))
+                && masks_match();
+
+            return if is_long {
+                candidate.saturating_add(12)
+            } else {
+                candidate
+            };
+        }
+
+        // V2 (52) / V3 (56) BITFIELDS: no trailing skip.
+        return candidate;
+    }
+
+    // BI_RGB and everything else: pixels start right after header + palette.
+    candidate
+}
+
+// A DIB whose size or pixel offset exceeds the u32 range of the BMP file header
+// cannot be represented; surface a clean error rather than wrapping silently.
+fn overflow_error(field: &str) -> ClipboardError {
+    ClipboardError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("clipboard DIB too large to encode BMP header field {field}"),
+    ))
+}
+
+fn dib_to_png(dib: &[u8]) -> Result<Vec<u8>, ClipboardError> {
+    // The clipboard hands us a raw DIB (BITMAPINFOHEADER/…/BITMAPV5HEADER + pixel
+    // data) with no BMP file header. Rather than let BmpDecoder guess where the
+    // pixels start (which mishandles short-layout BITFIELDS DIBV5), we compute the
+    // real pixel offset and prepend a 14-byte BITMAPFILEHEADER whose bfOffBits
+    // points at it. BmpDecoder::new treats bfOffBits as the authoritative pixel
+    // offset, so the layout is handled correctly regardless of header flavor.
+    let pixel_offset = dib_pixel_offset(dib);
+
+    // The BMP file header stores bfSize and bfOffBits as u32. A DIB larger than
+    // ~4 GiB (or an offset past u32) cannot be represented; fail cleanly instead of
+    // silently wrapping via `as u32` and emitting a corrupt header.
+    let bf_size = u32::try_from(14 + dib.len()).map_err(|_| overflow_error("bfSize"))?;
+    let bf_off_bits = u32::try_from(14 + pixel_offset).map_err(|_| overflow_error("bfOffBits"))?;
+
+    let mut bmp = Vec::with_capacity(14 + dib.len());
+    bmp.extend_from_slice(b"BM"); // bfType
+    bmp.extend_from_slice(&bf_size.to_le_bytes()); // bfSize
+    bmp.extend_from_slice(&0u16.to_le_bytes()); // bfReserved1
+    bmp.extend_from_slice(&0u16.to_le_bytes()); // bfReserved2
+    bmp.extend_from_slice(&bf_off_bits.to_le_bytes()); // bfOffBits
+    bmp.extend_from_slice(dib);
+
+    let decoder = image::codecs::bmp::BmpDecoder::new(std::io::Cursor::new(&bmp))?;
+    let decoded = image::DynamicImage::from_decoder(decoder)?;
+
+    // Zero-alpha fixup: some Windows sources (Snipping Tool, GDI screenshots) emit a
+    // DIBV5 with an alpha mask set but leave every alpha byte at 0, which decodes as a
+    // fully-transparent image. When EVERY pixel is transparent we treat the image as
+    // opaque (drop to RGB); otherwise the non-zero alpha is genuine and preserved.
+    // Tradeoff: a deliberately fully-transparent image also becomes opaque — acceptable,
+    // since such a paste would be invisible and useless anyway.
+    let normalized = match decoded {
+        image::DynamicImage::ImageRgba8(rgba) if rgba.pixels().all(|pixel| pixel.0[3] == 0) => {
+            image::DynamicImage::ImageRgb8(image::DynamicImage::ImageRgba8(rgba).into_rgb8())
+        }
+        other => other,
+    };
+
+    let mut png = Vec::new();
+    normalized.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)?;
+    Ok(png)
 }
 
 #[cfg(not(windows))]
@@ -103,94 +265,7 @@ fn unique_clipboard_image_name() -> String {
         .map(|duration| duration.as_millis())
         .unwrap_or_default();
 
-    format!("splice-clipboard-{millis}.bmp")
-}
-
-fn dib_to_bmp(dib: &[u8]) -> Result<Vec<u8>, ClipboardError> {
-    let pixel_offset = dib_pixel_offset(dib)?;
-    let file_size = 14usize
-        .checked_add(dib.len())
-        .ok_or(ClipboardError::InvalidDib("BMP file size overflow"))?;
-    let pixel_offset = 14usize
-        .checked_add(pixel_offset)
-        .ok_or(ClipboardError::InvalidDib("BMP pixel offset overflow"))?;
-
-    let mut bmp = Vec::with_capacity(file_size);
-    bmp.extend_from_slice(b"BM");
-    bmp.extend_from_slice(&(file_size as u32).to_le_bytes());
-    bmp.extend_from_slice(&0u16.to_le_bytes());
-    bmp.extend_from_slice(&0u16.to_le_bytes());
-    bmp.extend_from_slice(&(pixel_offset as u32).to_le_bytes());
-    bmp.extend_from_slice(dib);
-
-    Ok(bmp)
-}
-
-fn dib_pixel_offset(dib: &[u8]) -> Result<usize, ClipboardError> {
-    if dib.len() < 16 {
-        return Err(ClipboardError::InvalidDib("DIB is too small"));
-    }
-
-    let header_size = read_u32_le(dib, 0)? as usize;
-    if header_size < 12 {
-        return Err(ClipboardError::InvalidDib("unsupported DIB header size"));
-    }
-    if dib.len() < header_size {
-        return Err(ClipboardError::InvalidDib(
-            "DIB shorter than declared header",
-        ));
-    }
-
-    if header_size == 12 {
-        let bit_count = read_u16_le(dib, 10)?;
-        let colors = if bit_count <= 8 {
-            1usize << bit_count
-        } else {
-            0
-        };
-        return header_size
-            .checked_add(colors * 3)
-            .ok_or(ClipboardError::InvalidDib("DIB color table overflow"));
-    }
-
-    if dib.len() < 40 {
-        return Err(ClipboardError::InvalidDib("BITMAPINFOHEADER is incomplete"));
-    }
-
-    let bit_count = read_u16_le(dib, 14)?;
-    let compression = read_u32_le(dib, 16)?;
-    let colors_used = read_u32_le(dib, 32)? as usize;
-    let colors = if colors_used > 0 {
-        colors_used
-    } else if bit_count <= 8 {
-        1usize << bit_count
-    } else {
-        0
-    };
-    let bitfields_bytes = if header_size == 40 && compression == 3 {
-        12usize
-    } else {
-        0usize
-    };
-
-    header_size
-        .checked_add(bitfields_bytes)
-        .and_then(|offset| offset.checked_add(colors * 4))
-        .ok_or(ClipboardError::InvalidDib("DIB pixel offset overflow"))
-}
-
-fn read_u16_le(bytes: &[u8], offset: usize) -> Result<u16, ClipboardError> {
-    let slice = bytes
-        .get(offset..offset + 2)
-        .ok_or(ClipboardError::InvalidDib("unexpected end of DIB"))?;
-    Ok(u16::from_le_bytes([slice[0], slice[1]]))
-}
-
-fn read_u32_le(bytes: &[u8], offset: usize) -> Result<u32, ClipboardError> {
-    let slice = bytes
-        .get(offset..offset + 4)
-        .ok_or(ClipboardError::InvalidDib("unexpected end of DIB"))?;
-    Ok(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+    format!("splice-clipboard-{millis}.png")
 }
 
 #[cfg(windows)]
@@ -219,7 +294,10 @@ mod windows_clipboard {
     }
 
     fn available_image_format() -> Result<u32, ClipboardError> {
-        // Prefer DIBV5 when available because it can preserve richer bitmap metadata.
+        // Prefer DIBV5 when available because it can preserve richer bitmap metadata
+        // (including a real alpha channel from well-behaved apps). The zero-alpha
+        // fixup in dib_to_png neutralizes DIBV5's all-zero-alpha hazard, so CF_DIBV5
+        // stays the preferred format.
         if unsafe { IsClipboardFormatAvailable(CF_DIBV5.0 as u32) }.is_ok() {
             return Ok(CF_DIBV5.0 as u32);
         }
@@ -292,6 +370,8 @@ mod windows_clipboard {
 mod tests {
     use super::*;
 
+    const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+
     #[test]
     fn only_image_payload_prefers_image_pipeline() {
         assert!(!ClipboardPayload::Empty.prefers_image());
@@ -304,88 +384,429 @@ mod tests {
     }
 
     #[test]
-    fn dib_to_bmp_adds_file_header_without_copying_external_handles() {
-        let dib = minimal_24_bit_dib();
-        let bmp = dib_to_bmp(&dib).expect("valid DIB should convert to BMP");
+    fn converts_zero_alpha_dibv5_to_opaque_png_and_flips_bottom_up_rows() {
+        let png = dib_to_png(&money_dib()).expect("valid DIBV5 should convert to PNG");
 
-        assert_eq!(&bmp[0..2], b"BM");
+        assert_eq!(&png[0..8], &PNG_SIGNATURE, "output must be a real PNG");
+
+        let image = decode_png(&png);
+        assert_eq!(image.dimensions(), (2, 2));
+
+        // The LAST DIB row holds the top image row (bottom-up storage). Its first
+        // pixel is red, so decoded pixel (0,0) must be red — proving the row flip.
+        let top_left = image.get_pixel(0, 0);
         assert_eq!(
-            u32::from_le_bytes([bmp[2], bmp[3], bmp[4], bmp[5]]) as usize,
-            bmp.len()
+            top_left.0,
+            [255, 0, 0, 255],
+            "top-left must be opaque red (zero-alpha fixup + bottom-up flip)"
         );
-        assert_eq!(u32::from_le_bytes([bmp[10], bmp[11], bmp[12], bmp[13]]), 54);
-        assert_eq!(&bmp[14..], dib.as_slice());
     }
 
     #[test]
-    fn dib_to_bmp_rejects_truncated_headers() {
-        let error = dib_to_bmp(&[40, 0, 0]).expect_err("truncated DIB should fail");
+    fn preserves_genuine_alpha_when_any_pixel_is_transparent() {
+        let png = dib_to_png(&money_dib_with_alpha(128)).expect("DIBV5 with alpha should convert");
 
-        assert!(matches!(error, ClipboardError::InvalidDib(_)));
+        let image = decode_png(&png);
+        let top_left = image.get_pixel(0, 0);
+        assert_eq!(
+            top_left.0,
+            [255, 0, 0, 128],
+            "genuine alpha must survive (fixup must not clobber it)"
+        );
     }
 
     #[test]
-    fn persist_dib_as_bmp_writes_file_and_releases_file_handle() {
-        let temp_dir = std::env::temp_dir().join(format!(
-            "splice-clipboard-test-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system time should be after epoch")
-                .as_nanos()
-        ));
+    fn honors_top_down_dib_row_order() {
+        // Same pixels as money_dib but with a negative height (top-down). Now the
+        // FIRST DIB row is the top image row, whose first pixel is blue.
+        let png = dib_to_png(&top_down_dib()).expect("top-down DIB should convert");
 
-        let path = persist_dib_as_bmp(&temp_dir, &minimal_24_bit_dib())
-            .expect("DIB should persist as BMP");
-        let bytes = fs::read(&path).expect("BMP should be readable");
-        assert_eq!(&bytes[0..2], b"BM");
-
-        fs::remove_dir_all(&temp_dir).expect("temp directory should be cleaned");
+        let image = decode_png(&png);
+        let top_left = image.get_pixel(0, 0);
+        assert_eq!(
+            top_left.0,
+            [0, 0, 255, 255],
+            "top-left must be opaque blue (first DIB row = top row)"
+        );
     }
 
     #[test]
-    fn image_clipboard_payload_maps_to_core_paste_payload() {
-        let temp_dir = std::env::temp_dir().join(format!(
-            "splice-clipboard-payload-test-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system time should be after epoch")
-                .as_nanos()
-        ));
+    fn decodes_short_layout_v5_bitfields_without_skipping_pixels() {
+        // Short-layout CF_DIBV5 (Paint.NET / mmozeiko style): masks live only in the
+        // header, there is NO 12-byte trailer, and pixels start immediately at byte
+        // 124. The decoder must NOT skip 12 bytes here or it reads garbage/EOF.
+        let png = dib_to_png(&short_layout_v5_bitfields_dib())
+            .expect("short-layout DIBV5 should convert");
 
-        let path =
-            persist_dib_as_bmp(&temp_dir, &minimal_24_bit_dib()).expect("DIB should persist");
-        let payload = ClipboardPayload::Image(ImagePaste {
-            path: path.to_string_lossy().into_owned(),
-            mime_type: "image/bmp".to_owned(),
-        });
+        assert_eq!(&png[0..8], &PNG_SIGNATURE, "output must be a real PNG");
 
-        let mapped = match payload {
-            ClipboardPayload::Image(image) => PastePayload::Image(image),
-            ClipboardPayload::Text(text) => PastePayload::Text(text),
-            ClipboardPayload::Empty => panic!("test payload should not be empty"),
-        };
+        let image = decode_png(&png);
+        assert_eq!(image.dimensions(), (2, 2));
+        assert_eq!(image.get_pixel(0, 0).0, [255, 0, 0, 255], "top-left red");
+        assert_eq!(image.get_pixel(1, 0).0, [0, 255, 0, 255], "top-right green");
+        assert_eq!(
+            image.get_pixel(0, 1).0,
+            [0, 0, 255, 255],
+            "bottom-left blue"
+        );
+        assert_eq!(
+            image.get_pixel(1, 1).0,
+            [255, 255, 255, 255],
+            "bottom-right white"
+        );
+    }
 
+    #[test]
+    fn decodes_v5_bi_rgb_dib_at_header_end() {
+        // A 124-byte BITMAPV5HEADER with BI_RGB (no bitfields, no mask trailer):
+        // pixels start immediately at byte 124. The 4th byte per pixel is padding.
+        let png = dib_to_png(&v5_bi_rgb_dib()).expect("V5 BI_RGB DIB should convert");
+
+        let image = decode_png(&png);
+        assert_eq!(image.dimensions(), (2, 2));
+        assert_eq!(image.get_pixel(0, 0).0, [255, 0, 0, 255], "top-left red");
+        assert_eq!(image.get_pixel(1, 0).0, [0, 255, 0, 255], "top-right green");
+        assert_eq!(
+            image.get_pixel(0, 1).0,
+            [0, 0, 255, 255],
+            "bottom-left blue"
+        );
+        assert_eq!(
+            image.get_pixel(1, 1).0,
+            [255, 255, 255, 255],
+            "bottom-right white"
+        );
+    }
+
+    #[test]
+    fn decodes_24_bit_dib_respecting_row_stride_padding() {
+        let png = dib_to_png(&three_pixel_24_bit_dib()).expect("24-bit DIB should convert");
+
+        let image = decode_png(&png);
+        assert_eq!(image.dimensions(), (3, 1));
+        assert_eq!(image.get_pixel(0, 0).0, [255, 0, 0, 255], "pixel 0 is red");
+        assert_eq!(
+            image.get_pixel(1, 0).0,
+            [0, 255, 0, 255],
+            "pixel 1 is green"
+        );
+        assert_eq!(image.get_pixel(2, 0).0, [0, 0, 255, 255], "pixel 2 is blue");
+    }
+
+    #[test]
+    fn treats_32_bit_bi_rgb_fourth_byte_as_padding() {
+        let png = dib_to_png(&single_pixel_32_bit_bi_rgb_dib(0xAB))
+            .expect("32bpp BI_RGB DIB should convert");
+
+        let image = decode_png(&png);
+        assert_eq!(image.dimensions(), (1, 1));
+        assert_eq!(
+            image.get_pixel(0, 0).0,
+            [255, 0, 0, 255],
+            "opaque red; junk 4th byte must be ignored"
+        );
+    }
+
+    #[test]
+    fn rejects_garbage_dib_without_writing_a_file() {
+        let temp_dir = fresh_temp_dir("garbage");
+
+        let error = persist_dib_as_png(&temp_dir, &[40, 0, 0])
+            .expect_err("garbage DIB must not persist a file");
+
+        assert!(matches!(error, ClipboardError::Image(_)));
         assert!(
-            matches!(mapped, PastePayload::Image(ImagePaste { mime_type, .. }) if mime_type == "image/bmp")
+            !temp_dir.exists(),
+            "no file (or directory) should be created on decode failure"
         );
+    }
+
+    #[test]
+    fn surface_uses_png_extension_and_mime() {
+        assert!(unique_clipboard_image_name().ends_with(".png"));
+
+        let temp_dir = fresh_temp_dir("surface");
+        let paste =
+            image_paste_from_dib(&temp_dir, &money_dib()).expect("valid DIB should build a paste");
+
+        assert!(paste.path.ends_with(".png"), "persisted path must be .png");
+        assert_eq!(paste.mime_type, "image/png");
 
         fs::remove_dir_all(&temp_dir).expect("temp directory should be cleaned");
     }
 
-    fn minimal_24_bit_dib() -> Vec<u8> {
-        let mut dib = Vec::new();
-        dib.extend_from_slice(&40u32.to_le_bytes()); // BITMAPINFOHEADER size
-        dib.extend_from_slice(&1i32.to_le_bytes()); // width
-        dib.extend_from_slice(&1i32.to_le_bytes()); // height
-        dib.extend_from_slice(&1u16.to_le_bytes()); // planes
-        dib.extend_from_slice(&24u16.to_le_bytes()); // bit count
-        dib.extend_from_slice(&0u32.to_le_bytes()); // BI_RGB
-        dib.extend_from_slice(&4u32.to_le_bytes()); // image size, padded row
-        dib.extend_from_slice(&0i32.to_le_bytes()); // x pixels per meter
-        dib.extend_from_slice(&0i32.to_le_bytes()); // y pixels per meter
-        dib.extend_from_slice(&0u32.to_le_bytes()); // colors used
-        dib.extend_from_slice(&0u32.to_le_bytes()); // important colors
-        dib.extend_from_slice(&[0, 0, 255, 0]); // one red pixel in BGR + row padding
+    #[test]
+    fn decodes_8bpp_indexed_dib_with_default_full_palette() {
+        // 8bpp BI_RGB indexed DIB with clr_used == 0, which means "full 2^8 palette"
+        // (256 entries, 1024 bytes). The pixel offset MUST skip the whole palette; a
+        // naive clr_used*4 == 0 lands the offset inside the palette and decodes garbage.
+        let png = dib_to_png(&indexed_8bpp_dib()).expect("8bpp indexed DIB should convert");
+
+        assert_eq!(&png[0..8], &PNG_SIGNATURE, "output must be a real PNG");
+
+        let image = decode_png(&png);
+        assert_eq!(image.dimensions(), (2, 1));
+        assert_eq!(
+            image.get_pixel(0, 0).0,
+            [255, 0, 0, 255],
+            "index 0 -> opaque red"
+        );
+        assert_eq!(
+            image.get_pixel(1, 0).0,
+            [0, 255, 0, 255],
+            "index 1 -> opaque green"
+        );
+    }
+
+    #[test]
+    fn masks_check_classifies_short_layout_despite_long_eligible_size() {
+        // Adversarial short-layout V5 BITFIELDS: it carries 12 bytes of trailing slack
+        // (models GlobalSize over-reporting allocation granularity), so the size guard
+        // alone would deem it "long" and skip a 12-byte trailer. But the first 12 pixel
+        // bytes do NOT equal the header R/G/B masks, so the masks_match check must still
+        // classify it SHORT and decode the real pixels. This is the test that actually
+        // exercises masks_match.
+        let png = dib_to_png(&short_layout_v5_bitfields_dib_with_trailing_slack())
+            .expect("short-layout DIBV5 with slack should convert");
+
+        let image = decode_png(&png);
+        assert_eq!(image.dimensions(), (2, 2));
+        assert_eq!(image.get_pixel(0, 0).0, [255, 0, 0, 255], "top-left red");
+        assert_eq!(image.get_pixel(1, 0).0, [0, 255, 0, 255], "top-right green");
+        assert_eq!(
+            image.get_pixel(0, 1).0,
+            [0, 0, 255, 255],
+            "bottom-left blue"
+        );
+        assert_eq!(
+            image.get_pixel(1, 1).0,
+            [255, 255, 255, 255],
+            "bottom-right white"
+        );
+    }
+
+    fn decode_png(bytes: &[u8]) -> image::RgbaImage {
+        image::load_from_memory_with_format(bytes, image::ImageFormat::Png)
+            .expect("clipboard output should decode as PNG")
+            .to_rgba8()
+    }
+
+    fn fresh_temp_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "splice-clipboard-{tag}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        ))
+    }
+
+    // BITMAPV5HEADER (124 bytes), 32bpp, BI_BITFIELDS with standard BGRA masks.
+    // `long` selects the pixel layout: when true a redundant 12-byte RGB mask
+    // trailer is appended after the header (Windows-synthesized CF_DIBV5, pixels
+    // at byte 136); when false the pixels start immediately after the 124-byte
+    // header (short layout written by apps like Paint.NET, pixels at byte 124).
+    fn v5_bitfields_header(width: i32, height: i32, long: bool) -> Vec<u8> {
+        let stride = width.unsigned_abs() * 4;
+        let size_image = stride * height.unsigned_abs();
+
+        let mut dib = Vec::with_capacity(124);
+        dib.extend_from_slice(&124u32.to_le_bytes()); // bV5Size
+        dib.extend_from_slice(&width.to_le_bytes()); // bV5Width
+        dib.extend_from_slice(&height.to_le_bytes()); // bV5Height (negative = top-down)
+        dib.extend_from_slice(&1u16.to_le_bytes()); // bV5Planes
+        dib.extend_from_slice(&32u16.to_le_bytes()); // bV5BitCount
+        dib.extend_from_slice(&3u32.to_le_bytes()); // bV5Compression = BI_BITFIELDS
+        dib.extend_from_slice(&size_image.to_le_bytes()); // bV5SizeImage
+        dib.extend_from_slice(&0i32.to_le_bytes()); // bV5XPelsPerMeter
+        dib.extend_from_slice(&0i32.to_le_bytes()); // bV5YPelsPerMeter
+        dib.extend_from_slice(&0u32.to_le_bytes()); // bV5ClrUsed
+        dib.extend_from_slice(&0u32.to_le_bytes()); // bV5ClrImportant
+        dib.extend_from_slice(&0x00FF_0000u32.to_le_bytes()); // bV5RedMask
+        dib.extend_from_slice(&0x0000_FF00u32.to_le_bytes()); // bV5GreenMask
+        dib.extend_from_slice(&0x0000_00FFu32.to_le_bytes()); // bV5BlueMask
+        dib.extend_from_slice(&0xFF00_0000u32.to_le_bytes()); // bV5AlphaMask
+        dib.resize(124, 0); // remaining V5 fields (color space, gamma, intent, profile)
+
+        if long {
+            // Windows-synthesized (long) layout: the RGB color masks are duplicated
+            // in a 12-byte trailer after the header, and the pixel data follows it.
+            dib.extend_from_slice(&0x00FF_0000u32.to_le_bytes()); // red mask (trailer)
+            dib.extend_from_slice(&0x0000_FF00u32.to_le_bytes()); // green mask (trailer)
+            dib.extend_from_slice(&0x0000_00FFu32.to_le_bytes()); // blue mask (trailer)
+        }
+        dib
+    }
+
+    // 2x2 image with a distinct color per corner, all alpha bytes 0, bottom-up.
+    // Stored order (bottom row first): [blue, white] then [red, green].
+    fn money_dib() -> Vec<u8> {
+        let mut dib = v5_bitfields_header(2, 2, true);
+        dib.extend_from_slice(&[
+            255, 0, 0, 0, // (0,1) bottom-left blue  (B,G,R,A)
+            255, 255, 255, 0, // (1,1) bottom-right white
+            0, 0, 255, 0, // (0,0) top-left red
+            0, 255, 0, 0, // (1,0) top-right green
+        ]);
+        dib
+    }
+
+    // Same as money_dib but the top-left (red) pixel carries a real alpha value.
+    fn money_dib_with_alpha(alpha: u8) -> Vec<u8> {
+        let mut dib = v5_bitfields_header(2, 2, true);
+        dib.extend_from_slice(&[
+            255, 0, 0, 0, // bottom-left blue
+            255, 255, 255, 0, // bottom-right white
+            0, 0, 255, alpha, // top-left red with genuine alpha
+            0, 255, 0, 0, // top-right green
+        ]);
+        dib
+    }
+
+    // 2x2 short-layout BITFIELDS DIBV5: pixels start at byte 124 (no mask trailer).
+    // Distinct opaque colors per corner, bottom-up storage (bottom row stored first).
+    fn short_layout_v5_bitfields_dib() -> Vec<u8> {
+        let mut dib = v5_bitfields_header(2, 2, false);
+        // Bottom-up storage: the bottom image row is stored first. Bytes are B,G,R,A.
+        dib.extend_from_slice(&[
+            255, 0, 0, 255, // (0,1) bottom-left blue
+            255, 255, 255, 255, // (1,1) bottom-right white
+            0, 0, 255, 255, // (0,0) top-left red
+            0, 255, 0, 255, // (1,0) top-right green
+        ]);
+        dib
+    }
+
+    // 2x2 BITMAPV5HEADER, 32bpp, BI_RGB (compression 0): no masks, no trailer,
+    // pixels start at byte 124. Bottom-up storage; the 4th byte is padding.
+    fn v5_bi_rgb_dib() -> Vec<u8> {
+        let width = 2i32;
+        let height = 2i32;
+        let stride = width.unsigned_abs() * 4;
+        let size_image = stride * height.unsigned_abs();
+
+        let mut dib = Vec::with_capacity(124);
+        dib.extend_from_slice(&124u32.to_le_bytes()); // bV5Size
+        dib.extend_from_slice(&width.to_le_bytes()); // bV5Width
+        dib.extend_from_slice(&height.to_le_bytes()); // bV5Height
+        dib.extend_from_slice(&1u16.to_le_bytes()); // bV5Planes
+        dib.extend_from_slice(&32u16.to_le_bytes()); // bV5BitCount
+        dib.extend_from_slice(&0u32.to_le_bytes()); // bV5Compression = BI_RGB
+        dib.extend_from_slice(&size_image.to_le_bytes()); // bV5SizeImage
+        dib.extend_from_slice(&0i32.to_le_bytes()); // bV5XPelsPerMeter
+        dib.extend_from_slice(&0i32.to_le_bytes()); // bV5YPelsPerMeter
+        dib.extend_from_slice(&0u32.to_le_bytes()); // bV5ClrUsed
+        dib.extend_from_slice(&0u32.to_le_bytes()); // bV5ClrImportant
+        dib.resize(124, 0); // masks + remaining V5 fields stay zero for BI_RGB
+
+        // Bottom-up: bottom image row stored first. Bytes are B,G,R + padding.
+        dib.extend_from_slice(&[
+            255, 0, 0, 0, // (0,1) bottom-left blue
+            255, 255, 255, 0, // (1,1) bottom-right white
+            0, 0, 255, 0, // (0,0) top-left red
+            0, 255, 0, 0, // (1,0) top-right green
+        ]);
+        dib
+    }
+
+    // Same pixel bytes as money_dib but top-down (negative height): the first
+    // stored row becomes the top image row.
+    fn top_down_dib() -> Vec<u8> {
+        let mut dib = v5_bitfields_header(2, -2, true);
+        // Identical pixel bytes to money_dib; only the height sign differs. With a
+        // top-down DIB the FIRST stored row is the top image row, so pixel (0,0)
+        // becomes blue here (vs. red in the bottom-up money_dib) — proving row order.
+        dib.extend_from_slice(&[
+            255, 0, 0, 0, // first stored row -> top: (0,0) blue
+            255, 255, 255, 0, // (1,0) white
+            0, 0, 255, 0, // second stored row -> bottom: (0,1) red
+            0, 255, 0, 0, // (1,1) green
+        ]);
+        dib
+    }
+
+    // BITMAPINFOHEADER (40 bytes).
+    fn info_header(
+        width: i32,
+        height: i32,
+        bit_count: u16,
+        compression: u32,
+        size_image: u32,
+    ) -> Vec<u8> {
+        let mut dib = Vec::with_capacity(40);
+        dib.extend_from_slice(&40u32.to_le_bytes()); // biSize
+        dib.extend_from_slice(&width.to_le_bytes());
+        dib.extend_from_slice(&height.to_le_bytes());
+        dib.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
+        dib.extend_from_slice(&bit_count.to_le_bytes());
+        dib.extend_from_slice(&compression.to_le_bytes());
+        dib.extend_from_slice(&size_image.to_le_bytes());
+        dib.extend_from_slice(&0i32.to_le_bytes()); // biXPelsPerMeter
+        dib.extend_from_slice(&0i32.to_le_bytes()); // biYPelsPerMeter
+        dib.extend_from_slice(&0u32.to_le_bytes()); // biClrUsed
+        dib.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
+        dib
+    }
+
+    // 3x1 24-bit BI_RGB image. Row is 9 data bytes padded to a 12-byte stride.
+    fn three_pixel_24_bit_dib() -> Vec<u8> {
+        let mut dib = info_header(3, 1, 24, 0, 12);
+        dib.extend_from_slice(&[
+            0, 0, 255, // red   (B,G,R)
+            0, 255, 0, // green
+            255, 0, 0, // blue
+            0, 0, 0, // stride padding to 12 bytes
+        ]);
+        dib
+    }
+
+    // 1x1 32-bit BI_RGB image; the 4th byte is junk and must be ignored.
+    fn single_pixel_32_bit_bi_rgb_dib(junk: u8) -> Vec<u8> {
+        let mut dib = info_header(1, 1, 32, 0, 4);
+        dib.extend_from_slice(&[0, 0, 255, junk]); // red (B,G,R) + junk
+        dib
+    }
+
+    // 2x1 8bpp BI_RGB indexed DIB with clr_used == 0 (the "full 256-entry palette"
+    // convention). Palette index 0 = red, index 1 = green; the index row is [0, 1]
+    // padded to the 4-byte DWORD stride. The pixels only decode correctly if the whole
+    // 1024-byte palette is skipped.
+    fn indexed_8bpp_dib() -> Vec<u8> {
+        // Row stride is ((2*8 + 31) / 32) * 4 = 4 bytes for the single row.
+        let mut dib = info_header(2, 1, 8, 0, 4);
+
+        // 256-entry RGBQUAD palette (B,G,R,0). Only indices 0 and 1 are meaningful.
+        let mut palette = vec![0u8; 256 * 4];
+        palette[0..4].copy_from_slice(&[0, 0, 255, 0]); // index 0 -> red
+        palette[4..8].copy_from_slice(&[0, 255, 0, 0]); // index 1 -> green
+        dib.extend_from_slice(&palette);
+
+        // 2x1 index row [0, 1] padded to the 4-byte DWORD stride.
+        dib.extend_from_slice(&[0, 1, 0, 0]);
+        dib
+    }
+
+    // Short-layout V5 BITFIELDS whose byte length is large enough that the size guard
+    // alone would treat it as "long" (>= 12-byte trailer + full pixel buffer). The 12
+    // bytes of trailing slack after the 16-byte pixel buffer model GlobalSize
+    // over-reporting allocation granularity. The first 12 pixel bytes deliberately do
+    // NOT match the header R/G/B masks, so only the masks_match check keeps the layout
+    // classified as SHORT.
+    fn short_layout_v5_bitfields_dib_with_trailing_slack() -> Vec<u8> {
+        let mut dib = v5_bitfields_header(2, 2, false);
+        // Bottom-up storage, bytes B,G,R,A. Opaque alpha (255) guarantees each pixel's
+        // little-endian u32 has 0xFF in its high byte, so it can never equal a header
+        // R/G/B mask (which all have a 0x00 high byte).
+        dib.extend_from_slice(&[
+            255, 0, 0, 255, // (0,1) bottom-left blue
+            255, 255, 255, 255, // (1,1) bottom-right white
+            0, 0, 255, 255, // (0,0) top-left red
+            0, 255, 0, 255, // (1,0) top-right green
+        ]);
+        // 12 bytes of trailing slack: enough that (dib.len - 124) >= 12 + 16, so the
+        // size guard alone would consider a long-layout trailer plausible. masks_match
+        // must override that and keep the layout SHORT.
+        dib.extend_from_slice(&[0u8; 12]);
         dib
     }
 }

@@ -23,13 +23,13 @@ describe("paste preview helpers", () => {
     expect(
       pastePreviewToState({
         status: "ready",
-        text: "Image file: C:/Temp/image.bmp\r",
+        text: "Image file: C:/Temp/image.png\r",
         processName: "codex.exe",
         adapterName: "codex-cli",
       }),
     ).toEqual({
       kind: "ready",
-      text: "Image file: C:/Temp/image.bmp\r",
+      text: "Image file: C:/Temp/image.png\r",
       processName: "codex.exe",
       adapterName: "codex-cli",
     });
@@ -39,12 +39,12 @@ describe("paste preview helpers", () => {
     expect(
       pastePreviewToState({
         status: "unsupportedImage",
-        path: "C:/Temp/image.bmp",
+        path: "C:/Temp/image.png",
         processName: "unknown.exe",
       }),
     ).toEqual({
       kind: "unsupported",
-      path: "C:/Temp/image.bmp",
+      path: "C:/Temp/image.png",
       processName: "unknown.exe",
     });
   });
@@ -53,16 +53,16 @@ describe("paste preview helpers", () => {
     expect(
       pastePreviewToTerminalInput({
         status: "ready",
-        text: "Image file: C:/Temp/image.bmp\r",
+        text: "Image file: C:/Temp/image.png\r",
         processName: "codex.exe",
         adapterName: "codex-cli",
       }),
-    ).toBe("Image file: C:/Temp/image.bmp\r");
+    ).toBe("Image file: C:/Temp/image.png\r");
 
     expect(
       pastePreviewToTerminalInput({
         status: "unsupportedImage",
-        path: "C:/Temp/image.bmp",
+        path: "C:/Temp/image.png",
         processName: "unknown.exe",
       }),
     ).toBeUndefined();
