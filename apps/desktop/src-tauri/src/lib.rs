@@ -1,13 +1,23 @@
 use serde::Serialize;
 use splice_core::{AdapterRegistry, PastePayload, PasteRoute};
 use splice_pty::{PtySession, TerminalSize};
-use std::{path::PathBuf, process::Command, sync::Mutex};
+use std::{
+    path::PathBuf,
+    process::Command,
+    sync::{Arc, Mutex},
+};
 use tauri::{Emitter, State};
 
 const PTY_OUTPUT_EVENT: &str = "pty-output";
 
 struct PtyState {
-    session: Mutex<Option<PtySession>>,
+    // Commands must lock this mutex only long enough to clone the `Arc`
+    // (or take it on teardown) and release the guard BEFORE calling any
+    // potentially blocking `PtySession` method. Otherwise a hung child
+    // blocking `pty_write` would stall `pty_interrupt`/`pty_resize`/
+    // `pty_read` behind this lock — the same stall the library layer
+    // already eliminates internally with the identical `Arc` pattern.
+    session: Mutex<Option<Arc<PtySession>>>,
 }
 
 #[tauri::command]
@@ -73,12 +83,14 @@ fn pty_spawn(
     let command = resolve_pty_command(program, args);
     let command_args = command.args.iter().map(String::as_str).collect::<Vec<_>>();
 
-    if let Some(previous_session) = state
+    let previous_session = state
         .session
         .lock()
         .map_err(|_| "PTY state lock poisoned".to_owned())?
-        .take()
-    {
+        .take();
+    // Close outside the lock: teardown blocks on process shutdown and the
+    // reader-thread join, and must not stall concurrent PTY commands.
+    if let Some(previous_session) = previous_session {
         previous_session.close();
     }
 
@@ -91,7 +103,7 @@ fn pty_spawn(
         .session
         .lock()
         .map_err(|_| "PTY state lock poisoned".to_owned())?;
-    *guard = Some(session);
+    *guard = Some(Arc::new(session));
 
     Ok(())
 }
@@ -145,20 +157,16 @@ fn common_cli_path_prefix() -> String {
 
 #[tauri::command]
 fn pty_write(state: State<'_, PtyState>, data: String) -> Result<(), String> {
-    let mut guard = state
-        .session
-        .lock()
-        .map_err(|_| "PTY state lock poisoned".to_owned())?;
-    let Some(session) = guard.as_ref() else {
-        return Err("PTY session is not running".to_owned());
-    };
+    let session =
+        clone_pty_session(&state)?.ok_or_else(|| "PTY session is not running".to_owned())?;
 
+    // The write runs on the clone with the state lock released, so a hung
+    // child cannot stall `pty_interrupt` (or any other PTY command).
     match session.write(&data) {
         Ok(()) => Ok(()),
         Err(error) if error.is_terminal_closed() => {
-            if let Some(closed_session) = guard.take() {
-                closed_session.close();
-            }
+            clear_pty_session_if_current(&state, &session);
+            session.close();
             Err("PTY session closed; start a new terminal session".to_owned())
         }
         Err(error) => Err(error.to_string()),
@@ -180,23 +188,16 @@ fn pty_resize(state: State<'_, PtyState>, cols: u16, rows: u16) -> Result<(), St
 // event, not returned from this command.
 #[tauri::command]
 fn pty_read(state: State<'_, PtyState>) -> Result<(), String> {
-    {
-        let mut guard = state
-            .session
-            .lock()
-            .map_err(|_| "PTY state lock poisoned".to_owned())?;
-        if guard
-            .as_ref()
-            .map(PtySession::is_running)
-            .transpose()
-            .map_err(|error| error.to_string())?
-            == Some(false)
-        {
-            if let Some(session) = guard.take() {
-                session.close();
-            }
-            return Err("PTY session closed; start a new terminal session".to_owned());
-        }
+    let Some(session) = clone_pty_session(&state)? else {
+        return Ok(());
+    };
+
+    // Liveness check and teardown run on the clone with the state lock
+    // released, so they cannot stall other PTY commands.
+    if !session.is_running().map_err(|error| error.to_string())? {
+        clear_pty_session_if_current(&state, &session);
+        session.close();
+        return Err("PTY session closed; start a new terminal session".to_owned());
     }
 
     Ok(())
@@ -204,11 +205,14 @@ fn pty_read(state: State<'_, PtyState>) -> Result<(), String> {
 
 #[tauri::command]
 fn pty_kill(state: State<'_, PtyState>) -> Result<(), String> {
-    let mut guard = state
+    let session = state
         .session
         .lock()
-        .map_err(|_| "PTY state lock poisoned".to_owned())?;
-    if let Some(session) = guard.take() {
+        .map_err(|_| "PTY state lock poisoned".to_owned())?
+        .take();
+    // Close outside the lock: teardown blocks on process shutdown and the
+    // reader-thread join, and must not stall concurrent PTY commands.
+    if let Some(session) = session {
         session.close();
     }
 
@@ -235,30 +239,51 @@ fn open_path(path: String) -> Result<(), String> {
         .map_err(|error| format!("Failed to reveal path: {error}"))
 }
 
+/// Clone the current session handle while holding the state lock only for
+/// the duration of the `Arc` clone. Callers invoke (possibly blocking)
+/// `PtySession` methods on the returned clone AFTER the lock is released.
+fn clone_pty_session(state: &State<'_, PtyState>) -> Result<Option<Arc<PtySession>>, String> {
+    let guard = state
+        .session
+        .lock()
+        .map_err(|_| "PTY state lock poisoned".to_owned())?;
+
+    Ok(guard.as_ref().map(Arc::clone))
+}
+
+/// Remove the stored session only if it is still the exact session that
+/// observed the failure, so a replacement spawned concurrently by
+/// `pty_spawn` is never torn down by a stale error path. Best-effort on
+/// lock poisoning: the caller's "session closed" error is the useful one.
+fn clear_pty_session_if_current(state: &State<'_, PtyState>, session: &Arc<PtySession>) {
+    if let Ok(mut guard) = state.session.lock() {
+        if guard
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, session))
+        {
+            guard.take();
+        }
+    }
+}
+
 fn with_pty_session<F>(state: &State<'_, PtyState>, operation: F) -> Result<(), String>
 where
     F: FnOnce(&PtySession) -> Result<(), splice_pty::PtyError>,
 {
-    let guard = state
-        .session
-        .lock()
-        .map_err(|_| "PTY state lock poisoned".to_owned())?;
-    let session = guard
-        .as_ref()
-        .ok_or_else(|| "PTY session is not running".to_owned())?;
+    let session =
+        clone_pty_session(state)?.ok_or_else(|| "PTY session is not running".to_owned())?;
 
-    operation(session).map_err(|error| error.to_string())
+    // Run the operation on the clone with the state lock released, so a
+    // blocking call here can never stall other PTY commands.
+    operation(&session).map_err(|error| error.to_string())
 }
 
 fn active_pty_process_name(state: &State<'_, PtyState>) -> Result<String, String> {
-    let guard = state
-        .session
-        .lock()
-        .map_err(|_| "PTY state lock poisoned".to_owned())?;
+    let session = clone_pty_session(state)?;
 
     let registry = AdapterRegistry::with_builtin_adapters();
-    let candidates = guard
-        .as_ref()
+    let candidates = session
+        .as_deref()
         .map(PtySession::active_process_candidates)
         .transpose()
         .map_err(|error| error.to_string())?
