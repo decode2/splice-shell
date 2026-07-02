@@ -190,3 +190,146 @@ fn conpty_default_shell_can_find_user_cli_paths_when_prefixed() {
         "expected prefixed PATH to resolve the stub CLI, got: {output:?}"
     );
 }
+
+#[cfg(windows)]
+#[test]
+fn live_pty_session_kills_grandchild_process_tree_on_close() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    // Regression test for orphan-freedom: `close()` must tear down the
+    // *entire* process tree rooted at the PTY's shell, not just the
+    // immediate shell process. This spawns a real two-level-deep
+    // descendant (root PowerShell -> cmd.exe -> ping.exe) and asserts it is
+    // gone after `close()`, exercising the
+    // `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` teardown path added to
+    // `crates/splice-pty/src/lib.rs`.
+    //
+    // What this does NOT prove: it does not pin the exact TOCTOU window
+    // that motivated the fix (a grandchild spawned *during* the old
+    // snapshot-and-kill enumeration in `close()`). Reliably winning that
+    // race deterministically would require sub-millisecond control over
+    // when the grandchild process is created relative to `close()`'s
+    // internal snapshot, which this environment cannot guarantee. Instead,
+    // this proves the achievable, still-meaningful invariant: a real
+    // grandchild that is fully alive and confirmed running by the time
+    // `close()` is called is nonetheless terminated by it. Any change that
+    // stops assigning the shell to a kill-on-close job, or that stops
+    // closing the job handle during teardown (leaving cleanup to the old
+    // PID-tree walk alone), will make this test fail if that walk ever
+    // misses the grandchild -- and always regresses the job-based
+    // guarantee even when the walk happens to still catch it.
+    let (sender, receiver) = mpsc::channel::<String>();
+    let session = splice_pty::PtySession::spawn(
+        "powershell.exe",
+        &["-NoLogo", "-NoProfile"],
+        splice_pty::TerminalSize::new(120, 30).expect("valid terminal size"),
+        move |output| {
+            let _ = sender.send(output);
+        },
+    )
+    .expect("live ConPTY session should start");
+
+    // Ask PowerShell to launch `cmd.exe` (a child of the PTY's root
+    // process), have that `cmd.exe` run a long-lived `ping -t` (a
+    // grandchild of the root process), then report the grandchild's real
+    // PID so the test can verify it directly rather than inferring it.
+    let script = concat!(
+        r#"$child = Start-Process -FilePath cmd.exe -ArgumentList '/D','/C','ping -t 127.0.0.1 >NUL' -PassThru; "#,
+        r#"Start-Sleep -Milliseconds 800; "#,
+        r#"$gc = (Get-CimInstance Win32_Process -Filter "ParentProcessId=$($child.Id)" | Select-Object -First 1 -ExpandProperty ProcessId); "#,
+        r#"Write-Output "SPLICE-GRANDCHILD-PID:$gc""#,
+        "\r\n"
+    );
+    session
+        .write(script)
+        .expect("PowerShell should accept the grandchild-spawning script");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut output = String::new();
+    let mut grandchild_pid: Option<u32> = None;
+    while Instant::now() < deadline && grandchild_pid.is_none() {
+        if let Ok(chunk) = receiver.recv_timeout(Duration::from_millis(250)) {
+            output.push_str(&chunk);
+            grandchild_pid = extract_marker_pid(&output, "SPLICE-GRANDCHILD-PID:");
+        }
+    }
+
+    let grandchild_pid = match grandchild_pid {
+        Some(pid) => pid,
+        None => {
+            session.close();
+            panic!(
+                "expected PowerShell to report a grandchild PID within the timeout, got: {output:?}"
+            );
+        }
+    };
+
+    assert!(
+        process_is_alive(grandchild_pid),
+        "expected grandchild ping.exe (pid {grandchild_pid}) to already be alive before close() \
+         is called, so this test actually proves close() kills it rather than it having already \
+         exited on its own"
+    );
+
+    session.close();
+
+    let kill_deadline = Instant::now() + Duration::from_secs(10);
+    let mut alive = process_is_alive(grandchild_pid);
+    while alive && Instant::now() < kill_deadline {
+        std::thread::sleep(Duration::from_millis(200));
+        alive = process_is_alive(grandchild_pid);
+    }
+
+    assert!(
+        !alive,
+        "expected grandchild process (pid {grandchild_pid}) to be terminated as part of \
+         close()'s process-tree teardown, but it was still running after the timeout -- \
+         this is an orphaned process"
+    );
+}
+
+/// Finds `marker` in `output` and parses the run of ASCII digits immediately
+/// following it as a `u32`.
+///
+/// PowerShell's PSReadLine echoes the command line back with syntax
+/// highlighting *before* it executes, so a literal marker string containing
+/// a variable reference (e.g. `"...:$gc"`) appears twice in the captured
+/// output: once as echoed source text (followed by the variable's *name*,
+/// not its value) and once as the real result (followed by digits). A plain
+/// `str::find` would match the echoed occurrence first and fail to parse a
+/// PID from it. This scans forward past any occurrence that isn't followed
+/// by at least one digit, so it finds the real result wherever it appears.
+#[cfg(windows)]
+fn extract_marker_pid(output: &str, marker: &str) -> Option<u32> {
+    let mut search_from = 0;
+    while let Some(relative_pos) = output[search_from..].find(marker) {
+        let pos = search_from + relative_pos;
+        let tail = &output[pos + marker.len()..];
+        let digits: String = tail.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+        if !digits.is_empty() {
+            if let Ok(pid) = digits.parse::<u32>() {
+                return Some(pid);
+            }
+        }
+        search_from = pos + marker.len();
+    }
+    None
+}
+
+/// Checks whether a process with the given PID is currently running.
+///
+/// Shells out to `tasklist` rather than linking the `windows` crate
+/// directly into the test binary, so this regression test doesn't need its
+/// own Win32 dependency just to assert a PID is gone.
+#[cfg(windows)]
+fn process_is_alive(pid: u32) -> bool {
+    let output = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .output()
+        .expect("tasklist should run");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let pid_text = pid.to_string();
+    stdout.split_whitespace().any(|token| token == pid_text)
+}

@@ -199,7 +199,7 @@ mod windows_conpty {
         time::Duration,
     };
     use windows::{
-        core::PWSTR,
+        core::{PCWSTR, PWSTR},
         Win32::{
             Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE},
             Storage::FileSystem::{ReadFile, WriteFile},
@@ -213,12 +213,18 @@ mod windows_conpty {
                     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
                     TH32CS_SNAPPROCESS,
                 },
+                JobObjects::{
+                    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+                    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                },
                 Pipes::CreatePipe,
                 Threading::{
                     CreateProcessW, DeleteProcThreadAttributeList,
-                    InitializeProcThreadAttributeList, TerminateProcess, UpdateProcThreadAttribute,
-                    WaitForSingleObject, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
-                    INFINITE, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, PROCESS_TERMINATE,
+                    InitializeProcThreadAttributeList, ResumeThread, TerminateProcess,
+                    UpdateProcThreadAttribute, WaitForSingleObject, CREATE_SUSPENDED,
+                    CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
+                    LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, PROCESS_TERMINATE,
                     PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTF_USESTDHANDLES, STARTUPINFOEXW,
                 },
             },
@@ -243,6 +249,14 @@ mod windows_conpty {
         reader: Option<JoinHandle<()>>,
         root_process_id: u32,
         root_process_name: String,
+        // `Some` when the child was placed in a `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+        // job at spawn time (see `create_kill_on_close_job`/`spawn_process`).
+        // Closing this handle in `close()` atomically kills every process
+        // still in the job, including anything spawned after assignment,
+        // with no snapshot race and no PID-recycling hazard. `None` only if
+        // job creation/assignment failed at spawn time, in which case
+        // `close()` falls back to the legacy snapshot-based tree walk.
+        job: Option<OwnedHandle>,
     }
 
     impl PtySession {
@@ -286,6 +300,7 @@ mod windows_conpty {
                     reader: Some(reader),
                     root_process_id: handles.process_id,
                     root_process_name: program.to_owned(),
+                    job: handles.job,
                 })),
             })
         }
@@ -399,10 +414,29 @@ mod windows_conpty {
             if let Ok(mut guard) = self.inner.lock() {
                 if let Some(mut inner) = guard.take() {
                     unsafe {
-                        let _ = terminate_process_tree(inner.root_process_id);
+                        // The kill-on-close job (when present) is the
+                        // race-free tree-teardown mechanism: closing its
+                        // handle below atomically kills every process still
+                        // in the job, including grandchildren spawned after
+                        // `spawn_process` returned. Running the old
+                        // snapshot-and-kill walk on top of a working job
+                        // would add no correctness benefit and reintroduces
+                        // the exact PID-recycling hazard this fix removes
+                        // (a snapshot taken now could target a PID already
+                        // recycled by the time it's opened). Only fall back
+                        // to it when no job was assigned at spawn time.
+                        if inner.job.is_none() {
+                            let _ = terminate_process_tree(inner.root_process_id);
+                        }
                         let _ = TerminateProcess(inner.process.raw(), 0);
                         WaitForSingleObject(inner.process.raw(), INFINITE);
                     }
+                    // Drop the job before the other handles so the
+                    // kill-on-close tree teardown fires as early as
+                    // possible during shutdown; `ClosePseudoConsole` and the
+                    // reader-thread join below don't depend on job members
+                    // being alive, so this ordering is deadlock-free.
+                    drop(inner.job.take());
                     drop(inner.input_write);
                     drop(inner.conpty);
                     if let Some(reader) = inner.reader.take() {
@@ -493,6 +527,7 @@ mod windows_conpty {
         let conpty = handles.conpty;
         let process = handles.process;
         let process_thread = handles.process_thread;
+        let job = handles.job;
         let output_reader = SendHandle(handles.output_read.into_raw());
         let reader = thread::spawn(move || read_all_from_send(output_reader));
         drop(process_thread);
@@ -509,6 +544,10 @@ mod windows_conpty {
         }
         drop(process);
         drop(conpty);
+        // Drop the job last so any child the shell spawned but didn't clean
+        // up before exiting is still reaped via kill-on-close, keeping this
+        // one-shot helper orphan-free too.
+        drop(job);
 
         let bytes = reader
             .join()
@@ -524,6 +563,9 @@ mod windows_conpty {
         process_thread: OwnedHandle,
         process_id: u32,
         conpty: OwnedPseudoConsole,
+        // See `PtySessionInner::job` for the kill-on-close contract this
+        // handle establishes.
+        job: Option<OwnedHandle>,
     }
 
     fn spawn_process(
@@ -580,7 +622,13 @@ mod windows_conpty {
                 None,
                 None,
                 false,
-                EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+                // CREATE_SUSPENDED holds the primary thread until this
+                // function explicitly resumes it below, *after* the process
+                // has been assigned to the kill-on-close job. Without this,
+                // the child could start running (and spawning its own
+                // children) before it is a job member, reopening the exact
+                // race this whole mechanism exists to close.
+                EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
                 None,
                 None,
                 &startup_info.StartupInfo,
@@ -588,14 +636,81 @@ mod windows_conpty {
             )?;
         }
 
+        let process = OwnedHandle::new(process_info.hProcess);
+        let process_thread = OwnedHandle::new(process_info.hThread);
+
+        // Attach the still-suspended child to a kill-on-close Job Object.
+        // Ordering is load-bearing: CREATE_SUSPENDED (above) -> assign ->
+        // resume (below). Assigning before resuming guarantees the OS kills
+        // the *whole* tree — including anything the child spawns after this
+        // point — atomically when the job's last handle closes, with no
+        // snapshot race and no PID-recycling hazard (the job tracks
+        // membership by kernel object, not by PID).
+        //
+        // `AssignProcessToJobObject` can fail on some hosts (e.g. this
+        // process is itself confined to a job created without
+        // JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK on pre-Windows-8 semantics).
+        // Degrade gracefully rather than failing the spawn: `close()` falls
+        // back to the legacy snapshot-based `terminate_process_tree` walk
+        // for sessions where `job` ends up `None`.
+        let job = match create_kill_on_close_job() {
+            Ok(job) => match unsafe { AssignProcessToJobObject(job.raw(), process.raw()) } {
+                Ok(()) => Some(job),
+                Err(_) => None,
+            },
+            Err(_) => None,
+        };
+
+        let resume_result = unsafe { ResumeThread(process_thread.raw()) };
+        if resume_result == u32::MAX {
+            // The child is suspended and about to be leaked (no other
+            // handle will observe it once this function returns an error).
+            // Terminate it explicitly rather than relying solely on `job`
+            // being dropped, since `job` may be `None` here.
+            let error = windows::core::Error::from_win32();
+            unsafe {
+                let _ = TerminateProcess(process.raw(), 0);
+            }
+            return Err(PtyError::Windows(error));
+        }
+
         Ok(SpawnedProcess {
             input_write,
             output_read,
-            process: OwnedHandle::new(process_info.hProcess),
-            process_thread: OwnedHandle::new(process_info.hThread),
+            process,
+            process_thread,
             process_id: process_info.dwProcessId,
             conpty,
+            job,
         })
+    }
+
+    /// Creates a Job Object configured with
+    /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`: when the last handle to the
+    /// returned job is closed, Windows atomically terminates every process
+    /// still assigned to it. This is the race-free replacement for
+    /// snapshot-and-kill tree teardown (see `terminate_process_tree`) —
+    /// there is no window between "enumerate processes" and "terminate
+    /// them" for a concurrently spawned grandchild to slip through, and no
+    /// PID-recycling hazard, because job membership is tracked by kernel
+    /// object rather than by PID.
+    fn create_kill_on_close_job() -> Result<OwnedHandle, PtyError> {
+        let job = unsafe { CreateJobObjectW(None, PCWSTR::null())? };
+        let job = OwnedHandle::new(job);
+
+        let mut limit_info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limit_info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+
+        unsafe {
+            SetInformationJobObject(
+                job.raw(),
+                JobObjectExtendedLimitInformation,
+                &limit_info as *const _ as *const c_void,
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )?;
+        }
+
+        Ok(job)
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -618,6 +733,17 @@ mod windows_conpty {
             .collect())
     }
 
+    /// Best-effort, racy fallback tree teardown: takes a ToolHelp snapshot,
+    /// walks descendants of `root_process_id` by PID, and terminates each
+    /// one found. Only used by `close()` when no kill-on-close Job Object
+    /// was assigned to the session at spawn time (see
+    /// `create_kill_on_close_job`), which should be rare (Windows 8+).
+    ///
+    /// This is *not* race-free: a process spawned between the snapshot and
+    /// the kill loop is not observed and is orphaned, and a PID reused
+    /// between snapshot and `OpenProcess` could in principle be targeted
+    /// instead of the intended descendant. It is kept only as a
+    /// last-resort fallback, not as a general teardown mechanism.
     fn terminate_process_tree(root_process_id: u32) -> Result<(), PtyError> {
         let processes = process_snapshot()?;
         let mut descendants = descendants_of(root_process_id, &processes);
