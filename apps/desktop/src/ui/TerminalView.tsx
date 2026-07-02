@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { FitAddon } from "@xterm/addon-fit";
+import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import type { ActivePasteTargetState } from "../paste/activePasteTarget";
@@ -107,7 +108,8 @@ export function TerminalView({
     const terminal = new Terminal({
       allowProposedApi: true,
       cursorBlink: true,
-      fontFamily: '"Cascadia Code", "Fira Code", Consolas, monospace',
+      fontFamily:
+        '"CaskaydiaCove Nerd Font", "CaskaydiaCove NF", "JetBrainsMono Nerd Font", "FiraCode Nerd Font", "Cascadia Code", "Fira Code", Consolas, monospace',
       fontSize: terminalSettings.fontSize,
       theme: {
         background: terminalSettings.background,
@@ -224,6 +226,22 @@ export function TerminalView({
       },
     });
 
+    // WebGL renderer avoids the DOM renderer's glyph clipping (Nerd Font icons get cut off) and
+    // is faster. It needs the terminal's canvas to already be mounted, which createTerminalBridge
+    // guarantees via terminal.open() above. WebGL can be unavailable (no GPU, disabled in
+    // WebView2, etc.), so construction/loading is best-effort and never crashes the terminal.
+    let webglAddon: WebglAddon | undefined;
+    try {
+      webglAddon = new WebglAddon();
+      terminal.loadAddon(webglAddon);
+      webglAddon.onContextLoss(() => {
+        webglAddon?.dispose();
+      });
+    } catch (error) {
+      console.error("WebGL renderer unavailable, falling back to the DOM renderer.", error);
+      webglAddon = undefined;
+    }
+
     const monitorPtySession = async () => {
       while (!disposed) {
         try {
@@ -313,6 +331,7 @@ export function TerminalView({
       unlistenPtyOutput?.();
       void killPty();
       fileLinkProvider.dispose();
+      webglAddon?.dispose();
       bridge.dispose();
       terminalRef.current = null;
     };

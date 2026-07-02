@@ -39,6 +39,8 @@ const mocks = vi.hoisted(() => ({
   >(),
   fitAddonFit: vi.fn<() => void>(),
   fitAddonDispose: vi.fn<() => void>(),
+  webglAddonOnContextLoss: vi.fn<(handler: () => void) => void>(),
+  webglAddonDispose: vi.fn<() => void>(),
 }));
 
 // Mock the Tauri IPC boundary. ptyClient.ts and fileLinks.ts call the real `invoke` wrapper
@@ -116,6 +118,20 @@ vi.mock("@xterm/addon-fit", () => {
   return { FitAddon: MockFitAddon };
 });
 
+vi.mock("@xterm/addon-webgl", () => {
+  class MockWebglAddon {
+    onContextLoss(handler: () => void) {
+      mocks.webglAddonOnContextLoss(handler);
+    }
+
+    dispose() {
+      mocks.webglAddonDispose();
+    }
+  }
+
+  return { WebglAddon: MockWebglAddon };
+});
+
 const readyPasteTarget: ActivePasteTargetState = {
   kind: "ready",
   processName: "codex.exe",
@@ -167,6 +183,9 @@ beforeEach(() => {
 
   mocks.fitAddonFit.mockReset();
   mocks.fitAddonDispose.mockReset();
+
+  mocks.webglAddonOnContextLoss.mockReset();
+  mocks.webglAddonDispose.mockReset();
 });
 
 afterEach(() => {
