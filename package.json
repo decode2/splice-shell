@@ -8,6 +8,7 @@
     "build": "npm --workspace apps/desktop run build",
     "preview": "npm --workspace apps/desktop run preview",
     "tauri": "npm --workspace apps/desktop run tauri",
+    "lint": "npm --workspace apps/desktop run lint",
     "test": "npm --workspaces run test --if-present",
     "typecheck": "npm --workspaces run typecheck --if-present"
   },
