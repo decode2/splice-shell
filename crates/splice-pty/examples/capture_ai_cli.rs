@@ -25,7 +25,7 @@ fn main() {
             &format!("set PATH={};%PATH%", common_cli_path_prefix()),
         ],
         splice_pty::TerminalSize::new(120, 40).expect("valid terminal size"),
-        move |output| {
+        move |_id, output| {
             let _ = sender.send(output);
         },
         |_id| {},

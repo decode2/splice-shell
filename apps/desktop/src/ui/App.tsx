@@ -21,6 +21,13 @@ const TerminalView = lazy(() =>
 
 export function App() {
   const disposedRef = useRef(false);
+  // The active PTY session's monotonic id, published by `TerminalView` via
+  // `onPtyReady`. Threaded into the id-scoped `writePty` and paste-target
+  // commands. Undefined until the first session is recorded; the `?? 0`
+  // sentinel (the counter starts at 1) makes a pre-session write a guaranteed
+  // backend miss that maps to today's "not running" error, and the
+  // paste-target commands accept the undefined as a `None` fallback.
+  const activeSessionIdRef = useRef<number | undefined>(undefined);
   // One window-chrome instance shared by the maximized hook and the title bar's
   // controls, so getCurrentWindow() is resolved once (lazily, Tauri-safe).
   const chrome = useMemo(() => getWindowChrome(), []);
@@ -50,7 +57,7 @@ export function App() {
     });
   const refreshActivePasteTarget = useCallback(async () => {
     try {
-      const target = await getActivePasteTarget();
+      const target = await getActivePasteTarget(activeSessionIdRef.current);
       if (!disposedRef.current) {
         setActivePasteTargetState(activePasteTargetToState(target));
       }
@@ -85,11 +92,11 @@ export function App() {
 
   const pasteClipboardImageIntoTerminal = useCallback(async () => {
     try {
-      const preview = await previewActiveClipboardImagePaste();
+      const preview = await previewActiveClipboardImagePaste(activeSessionIdRef.current);
       setPasteState(pastePreviewToState(preview));
       const terminalInput = pastePreviewToTerminalInput(preview);
       if (terminalInput) {
-        await writePty(terminalInput);
+        await writePty(terminalInput, activeSessionIdRef.current ?? 0);
         debouncedActivePasteTargetRefresh.schedule();
       }
     } catch (error) {
@@ -102,10 +109,18 @@ export function App() {
 
   const pasteTextIntoTerminal = useCallback(
     async (text: string) => {
-      await writePty(text);
+      await writePty(text, activeSessionIdRef.current ?? 0);
       debouncedActivePasteTargetRefresh.schedule();
     },
     [debouncedActivePasteTargetRefresh],
+  );
+
+  const handlePtyReady = useCallback(
+    (sessionId: number) => {
+      activeSessionIdRef.current = sessionId;
+      void refreshActivePasteTarget();
+    },
+    [refreshActivePasteTarget],
   );
 
   return (
@@ -129,7 +144,7 @@ export function App() {
           onInputActivity={debouncedActivePasteTargetRefresh.schedule}
           onSessionHealth={handleSessionHealth}
           onTextPaste={pasteTextIntoTerminal}
-          onPtyReady={refreshActivePasteTarget}
+          onPtyReady={handlePtyReady}
           settingsOpen={settingsOpen}
           onCloseSettings={closeSettings}
         />

@@ -125,7 +125,7 @@ impl PtySession {
         _on_exit: G,
     ) -> Result<Self, PtyError>
     where
-        F: FnMut(String) + Send + 'static,
+        F: FnMut(u64, String) + Send + 'static,
         G: FnOnce(u64) + Send + 'static,
     {
         Err(PtyError::UnsupportedPlatform)
@@ -303,7 +303,7 @@ mod windows_conpty {
             on_exit: G,
         ) -> Result<Self, PtyError>
         where
-            F: FnMut(String) + Send + 'static,
+            F: FnMut(u64, String) + Send + 'static,
             G: FnOnce(u64) + Send + 'static,
         {
             let handles = spawn_process(program, args, size)?;
@@ -352,14 +352,14 @@ mod windows_conpty {
                     pending.extend_from_slice(bytes);
                     let split = pending.len() - incomplete_utf8_tail_len(&pending);
                     if split > 0 {
-                        on_output(String::from_utf8_lossy(&pending[..split]).into_owned());
+                        on_output(id, String::from_utf8_lossy(&pending[..split]).into_owned());
                         pending.drain(..split);
                     }
                 });
                 // Flush trailing bytes at EOF; an incomplete sequence here will
                 // never complete, so decode it lossily rather than drop it.
                 if !pending.is_empty() {
-                    on_output(String::from_utf8_lossy(&pending).into_owned());
+                    on_output(id, String::from_utf8_lossy(&pending).into_owned());
                 }
             });
 

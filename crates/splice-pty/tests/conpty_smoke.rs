@@ -44,7 +44,7 @@ fn live_pty_session_writes_input_and_streams_output() {
         "cmd.exe",
         &["/D", "/K"],
         splice_pty::TerminalSize::new(80, 24).expect("valid terminal size"),
-        move |output| {
+        move |_id, output| {
             let _ = sender.send(output);
         },
         |_id| {},
@@ -73,6 +73,46 @@ fn live_pty_session_writes_input_and_streams_output() {
 
 #[cfg(windows)]
 #[test]
+fn on_output_receives_the_spawned_session_id() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    // The `on_output` callback must receive the emitting session's monotonic
+    // id as its first argument (mirroring `on_exit`), so the Tauri layer can
+    // attribute each `pty-output` chunk to the session that produced it.
+    let (sender, receiver) = mpsc::channel::<(u64, String)>();
+    let session = splice_pty::PtySession::spawn(
+        "cmd.exe",
+        &["/D", "/K"],
+        splice_pty::TerminalSize::new(80, 24).expect("valid terminal size"),
+        move |id, output| {
+            let _ = sender.send((id, output));
+        },
+        |_id| {},
+    )
+    .expect("live ConPTY session should start");
+
+    let session_id = session.id();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut observed_id: Option<u64> = None;
+    while Instant::now() < deadline && observed_id.is_none() {
+        if let Ok((id, _chunk)) = receiver.recv_timeout(Duration::from_millis(250)) {
+            observed_id = Some(id);
+        }
+    }
+
+    session.close();
+
+    assert_eq!(
+        observed_id,
+        Some(session_id),
+        "on_output must receive the emitting session's monotonic id as its first argument"
+    );
+}
+
+#[cfg(windows)]
+#[test]
 fn live_pty_session_forwards_arrow_up_to_shell_history() {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
@@ -82,7 +122,7 @@ fn live_pty_session_forwards_arrow_up_to_shell_history() {
         "cmd.exe",
         &["/D", "/K"],
         splice_pty::TerminalSize::new(80, 24).expect("valid terminal size"),
-        move |output| {
+        move |_id, output| {
             let _ = sender.send(output);
         },
         |_id| {},
@@ -126,7 +166,7 @@ fn live_pty_ctrl_c_interrupts_command_without_closing_shell() {
         "cmd.exe",
         &["/D", "/K"],
         splice_pty::TerminalSize::new(80, 24).expect("valid terminal size"),
-        move |output| {
+        move |_id, output| {
             let _ = sender.send(output);
         },
         |_id| {},
@@ -227,7 +267,7 @@ fn live_pty_session_kills_grandchild_process_tree_on_close() {
         "powershell.exe",
         &["-NoLogo", "-NoProfile"],
         splice_pty::TerminalSize::new(120, 30).expect("valid terminal size"),
-        move |output| {
+        move |_id, output| {
             let _ = sender.send(output);
         },
         |_id| {},
@@ -323,7 +363,7 @@ fn pty_spawn_close_cycles_do_not_leak_process_handles() {
             "cmd.exe",
             &["/D", "/K"],
             splice_pty::TerminalSize::new(80, 24).expect("valid terminal size"),
-            |_output| {},
+            |_id, _output| {},
             |_id| {},
         )
         .expect("PTY session should spawn for the handle-leak regression test");
@@ -381,7 +421,7 @@ fn waiter_thread_fires_on_exit_when_child_exits_naturally() {
         "cmd.exe",
         &["/D", "/C", "exit"],
         splice_pty::TerminalSize::new(80, 24).expect("valid terminal size"),
-        |_output| {},
+        |_id, _output| {},
         move |id| {
             let _ = exit_tx.send(id);
         },
@@ -420,7 +460,7 @@ fn intentional_close_suppresses_on_exit_callback() {
         "cmd.exe",
         &["/D", "/K"],
         splice_pty::TerminalSize::new(80, 24).expect("valid terminal size"),
-        |_output| {},
+        |_id, _output| {},
         move |_id| {
             fired_in_callback.store(true, Ordering::SeqCst);
         },
@@ -467,7 +507,7 @@ fn natural_exit_spawn_close_cycles_do_not_leak_handles_or_threads() {
             "cmd.exe",
             &["/D", "/C", "exit"],
             splice_pty::TerminalSize::new(80, 24).expect("valid terminal size"),
-            |_output| {},
+            |_id, _output| {},
             move |id| {
                 let _ = exit_tx.send(id);
             },

@@ -67,6 +67,9 @@ export async function previewClipboardImagePaste(processName: string) {
   });
 }
 
-export async function previewActiveClipboardImagePaste() {
-  return invoke<PastePreview>(PREVIEW_ACTIVE_CLIPBOARD_IMAGE_PASTE_COMMAND);
+// `sessionId` is optional and forwarded to the backend; an omitted or unknown
+// id falls back to the cmd.exe paste target rather than erroring
+// (Paste-Target Fallback Parity).
+export async function previewActiveClipboardImagePaste(sessionId?: number) {
+  return invoke<PastePreview>(PREVIEW_ACTIVE_CLIPBOARD_IMAGE_PASTE_COMMAND, { sessionId });
 }

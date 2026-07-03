@@ -42,6 +42,9 @@ export function activePasteTargetToState(target: ActivePasteTarget): ActivePaste
   };
 }
 
-export async function getActivePasteTarget() {
-  return invoke<ActivePasteTarget>(ACTIVE_PASTE_TARGET_COMMAND);
+// `sessionId` is optional: at mount (before any session exists) and for the
+// cmd.exe fallback the frontend omits it, and the backend resolves the default
+// paste target rather than erroring (Paste-Target Fallback Parity).
+export async function getActivePasteTarget(sessionId?: number) {
+  return invoke<ActivePasteTarget>(ACTIVE_PASTE_TARGET_COMMAND, { sessionId });
 }

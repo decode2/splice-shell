@@ -1,16 +1,43 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   isPasteShortcut,
   pastePreviewToState,
   pastePreviewToTerminalInput,
+  previewActiveClipboardImagePaste,
   PREVIEW_ACTIVE_CLIPBOARD_IMAGE_PASTE_COMMAND,
 } from "./pastePreview";
+
+const invokeMock = vi.hoisted(() => vi.fn());
+
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: invokeMock,
+}));
+
+afterEach(() => {
+  invokeMock.mockReset();
+});
 
 describe("paste preview helpers", () => {
   it("keeps the active paste command name explicit", () => {
     expect(PREVIEW_ACTIVE_CLIPBOARD_IMAGE_PASTE_COMMAND).toBe(
       "preview_active_clipboard_image_paste",
     );
+  });
+
+  it("forwards a provided session id to the active preview command", () => {
+    invokeMock.mockResolvedValue({ status: "unsupportedImage", path: "x", processName: "cmd.exe" });
+    void previewActiveClipboardImagePaste(5);
+    expect(invokeMock).toHaveBeenCalledWith(PREVIEW_ACTIVE_CLIPBOARD_IMAGE_PASTE_COMMAND, {
+      sessionId: 5,
+    });
+  });
+
+  it("omits the session id when none is provided", () => {
+    invokeMock.mockResolvedValue({ status: "unsupportedImage", path: "x", processName: "cmd.exe" });
+    void previewActiveClipboardImagePaste();
+    expect(invokeMock).toHaveBeenCalledWith(PREVIEW_ACTIVE_CLIPBOARD_IMAGE_PASTE_COMMAND, {
+      sessionId: undefined,
+    });
   });
 
   it("detects Ctrl+V and Cmd+V paste shortcuts", () => {

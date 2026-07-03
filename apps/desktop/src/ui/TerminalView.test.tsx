@@ -167,6 +167,24 @@ function emitPtyExit(sessionId: number) {
   });
 }
 
+// Emits a `pty-output` event carrying the session-attributed payload the
+// backend now sends: `{ sessionId, data }`.
+function emitPtyOutput(sessionId: number, data: string) {
+  const outputHandler = capturedOutputHandlers.at(-1);
+  act(() => {
+    outputHandler?.({ event: PTY_OUTPUT_EVENT, id: 0, payload: { sessionId, data } });
+  });
+}
+
+// Concatenates every string written to the terminal, so order-sensitive
+// assertions can check that early-output chunks were flushed in arrival order
+// even after the scheduler coalesces adjacent plain-text writes.
+function joinedTerminalWrites() {
+  return mocks.terminalWrite.mock.calls
+    .map(([data]) => (typeof data === "string" ? data : ""))
+    .join("");
+}
+
 // Flush the microtask + macrotask queues so an async restart (spawnPty await +
 // finally) settles before the test inspects invoke calls.
 async function flushAsync() {
@@ -261,7 +279,11 @@ describe("TerminalView PTY lifecycle", () => {
     expect(outputHandler).toBeDefined();
 
     act(() => {
-      outputHandler?.({ event: PTY_OUTPUT_EVENT, id: 1, payload: "hello from the shell\r\n" });
+      outputHandler?.({
+        event: PTY_OUTPUT_EVENT,
+        id: 1,
+        payload: { sessionId: 1, data: "hello from the shell\r\n" },
+      });
     });
 
     await waitFor(() => {
@@ -346,7 +368,11 @@ describe("TerminalView pty-exit driven restart", () => {
     // cursor-show): the filter is now mid-span with an open synthetic sync.
     const outputHandler = capturedOutputHandlers.at(-1);
     act(() => {
-      outputHandler?.({ event: PTY_OUTPUT_EVENT, id: 1, payload: "\x1b[?25l\x1b[K" });
+      outputHandler?.({
+        event: PTY_OUTPUT_EVENT,
+        id: 1,
+        payload: { sessionId: 1, data: "\x1b[?25l\x1b[K" },
+      });
     });
     await flushAsync();
 
@@ -493,7 +519,7 @@ describe("TerminalView pty-exit driven restart", () => {
           outputHandler?.({
             event: PTY_OUTPUT_EVENT,
             id: lastSpawnCount,
-            payload: "boot banner\r\n",
+            payload: { sessionId: lastSpawnCount, data: "boot banner\r\n" },
           });
         });
         emitPtyExit(lastSpawnCount);
@@ -630,7 +656,11 @@ describe("TerminalView pty-exit driven restart", () => {
     // the quiet timer instead of being written inline.
     const outputHandler = capturedOutputHandlers.at(-1);
     act(() => {
-      outputHandler?.({ event: PTY_OUTPUT_EVENT, id: 1, payload: "\x1b[?25l frame \x1b[?25h" });
+      outputHandler?.({
+        event: PTY_OUTPUT_EVENT,
+        id: 1,
+        payload: { sessionId: 1, data: "\x1b[?25l frame \x1b[?25h" },
+      });
     });
     await flushAsync();
 
@@ -654,6 +684,245 @@ describe("TerminalView pty-exit driven restart", () => {
     // NOT fire a second, stranded deferred emission after the component is gone.
     await new Promise((resolve) => setTimeout(resolve, 250));
     expect(showWrites()).toBe(releasedAtTeardown);
+  });
+});
+
+describe("TerminalView session demultiplexing", () => {
+  it("writes output whose sessionId matches the current session", async () => {
+    render(<TerminalView />);
+
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
+    });
+    await waitFor(() => {
+      expect(capturedOutputHandlers.length).toBeGreaterThan(0);
+    });
+
+    // The first spawn resolved to id 1, so output attributed to session 1 is
+    // this view's own output and must be written.
+    emitPtyOutput(1, "own output\r\n");
+    await waitFor(() => {
+      expect(mocks.terminalWrite).toHaveBeenCalledWith("own output\r\n");
+    });
+  });
+
+  it("drops output attributed to a stale, already-superseded session", async () => {
+    render(<TerminalView />);
+
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
+    });
+
+    // Restart once so the current session id advances to 2.
+    emitPtyExit(1);
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(2);
+    });
+    await flushAsync();
+
+    // Output for the old session (id 1 < current id 2) must NOT be written.
+    emitPtyOutput(1, "STALE-SESSION-OUTPUT");
+    await flushAsync();
+
+    expect(joinedTerminalWrites()).not.toContain("STALE-SESSION-OUTPUT");
+  });
+
+  it("queues multi-chunk early output and flushes it in arrival order on record", async () => {
+    let resolveSpawn1: (() => void) | undefined;
+    let spawnId = 0;
+    mocks.invoke.mockImplementation((command) => {
+      if (command === "pty_spawn") {
+        spawnId += 1;
+        const thisId = spawnId;
+        if (thisId === 1) {
+          return new Promise<number>((resolve) => {
+            resolveSpawn1 = () => resolve(thisId);
+          });
+        }
+        return Promise.resolve(thisId);
+      }
+      return Promise.resolve(undefined);
+    });
+
+    render(<TerminalView />);
+
+    await waitFor(() => {
+      expect(capturedOutputHandlers.length).toBeGreaterThan(0);
+    });
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
+    });
+
+    // Three chunks for session 1 arrive BEFORE spawnPty resolves (currentSessionId
+    // is still undefined), so they must be queued, not dropped.
+    emitPtyOutput(1, "AAA");
+    emitPtyOutput(1, "BBB");
+    emitPtyOutput(1, "CCC");
+    await flushAsync();
+    // Nothing recorded yet: the chunks are still queued, not written.
+    expect(joinedTerminalWrites()).not.toContain("AAA");
+
+    // Recording session 1 synchronously drains the queue in arrival order.
+    await act(async () => {
+      resolveSpawn1?.();
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    });
+    // Let the output scheduler's rAF flush the coalesced write to the terminal.
+    await flushAsync();
+
+    await waitFor(() => {
+      expect(joinedTerminalWrites()).toContain("AAABBBCCC");
+    });
+  });
+
+  it("drops queued chunks whose sessionId differs from the recorded session on flush", async () => {
+    let resolveSpawn1: (() => void) | undefined;
+    let spawnId = 0;
+    mocks.invoke.mockImplementation((command) => {
+      if (command === "pty_spawn") {
+        spawnId += 1;
+        const thisId = spawnId;
+        if (thisId === 1) {
+          return new Promise<number>((resolve) => {
+            resolveSpawn1 = () => resolve(thisId);
+          });
+        }
+        return Promise.resolve(thisId);
+      }
+      return Promise.resolve(undefined);
+    });
+
+    render(<TerminalView />);
+
+    await waitFor(() => {
+      expect(capturedOutputHandlers.length).toBeGreaterThan(0);
+    });
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
+    });
+
+    // One chunk for the about-to-be-recorded session 1 and one for a different
+    // (never-recorded-here) session 2, both queued before spawn resolves.
+    emitPtyOutput(1, "KEEP-ME");
+    emitPtyOutput(2, "DROP-ME");
+    await flushAsync();
+
+    await act(async () => {
+      resolveSpawn1?.();
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    });
+    await flushAsync();
+
+    await waitFor(() => {
+      expect(joinedTerminalWrites()).toContain("KEEP-ME");
+    });
+    expect(joinedTerminalWrites()).not.toContain("DROP-ME");
+  });
+
+  it("flushes queued output BEFORE acting on a stashed instant-exit so the banner still prints", async () => {
+    let resolveSpawn1: (() => void) | undefined;
+    let spawnId = 0;
+    mocks.invoke.mockImplementation((command) => {
+      if (command === "pty_spawn") {
+        spawnId += 1;
+        const thisId = spawnId;
+        if (thisId === 1) {
+          return new Promise<number>((resolve) => {
+            resolveSpawn1 = () => resolve(thisId);
+          });
+        }
+        return Promise.resolve(thisId);
+      }
+      return Promise.resolve(undefined);
+    });
+
+    render(<TerminalView />);
+
+    await waitFor(() => {
+      expect(capturedOutputHandlers.length).toBeGreaterThan(0);
+      expect(capturedExitHandlers.length).toBeGreaterThan(0);
+    });
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
+    });
+
+    // An instant-exit shell prints a banner then dies, BOTH before spawnPty
+    // resolves: the banner is queued and the exit is stashed.
+    emitPtyOutput(1, "INSTANT-BANNER");
+    emitPtyExit(1);
+    await flushAsync();
+
+    // Recording session 1 must flush the banner BEFORE it acts on the stashed
+    // exit and restarts, so the banner is not eaten by the early-return path.
+    await act(async () => {
+      resolveSpawn1?.();
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    });
+    await flushAsync();
+
+    await waitFor(() => {
+      expect(joinedTerminalWrites()).toContain("INSTANT-BANNER");
+    });
+    // The stashed exit still drove exactly one restart.
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(2);
+    });
+  });
+
+  it("kills a spawn that resolves after the view was disposed and records no state", async () => {
+    let resolveSpawn1: (() => void) | undefined;
+    let spawnId = 0;
+    mocks.invoke.mockImplementation((command) => {
+      if (command === "pty_spawn") {
+        spawnId += 1;
+        const thisId = spawnId;
+        if (thisId === 1) {
+          return new Promise<number>((resolve) => {
+            resolveSpawn1 = () => resolve(thisId);
+          });
+        }
+        return Promise.resolve(thisId);
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const onPtyReady = vi.fn<(sessionId: number) => void>();
+    const { unmount } = render(<TerminalView onPtyReady={onPtyReady} />);
+
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
+    });
+
+    // Dispose the view while spawn 1 is still in flight.
+    act(() => {
+      unmount();
+    });
+
+    // The in-flight spawn now resolves AFTER disposal: it must kill the orphan
+    // session by id and record no state (no onPtyReady for it).
+    await act(async () => {
+      resolveSpawn1?.();
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    });
+
+    expect(
+      getInvokeCallsFor("pty_kill").some(
+        ([, args]) => (args as { sessionId: number }).sessionId === 1,
+      ),
+    ).toBe(true);
+    expect(onPtyReady).not.toHaveBeenCalled();
+  });
+
+  it("passes the spawned session id to onPtyReady", async () => {
+    const onPtyReady = vi.fn<(sessionId: number) => void>();
+    render(<TerminalView onPtyReady={onPtyReady} />);
+
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
+    });
+    await flushAsync();
+
+    expect(onPtyReady).toHaveBeenCalledWith(1);
   });
 });
 

@@ -8,8 +8,21 @@ export type PtyLaunchCommand = {
   args?: string[];
 };
 
-export function isPtyOutputPayload(payload: unknown): payload is string {
-  return typeof payload === "string";
+// The backend `pty-output` event carries the emitting session's monotonic id
+// alongside the decoded bytes, so a `TerminalView` can demultiplex output
+// across concurrent sessions (mirroring the `pty-exit` id payload).
+export type PtyOutputPayload = {
+  sessionId: number;
+  data: string;
+};
+
+export function isPtyOutputPayload(payload: unknown): payload is PtyOutputPayload {
+  return (
+    typeof payload === "object" &&
+    payload !== null &&
+    typeof (payload as { sessionId?: unknown }).sessionId === "number" &&
+    typeof (payload as { data?: unknown }).data === "string"
+  );
 }
 
 // The backend `pty-exit` event carries the exiting session's monotonic id
@@ -38,23 +51,29 @@ export function spawnPty({
   });
 }
 
-export function writePty(data: string) {
+export function writePty(data: string, sessionId: number) {
   return invoke<void>("pty_write", {
     data,
+    sessionId,
   });
 }
 
-export function interruptPty() {
-  return invoke<void>("pty_interrupt");
+export function interruptPty(sessionId: number) {
+  return invoke<void>("pty_interrupt", {
+    sessionId,
+  });
 }
 
-export function resizePty(size: { cols: number; rows: number }) {
+export function resizePty(size: { cols: number; rows: number }, sessionId: number) {
   return invoke<void>("pty_resize", {
     cols: size.cols,
     rows: size.rows,
+    sessionId,
   });
 }
 
-export function killPty() {
-  return invoke<void>("pty_kill");
+export function killPty(sessionId: number) {
+  return invoke<void>("pty_kill", {
+    sessionId,
+  });
 }

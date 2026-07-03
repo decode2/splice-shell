@@ -2,6 +2,7 @@ use serde::Serialize;
 use splice_core::{AdapterRegistry, PastePayload, PasteRoute};
 use splice_pty::{PtySession, TerminalSize};
 use std::{
+    collections::HashMap,
     path::PathBuf,
     process::Command,
     sync::{Arc, Mutex},
@@ -12,19 +13,32 @@ const PTY_OUTPUT_EVENT: &str = "pty-output";
 const PTY_EXIT_EVENT: &str = "pty-exit";
 
 struct PtyState {
-    // Commands must lock this mutex only long enough to clone the `Arc`
-    // (or take it on teardown) and release the guard BEFORE calling any
-    // potentially blocking `PtySession` method. Otherwise a hung child
-    // blocking `pty_write` would stall `pty_interrupt`/`pty_resize` behind
-    // this lock — the same stall the library layer already eliminates
-    // internally with the identical `Arc` pattern.
+    // Keyed by each session's monotonic id (`PtySession::id()`), so multiple
+    // concurrent sessions coexist without collision. Commands must lock this
+    // mutex only long enough to clone the `Arc` for a given id (or remove it
+    // on teardown) and release the guard BEFORE calling any potentially
+    // blocking `PtySession` method. Otherwise a hung child blocking
+    // `pty_write` would stall `pty_interrupt`/`pty_resize` behind this lock —
+    // the same stall the library layer already eliminates internally with the
+    // identical `Arc` pattern.
     //
     // Session death is no longer polled from the frontend. Each `PtySession`
     // runs a waiter thread that pushes a `pty-exit` event on natural exit
     // (see `pty_spawn`); the natural-exit path also clears this state itself
     // (`clear_and_close_session_by_id`) so a dead session's ConPTY/pipe/job
-    // handles never linger.
-    session: Mutex<Option<Arc<PtySession>>>,
+    // handles never linger. Removal is id-scoped and idempotent: a second
+    // removal of the same id is a harmless no-op.
+    sessions: Mutex<HashMap<u64, Arc<PtySession>>>,
+}
+
+/// Payload for the global `pty-output` event. Every emission carries the
+/// emitting session's monotonic id so the frontend can demultiplex output
+/// across concurrent sessions (mirroring the `pty-exit` id payload).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PtyOutputPayload {
+    session_id: u64,
+    data: String,
 }
 
 #[tauri::command]
@@ -62,16 +76,20 @@ fn preview_clipboard_image_paste(process_name: String) -> Result<PastePreview, S
 }
 
 #[tauri::command]
-fn active_paste_target(state: State<'_, PtyState>) -> Result<ActivePasteTarget, String> {
-    let process_name = active_pty_process_name(&state)?;
+fn active_paste_target(
+    state: State<'_, PtyState>,
+    session_id: Option<u64>,
+) -> Result<ActivePasteTarget, String> {
+    let process_name = active_pty_process_name(state.inner(), session_id)?;
     Ok(active_paste_target_for_process(&process_name))
 }
 
 #[tauri::command]
 fn preview_active_clipboard_image_paste(
     state: State<'_, PtyState>,
+    session_id: Option<u64>,
 ) -> Result<PastePreview, String> {
-    let process_name = active_pty_process_name(&state)?;
+    let process_name = active_pty_process_name(state.inner(), session_id)?;
     let payload = read_clipboard_image_paste_payload()?;
 
     Ok(preview_paste_payload(&process_name, &payload))
@@ -90,17 +108,10 @@ fn pty_spawn(
     let command = resolve_pty_command(program, args);
     let command_args = command.args.iter().map(String::as_str).collect::<Vec<_>>();
 
-    let previous_session = state
-        .session
-        .lock()
-        .map_err(|_| "PTY state lock poisoned".to_owned())?
-        .take();
-    // Close outside the lock: teardown blocks on process shutdown and the
-    // reader-thread join, and must not stall concurrent PTY commands.
-    if let Some(previous_session) = previous_session {
-        previous_session.close();
-    }
-
+    // No predecessor `.take()`/close here: sessions are keyed by id and coexist.
+    // Each session is torn down explicitly by its own id (frontend `killPty`,
+    // the detached natural-exit cleanup, or the instant-exit re-check below),
+    // so a new spawn never reaps an existing session.
     let output_app = app.clone();
     let cleanup_app = app.clone();
     let exit_app = app;
@@ -108,8 +119,14 @@ fn pty_spawn(
         &command.program,
         &command_args,
         size,
-        move |output| {
-            let _ = output_app.emit(PTY_OUTPUT_EVENT, output);
+        move |id, output| {
+            let _ = output_app.emit(
+                PTY_OUTPUT_EVENT,
+                PtyOutputPayload {
+                    session_id: id,
+                    data: output,
+                },
+            );
         },
         move |id| {
             // Natural exit: push the id to the frontend so it can decide
@@ -136,24 +153,24 @@ fn pty_spawn(
 
     {
         let mut guard = state
-            .session
+            .sessions
             .lock()
             .map_err(|_| "PTY state lock poisoned".to_owned())?;
-        *guard = Some(Arc::new(session));
+        guard.insert(id, Arc::new(session));
     }
 
     // Instant-exit race: if the child died before we stored it, its detached
-    // `clear_and_close_session_by_id(id)` cleanup already ran while
-    // `state.session` was still `None` (a no-op), and we just stored a dead
-    // session whose ConPTY/pipe/job handles and reader/waiter threads would
-    // otherwise linger until the next interaction. Now that it is stored,
-    // re-check liveness and, if it is not running, clear+close it immediately.
+    // `clear_and_close_session_by_id(id)` cleanup already ran while this id was
+    // absent from the registry (a no-op), and we just stored a dead session
+    // whose ConPTY/pipe/job handles and reader/waiter threads would otherwise
+    // linger until the next interaction. Now that it is stored, re-check
+    // liveness by id and, if it is not running, clear+close it immediately.
     // `is_running()` only errs on a poisoned lock or an already-closed session,
     // so a non-`Ok(true)` result is treated as dead. The teardown reuses the
-    // id-scoped, `Option::take`-idempotent `clear_and_close_session_by_id`, so
-    // a replacement spawned concurrently is never torn down, and its `close()`
-    // runs with the state lock released (no thread-join deadlock).
-    let still_running = clone_pty_session(&state)?
+    // id-scoped, idempotent `clear_and_close_session_by_id`, so a different
+    // session is never torn down, and its `close()` runs with the state lock
+    // released (no thread-join deadlock).
+    let still_running = clone_pty_session_by_id(state.inner(), id)?
         .and_then(|session| session.is_running().ok())
         .unwrap_or(false);
     if !still_running {
@@ -163,23 +180,25 @@ fn pty_spawn(
     Ok(id)
 }
 
-/// Remove and close the stored session only if it is still the exact session
-/// with `id` that just exited, so a replacement spawned concurrently by
-/// `pty_spawn` is never torn down by a stale natural-exit path. Runs on a
-/// detached thread off the waiter thread (see `pty_spawn`); `close()` here
-/// joins the now-finished waiter and releases the dead session's handles.
+/// Remove the session with `id` from the registry and return its `Arc` so the
+/// caller can close it OUTSIDE the state lock. Id-scoped and idempotent: a
+/// second removal of the same id yields `None`, and no other session is
+/// touched. Best-effort on lock poisoning (returns `None`). Takes `&PtyState`
+/// (not `&AppHandle`) so registry mutation is unit-testable without a Tauri
+/// runtime.
+fn remove_pty_session_by_id(state: &PtyState, id: u64) -> Option<Arc<PtySession>> {
+    let mut guard = state.sessions.lock().ok()?;
+    guard.remove(&id)
+}
+
+/// Remove and close the session with `id` that just exited. Runs on a detached
+/// thread off the waiter thread (see `pty_spawn`); `close()` here joins the
+/// now-finished waiter and releases the dead session's handles. Delegates the
+/// registry mutation to `remove_pty_session_by_id` (unit-testable) and closes
+/// outside the lock. Idempotent: a no-op if the id was already removed.
 fn clear_and_close_session_by_id(app: &tauri::AppHandle, id: u64) {
     let state = app.state::<PtyState>();
-    let session = {
-        let Ok(mut guard) = state.session.lock() else {
-            return;
-        };
-        if guard.as_ref().is_some_and(|current| current.id() == id) {
-            guard.take()
-        } else {
-            None
-        }
-    };
+    let session = remove_pty_session_by_id(state.inner(), id);
     // Close outside the lock: teardown blocks on process shutdown and the
     // reader/waiter-thread joins, and must not stall concurrent PTY commands.
     if let Some(session) = session {
@@ -234,17 +253,20 @@ fn common_cli_path_prefix() -> String {
     .join(";")
 }
 
-#[tauri::command]
-fn pty_write(state: State<'_, PtyState>, data: String) -> Result<(), String> {
-    let session =
-        clone_pty_session(&state)?.ok_or_else(|| "PTY session is not running".to_owned())?;
+/// Id-scoped write core, split out so its miss path is unit-testable without a
+/// Tauri `State`. A miss returns the EXACT string `"PTY session is not
+/// running"`, which the frontend's `isClosedPtyInputError` matches verbatim —
+/// changing it is a regression.
+fn pty_write_impl(state: &PtyState, session_id: u64, data: &str) -> Result<(), String> {
+    let session = clone_pty_session_by_id(state, session_id)?
+        .ok_or_else(|| "PTY session is not running".to_owned())?;
 
     // The write runs on the clone with the state lock released, so a hung
     // child cannot stall `pty_interrupt` (or any other PTY command).
-    match session.write(&data) {
+    match session.write(data) {
         Ok(()) => Ok(()),
         Err(error) if error.is_terminal_closed() => {
-            clear_pty_session_if_current(&state, &session);
+            clear_pty_session_if_current(state, &session);
             session.close();
             Err("PTY session closed; start a new terminal session".to_owned())
         }
@@ -253,30 +275,43 @@ fn pty_write(state: State<'_, PtyState>, data: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn pty_interrupt(state: State<'_, PtyState>) -> Result<(), String> {
-    with_pty_session(&state, |session| session.interrupt())
+fn pty_write(state: State<'_, PtyState>, session_id: u64, data: String) -> Result<(), String> {
+    pty_write_impl(state.inner(), session_id, &data)
 }
 
 #[tauri::command]
-fn pty_resize(state: State<'_, PtyState>, cols: u16, rows: u16) -> Result<(), String> {
+fn pty_interrupt(state: State<'_, PtyState>, session_id: u64) -> Result<(), String> {
+    with_pty_session(state.inner(), session_id, |session| session.interrupt())
+}
+
+#[tauri::command]
+fn pty_resize(
+    state: State<'_, PtyState>,
+    session_id: u64,
+    cols: u16,
+    rows: u16,
+) -> Result<(), String> {
     let size = TerminalSize::new(cols, rows).map_err(|error| format!("{error:?}"))?;
-    with_pty_session(&state, |session| session.resize(size))
+    with_pty_session(state.inner(), session_id, |session| session.resize(size))
 }
 
-#[tauri::command]
-fn pty_kill(state: State<'_, PtyState>) -> Result<(), String> {
-    let session = state
-        .session
-        .lock()
-        .map_err(|_| "PTY state lock poisoned".to_owned())?
-        .take();
+/// Id-scoped, idempotent kill core (unit-testable without a Tauri `State`). An
+/// unknown or already-removed id is a harmless `Ok(())` — never an error — so
+/// the frontend's fire-and-forget `void killPty()` can never reject and can
+/// race the detached natural-exit cleanup safely.
+fn pty_kill_impl(state: &PtyState, session_id: u64) -> Result<(), String> {
     // Close outside the lock: teardown blocks on process shutdown and the
     // reader-thread join, and must not stall concurrent PTY commands.
-    if let Some(session) = session {
+    if let Some(session) = remove_pty_session_by_id(state, session_id) {
         session.close();
     }
 
     Ok(())
+}
+
+#[tauri::command]
+fn pty_kill(state: State<'_, PtyState>, session_id: u64) -> Result<(), String> {
+    pty_kill_impl(state.inner(), session_id)
 }
 
 #[tauri::command]
@@ -299,47 +334,57 @@ fn open_path(path: String) -> Result<(), String> {
         .map_err(|error| format!("Failed to reveal path: {error}"))
 }
 
-/// Clone the current session handle while holding the state lock only for
-/// the duration of the `Arc` clone. Callers invoke (possibly blocking)
+/// Clone the session handle for `id` while holding the state lock only for the
+/// duration of the `Arc` clone. Callers invoke (possibly blocking)
 /// `PtySession` methods on the returned clone AFTER the lock is released.
-fn clone_pty_session(state: &State<'_, PtyState>) -> Result<Option<Arc<PtySession>>, String> {
+/// Returns `Ok(None)` when no session with that id exists. Takes `&PtyState`
+/// so it is usable from both commands (via `State::inner`) and unit tests.
+fn clone_pty_session_by_id(state: &PtyState, id: u64) -> Result<Option<Arc<PtySession>>, String> {
     let guard = state
-        .session
+        .sessions
         .lock()
         .map_err(|_| "PTY state lock poisoned".to_owned())?;
 
-    Ok(guard.as_ref().map(Arc::clone))
+    Ok(guard.get(&id).map(Arc::clone))
 }
 
-/// Remove the stored session only if it is still the exact session that
-/// observed the failure, so a replacement spawned concurrently by
-/// `pty_spawn` is never torn down by a stale error path. Best-effort on
-/// lock poisoning: the caller's "session closed" error is the useful one.
-fn clear_pty_session_if_current(state: &State<'_, PtyState>, session: &Arc<PtySession>) {
-    if let Ok(mut guard) = state.session.lock() {
+/// Remove the stored session only if the entry under its id is still the exact
+/// session that observed the failure, so a different session sharing the id key
+/// is never torn down by a stale error path. Best-effort on lock poisoning:
+/// the caller's "session closed" error is the useful one.
+fn clear_pty_session_if_current(state: &PtyState, session: &Arc<PtySession>) {
+    if let Ok(mut guard) = state.sessions.lock() {
+        let id = session.id();
         if guard
-            .as_ref()
+            .get(&id)
             .is_some_and(|current| Arc::ptr_eq(current, session))
         {
-            guard.take();
+            guard.remove(&id);
         }
     }
 }
 
-fn with_pty_session<F>(state: &State<'_, PtyState>, operation: F) -> Result<(), String>
+fn with_pty_session<F>(state: &PtyState, id: u64, operation: F) -> Result<(), String>
 where
     F: FnOnce(&PtySession) -> Result<(), splice_pty::PtyError>,
 {
-    let session =
-        clone_pty_session(state)?.ok_or_else(|| "PTY session is not running".to_owned())?;
+    let session = clone_pty_session_by_id(state, id)?
+        .ok_or_else(|| "PTY session is not running".to_owned())?;
 
     // Run the operation on the clone with the state lock released, so a
     // blocking call here can never stall other PTY commands.
     operation(&session).map_err(|error| error.to_string())
 }
 
-fn active_pty_process_name(state: &State<'_, PtyState>) -> Result<String, String> {
-    let session = clone_pty_session(state)?;
+/// Resolve the active PTY process name for paste routing. `session_id` is
+/// `None` at mount (before any session exists) and may reference an unknown id;
+/// both fall back to the `cmd.exe` process name rather than erroring, so the
+/// TitleBar paste target stays populated (spec: Paste-Target Fallback Parity).
+fn active_pty_process_name(state: &PtyState, session_id: Option<u64>) -> Result<String, String> {
+    let session = match session_id {
+        Some(id) => clone_pty_session_by_id(state, id)?,
+        None => None,
+    };
 
     let registry = AdapterRegistry::with_builtin_adapters();
     let candidates = session
@@ -422,7 +467,7 @@ fn select_process_for_adapter<'a>(
 pub fn run() {
     tauri::Builder::default()
         .manage(PtyState {
-            session: Mutex::new(None),
+            sessions: Mutex::new(HashMap::new()),
         })
         .invoke_handler(tauri::generate_handler![
             app_status,
@@ -487,14 +532,186 @@ mod tests {
     #[test]
     fn pty_state_starts_empty() {
         let state = PtyState {
-            session: Mutex::new(None),
+            sessions: Mutex::new(HashMap::new()),
         };
 
         assert!(state
-            .session
+            .sessions
             .lock()
             .expect("state lock should work")
+            .is_empty());
+    }
+
+    #[test]
+    fn clone_pty_session_by_id_unknown_returns_none() {
+        let state = PtyState {
+            sessions: Mutex::new(HashMap::new()),
+        };
+
+        assert!(clone_pty_session_by_id(&state, 42)
+            .expect("lookup should not error on an empty registry")
             .is_none());
+    }
+
+    #[test]
+    fn with_pty_session_unknown_id_returns_not_running_string() {
+        let state = PtyState {
+            sessions: Mutex::new(HashMap::new()),
+        };
+
+        // `pty_interrupt`/`pty_resize` route through `with_pty_session`; a miss
+        // must error cleanly with the shared "not running" message rather than
+        // panicking or touching another session.
+        let error = with_pty_session(&state, 7, |session| session.interrupt())
+            .expect_err("an unknown id must not resolve to a session");
+        assert_eq!(error, "PTY session is not running");
+    }
+
+    #[test]
+    fn pty_write_impl_unknown_id_returns_exact_closed_input_error_string() {
+        let state = PtyState {
+            sessions: Mutex::new(HashMap::new()),
+        };
+
+        // `isClosedPtyInputError` on the frontend matches this EXACT string;
+        // changing it is a regression (spec: Missing-id write preserves the
+        // exact error string).
+        let error =
+            pty_write_impl(&state, 7, "echo hi").expect_err("writing to an unknown id must fail");
+        assert_eq!(error, "PTY session is not running");
+    }
+
+    #[test]
+    fn pty_kill_impl_unknown_id_is_idempotent_ok() {
+        let state = PtyState {
+            sessions: Mutex::new(HashMap::new()),
+        };
+
+        // Kill on a missing id must be a harmless `Ok(())` so the frontend's
+        // fire-and-forget `void killPty()` never rejects (spec: Idempotent Kill).
+        assert_eq!(pty_kill_impl(&state, 7), Ok(()));
+        // A second kill of the same (still-absent) id is likewise a no-op.
+        assert_eq!(pty_kill_impl(&state, 7), Ok(()));
+    }
+
+    #[test]
+    fn active_pty_process_name_falls_back_when_no_session_matches() {
+        let state = PtyState {
+            sessions: Mutex::new(HashMap::new()),
+        };
+
+        // Mount-time call before any session exists: `None` must fall back to
+        // the cmd.exe process name, never error (spec: Paste-Target Fallback
+        // Parity).
+        assert_eq!(
+            active_pty_process_name(&state, None),
+            Ok("cmd.exe".to_owned())
+        );
+
+        // An unknown id resolves to no session and falls back identically.
+        assert_eq!(
+            active_pty_process_name(&state, Some(999)),
+            Ok("cmd.exe".to_owned())
+        );
+    }
+
+    #[test]
+    fn pty_output_payload_serializes_with_camel_case_session_id() {
+        let payload = PtyOutputPayload {
+            session_id: 7,
+            data: "hi".to_owned(),
+        };
+
+        assert_eq!(
+            serde_json::to_string(&payload).expect("payload should serialize"),
+            r#"{"sessionId":7,"data":"hi"}"#
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pty_state_registry_inserts_and_looks_up_by_id() {
+        let state = PtyState {
+            sessions: Mutex::new(HashMap::new()),
+        };
+        let session = Arc::new(
+            PtySession::spawn(
+                "cmd.exe",
+                &["/D", "/K"],
+                TerminalSize::new(80, 24).expect("valid terminal size"),
+                |_id, _output| {},
+                |_id| {},
+            )
+            .expect("session should spawn"),
+        );
+        let id = session.id();
+
+        state
+            .sessions
+            .lock()
+            .expect("state lock should work")
+            .insert(id, Arc::clone(&session));
+
+        let looked_up = clone_pty_session_by_id(&state, id)
+            .expect("lookup should not error")
+            .expect("the inserted id should resolve to the session");
+        assert!(Arc::ptr_eq(&looked_up, &session));
+
+        session.close();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pty_state_registry_remove_is_id_scoped_and_idempotent() {
+        let state = PtyState {
+            sessions: Mutex::new(HashMap::new()),
+        };
+        let session_a = Arc::new(
+            PtySession::spawn(
+                "cmd.exe",
+                &["/D", "/K"],
+                TerminalSize::new(80, 24).expect("valid terminal size"),
+                |_id, _output| {},
+                |_id| {},
+            )
+            .expect("session A should spawn"),
+        );
+        let session_b = Arc::new(
+            PtySession::spawn(
+                "cmd.exe",
+                &["/D", "/K"],
+                TerminalSize::new(80, 24).expect("valid terminal size"),
+                |_id, _output| {},
+                |_id| {},
+            )
+            .expect("session B should spawn"),
+        );
+        let id_a = session_a.id();
+        let id_b = session_b.id();
+        assert_ne!(id_a, id_b, "monotonic ids must be distinct");
+
+        {
+            let mut guard = state.sessions.lock().expect("state lock should work");
+            guard.insert(id_a, Arc::clone(&session_a));
+            guard.insert(id_b, Arc::clone(&session_b));
+        }
+
+        // Removing A returns A and leaves B untouched.
+        let removed = remove_pty_session_by_id(&state, id_a)
+            .expect("removing an existing id should return its session");
+        assert!(Arc::ptr_eq(&removed, &session_a));
+        assert!(clone_pty_session_by_id(&state, id_a)
+            .expect("lookup should not error")
+            .is_none());
+        assert!(clone_pty_session_by_id(&state, id_b)
+            .expect("lookup should not error")
+            .is_some());
+
+        // A second removal of the same id is a harmless no-op.
+        assert!(remove_pty_session_by_id(&state, id_a).is_none());
+
+        session_a.close();
+        session_b.close();
     }
 
     #[test]

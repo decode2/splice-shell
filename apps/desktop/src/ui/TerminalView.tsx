@@ -49,19 +49,19 @@ type TerminalViewProps = {
   onSessionHealth?: (status: SessionHealth) => void;
   onTextPaste?: (text: string) => void | Promise<void>;
   onResize?: (size: { cols: number; rows: number }) => void;
-  onPtyReady?: () => void;
+  onPtyReady?: (sessionId: number) => void;
 };
 
 export function TerminalView({
   settingsOpen = false,
   onCloseSettings,
   onClipboardImagePaste,
-  onInput = writePty,
+  onInput,
   onInputActivity,
   onSessionHealth,
   onTextPaste,
   onPtyReady,
-  onResize = resizePty,
+  onResize,
 }: TerminalViewProps) {
   const terminalElementRef = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<Terminal | null>(null);
@@ -145,6 +145,15 @@ export function TerminalView({
     let restartInFlight = false;
     let ptyGeneration = 0;
     let currentSessionId: number | undefined;
+    // Ordered FIFO queue of session-attributed output chunks that arrived
+    // BEFORE their session id was recorded. The reader thread can emit
+    // `pty-output` before `spawnPty` resolves over IPC (an instant-exit shell's
+    // banner is SEVERAL chunks), so a single last-wins slot would drop all but
+    // the last chunk. Chunks are enqueued in arrival order and drained
+    // synchronously the moment `startPty` records `currentSessionId` (see
+    // `flushEarlyOutputQueue`). Inherently bounded: it only grows during one
+    // spawn IPC round-trip, is cleared on record, and is dropped on unmount.
+    const earlyOutputQueue: { sessionId: number; data: string }[] = [];
     // Restart-storm guard. The removed 500ms liveness poll was an implicit
     // throttle; without it, a shell that exits instantly on every launch would
     // spin `restartPty` forever. Cap consecutive restarts and reset the counter
@@ -231,13 +240,58 @@ export function TerminalView({
 
       writeTerminalActions(outputFilter.write(chunk));
     };
+    // Default input/resize writers thread the live `currentSessionId` into the
+    // id-scoped Tauri commands. When the parent supplies its own handler (e.g.
+    // paste routing), that wins; otherwise a `0` sentinel is used until a
+    // session is recorded (the counter starts at 1, so `0` is a guaranteed
+    // miss that the backend maps to today's "not running" error).
+    const writeInput = (data: string) => {
+      const handler = handlersRef.current.onInput;
+      if (handler) {
+        return handler(data);
+      }
+      return writePty(data, currentSessionId ?? 0);
+    };
+    const resizeTerminal = (size: { cols: number; rows: number }) => {
+      const handler = handlersRef.current.onResize;
+      if (handler) {
+        return handler(size);
+      }
+      return resizePty(size, currentSessionId ?? 0);
+    };
+    // Drain the early-output queue the moment a session id is recorded. Write
+    // the chunks that belong to `sessionId` in arrival order, drop chunks for
+    // any other id (a superseded or never-recorded session), and clear the
+    // queue. MUST be called synchronously (no `await`) right after recording
+    // the id so no queued listener callback can interleave.
+    const flushEarlyOutputQueue = (sessionId: number) => {
+      for (const chunk of earlyOutputQueue) {
+        if (chunk.sessionId === sessionId) {
+          writePtyOutput(chunk.data);
+        }
+      }
+      earlyOutputQueue.length = 0;
+    };
     const startPty = async () => {
       const spawnedSessionId = await spawnPty({ cols: terminal.cols, rows: terminal.rows });
+      // The view was torn down while this spawn was in flight. Removing
+      // `pty_spawn`'s predecessor reaping means nothing else will reap this
+      // now-orphaned session, so kill it explicitly by id and record no state.
+      if (disposed) {
+        void killPty(spawnedSessionId);
+        return;
+      }
       currentSessionId = spawnedSessionId;
       spawnTime = Date.now();
       ptyGeneration += 1;
       inputClosed = false;
-      handlersRef.current.onPtyReady?.();
+      handlersRef.current.onPtyReady?.(spawnedSessionId);
+
+      // Drain any output that raced ahead of this spawn resolving. This runs
+      // BEFORE the stashed-exit early-return below so an instant-exit shell's
+      // banner (queued here) still prints, matching today's single-session
+      // behavior where the first bytes always render.
+      flushEarlyOutputQueue(spawnedSessionId);
 
       // A `pty-exit` for this exact session may have raced ahead of `spawnPty`
       // resolving (instant-exit child) and been stashed by `handlePtyExit`.
@@ -318,7 +372,7 @@ export function TerminalView({
       if (shouldRefreshTargetAfterInput(data)) {
         handlersRef.current.onInputActivity?.();
       }
-      void Promise.resolve(handlersRef.current.onInput(data)).catch((error) => {
+      void Promise.resolve(writeInput(data)).catch((error) => {
         if (isClosedPtyInputError(error)) {
           if (
             !shouldRecoverClosedPtyInput({
@@ -344,7 +398,7 @@ export function TerminalView({
       container: terminalElement,
       onInput: sendTerminalInput,
       onResize: (size) => {
-        void Promise.resolve(handlersRef.current.onResize(size)).catch((error) => {
+        void Promise.resolve(resizeTerminal(size)).catch((error) => {
           terminal.write(`\r\nPTY resize failed: ${String(error)}\r\n`);
         });
       },
@@ -397,7 +451,7 @@ export function TerminalView({
       const text = event.clipboardData?.getData("text/plain");
       if (text) {
         void Promise.resolve(
-          handlersRef.current.onTextPaste?.(text) ?? handlersRef.current.onInput(text),
+          handlersRef.current.onTextPaste?.(text) ?? writeInput(text),
         ).catch((error) => {
           terminal.write(`\r\nPTY paste failed: ${String(error)}\r\n`);
         });
@@ -483,8 +537,23 @@ export function TerminalView({
     // spawning and subscribing.
     void Promise.all([
       listen(PTY_OUTPUT_EVENT, (event) => {
-        if (!disposed && isPtyOutputPayload(event.payload)) {
-          writePtyOutput(event.payload);
+        if (disposed || !isPtyOutputPayload(event.payload)) {
+          return;
+        }
+
+        const { sessionId, data } = event.payload;
+        // Demultiplex by the live session id, mirroring `pty-exit` filtering:
+        //   - equal to current            → this view's output; write it.
+        //   - above current, or none yet  → raced ahead of `spawnPty`
+        //     resolving; queue it FIFO for `startPty` to flush on record.
+        //   - below current               → stale, already-superseded; drop.
+        if (sessionId === currentSessionId) {
+          writePtyOutput(data);
+          return;
+        }
+
+        if (currentSessionId === undefined || sessionId > currentSessionId) {
+          earlyOutputQueue.push({ sessionId, data });
         }
       }),
       listen(PTY_EXIT_EVENT, (event) => {
@@ -518,7 +587,12 @@ export function TerminalView({
       terminalElement.removeEventListener("keydown", handleTerminalKeyDown, { capture: true });
       unlistenPtyOutput?.();
       unlistenPtyExit?.();
-      void killPty();
+      // Only kill a session that was actually recorded. A spawn still in flight
+      // at teardown is handled by `startPty`'s post-await disposed check, which
+      // kills the orphan by its resolved id.
+      if (currentSessionId !== undefined) {
+        void killPty(currentSessionId);
+      }
       fileLinkProvider.dispose();
       webglAddon?.dispose();
       bridge.dispose();
