@@ -249,6 +249,14 @@ export function TerminalView({
         }
 
         terminal.write("\r\nPTY session ended. Starting a new shell...\r\n");
+        // Flush AND reset the output filter before the new session starts. A
+        // session that died mid-escape can leave a held partial (e.g.
+        // `\x1b[?2`) and a stale open synthetic sync in the filter; carrying
+        // that state into the next session would corrupt its first bytes
+        // (malformed CSI swallowing the prompt) and suppress its first
+        // synthetic span. flush() emits any held bytes plus the closing 2026l
+        // and returns the filter to a clean, reusable state.
+        writeTerminalActions(outputFilter.flush());
         await startPty();
         terminal.write("\r\nNew shell session started.\r\n");
       } catch (error) {

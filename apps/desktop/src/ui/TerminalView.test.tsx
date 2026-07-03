@@ -341,6 +341,44 @@ describe("TerminalView pty-exit driven restart", () => {
     });
   });
 
+  it("flushes the output filter before respawning so a mid-span restart cannot corrupt the next session", async () => {
+    render(
+      <TerminalView activePasteTargetState={readyPasteTarget} pasteState={idlePasteState} />,
+    );
+
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
+    });
+    await waitFor(() => {
+      expect(capturedOutputHandlers.length).toBeGreaterThan(0);
+      expect(capturedExitHandlers.length).toBeGreaterThan(0);
+    });
+
+    // Feed output that opens a synthetic 2026 span but never closes it (no
+    // cursor-show): the filter is now mid-span with an open synthetic sync.
+    const outputHandler = capturedOutputHandlers.at(-1);
+    act(() => {
+      outputHandler?.({ event: PTY_OUTPUT_EVENT, id: 1, payload: "\x1b[?25l\x1b[K" });
+    });
+    await flushAsync();
+
+    // The session dies mid-span. The restart must flush the filter before
+    // respawning, emitting the closing 2026l and resetting filter state.
+    emitPtyExit(1);
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(2);
+    });
+    await flushAsync();
+
+    // The fed output contained no cursor-show, so a synthetic `\x1b[?2026l` can
+    // only have been emitted by the restart flush. Its presence proves the
+    // filter was flushed (and thus reset) before the new session started.
+    const wroteSyntheticClose = mocks.terminalWrite.mock.calls.some(
+      ([data]) => typeof data === "string" && data.includes("\x1b[?2026l"),
+    );
+    expect(wroteSyntheticClose).toBe(true);
+  });
+
   it("ignores a stale pty-exit for an already-superseded session", async () => {
     render(
       <TerminalView activePasteTargetState={readyPasteTarget} pasteState={idlePasteState} />,
