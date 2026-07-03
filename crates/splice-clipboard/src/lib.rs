@@ -249,6 +249,29 @@ fn dib_to_png(dib: &[u8]) -> Result<Vec<u8>, ClipboardError> {
     Ok(png)
 }
 
+// Normalize line endings to CRLF, the Windows clipboard convention, and encode
+// the result as UTF-16 code units with a trailing NUL — the exact buffer shape
+// CF_UNICODETEXT requires. Existing CRLF sequences are collapsed to LF first so
+// mixed input never becomes CRCRLF. Kept pure and platform-agnostic so it can be
+// unit-tested off Windows; the Win32 SetClipboardData path is Windows-only.
+fn encode_clipboard_text_utf16(text: &str) -> Vec<u16> {
+    let normalized = text.replace("\r\n", "\n").replace('\n', "\r\n");
+    let mut units: Vec<u16> = normalized.encode_utf16().collect();
+    units.push(0);
+    units
+}
+
+#[cfg(not(windows))]
+pub fn write_clipboard_text(_text: &str) -> Result<(), ClipboardError> {
+    Err(ClipboardError::UnsupportedPlatform)
+}
+
+#[cfg(windows)]
+pub fn write_clipboard_text(text: &str) -> Result<(), ClipboardError> {
+    let utf16 = encode_clipboard_text_utf16(text);
+    windows_clipboard::write_unicode_text(&utf16)
+}
+
 #[cfg(not(windows))]
 pub fn read_clipboard_dib_bytes() -> Result<Vec<u8>, ClipboardError> {
     Err(ClipboardError::UnsupportedPlatform)
@@ -271,17 +294,76 @@ fn unique_clipboard_image_name() -> String {
 #[cfg(windows)]
 mod windows_clipboard {
     use super::ClipboardError;
-    use std::{ffi::c_void, ptr::NonNull, slice};
+    use std::{ffi::c_void, ptr::NonNull, slice, thread::sleep, time::Duration};
     use windows::Win32::{
-        Foundation::HGLOBAL,
+        Foundation::{GlobalFree, HANDLE, HGLOBAL},
         System::{
             DataExchange::{
-                CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+                CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable,
+                OpenClipboard, SetClipboardData,
             },
-            Memory::{GlobalLock, GlobalSize, GlobalUnlock},
-            Ole::{CF_DIB, CF_DIBV5},
+            Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE},
+            Ole::{CF_DIB, CF_DIBV5, CF_UNICODETEXT},
         },
     };
+
+    // OpenClipboard fails with ERROR_ACCESS_DENIED while another process owns the
+    // clipboard. Contention is real (clipboard managers, other terminals), so retry
+    // a bounded number of times with a short backoff before giving up.
+    const OPEN_RETRY_ATTEMPTS: u32 = 10;
+    const OPEN_RETRY_DELAY: Duration = Duration::from_millis(10);
+
+    // Write UTF-16 code units (NUL-terminated) to the clipboard as CF_UNICODETEXT.
+    //
+    // Handle-ownership contract: SetClipboardData transfers ownership of the
+    // GlobalAlloc'd block to the system ON SUCCESS — after that the block must NOT
+    // be freed here (the system frees it, and a GlobalFree would be a double-free).
+    // The block is only freed on the error paths BEFORE ownership transfers.
+    pub fn write_unicode_text(units: &[u16]) -> Result<(), ClipboardError> {
+        let _clipboard = ClipboardGuard::open_with_retry()?;
+        unsafe {
+            EmptyClipboard()?;
+        }
+
+        let byte_len = std::mem::size_of_val(units);
+        let hglobal = unsafe { GlobalAlloc(GMEM_MOVEABLE, byte_len)? };
+
+        // Copy the UTF-16 buffer into the moveable block. Any failure here frees the
+        // block ourselves, since ownership has NOT yet passed to the clipboard.
+        if let Err(error) = fill_global(hglobal, units) {
+            unsafe {
+                let _ = GlobalFree(Some(hglobal));
+            }
+            return Err(error);
+        }
+
+        match unsafe { SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(hglobal.0))) } {
+            // Ownership now belongs to the system; do NOT free the handle.
+            Ok(_) => Ok(()),
+            Err(error) => {
+                unsafe {
+                    let _ = GlobalFree(Some(hglobal));
+                }
+                Err(error.into())
+            }
+        }
+    }
+
+    fn fill_global(hglobal: HGLOBAL, units: &[u16]) -> Result<(), ClipboardError> {
+        let ptr = unsafe { GlobalLock(hglobal) };
+        if ptr.is_null() {
+            return Err(ClipboardError::Windows(windows::core::Error::from_win32()));
+        }
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(units.as_ptr(), ptr.cast::<u16>(), units.len());
+            // GlobalUnlock returns Err with NO_ERROR once the lock count reaches
+            // zero, so its result is intentionally ignored.
+            let _ = GlobalUnlock(hglobal);
+        }
+
+        Ok(())
+    }
 
     pub fn read_dib_bytes() -> Result<Vec<u8>, ClipboardError> {
         let _clipboard = ClipboardGuard::open()?;
@@ -318,6 +400,25 @@ mod windows_clipboard {
             }
 
             Ok(Self)
+        }
+
+        fn open_with_retry() -> Result<Self, ClipboardError> {
+            let mut last_error: Option<windows::core::Error> = None;
+            for attempt in 0..OPEN_RETRY_ATTEMPTS {
+                match unsafe { OpenClipboard(None) } {
+                    Ok(()) => return Ok(Self),
+                    Err(error) => {
+                        last_error = Some(error);
+                        if attempt + 1 < OPEN_RETRY_ATTEMPTS {
+                            sleep(OPEN_RETRY_DELAY);
+                        }
+                    }
+                }
+            }
+
+            Err(ClipboardError::Windows(
+                last_error.unwrap_or_else(windows::core::Error::from_win32),
+            ))
         }
     }
 
@@ -371,6 +472,41 @@ mod tests {
     use super::*;
 
     const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+
+    #[test]
+    fn encodes_clipboard_text_as_nul_terminated_utf16() {
+        // A bare "a" becomes the UTF-16 code units for 'a' plus a NUL terminator,
+        // which CF_UNICODETEXT requires.
+        assert_eq!(encode_clipboard_text_utf16("a"), vec![0x0061, 0x0000]);
+    }
+
+    #[test]
+    fn normalizes_lone_newlines_to_crlf_before_encoding() {
+        // Windows clipboard convention is CRLF line endings. "a\nb" must encode as
+        // the UTF-16 units for "a\r\nb\0".
+        assert_eq!(
+            encode_clipboard_text_utf16("a\nb"),
+            vec![0x0061, 0x000D, 0x000A, 0x0062, 0x0000]
+        );
+    }
+
+    #[test]
+    fn does_not_double_convert_existing_crlf() {
+        // An input that already uses CRLF must not become CRCRLF.
+        assert_eq!(
+            encode_clipboard_text_utf16("a\r\nb"),
+            vec![0x0061, 0x000D, 0x000A, 0x0062, 0x0000]
+        );
+    }
+
+    #[test]
+    fn encodes_astral_characters_as_surrogate_pairs() {
+        // U+1F600 (😀) encodes to the surrogate pair D83D DE00, then the NUL.
+        assert_eq!(
+            encode_clipboard_text_utf16("\u{1F600}"),
+            vec![0xD83D, 0xDE00, 0x0000]
+        );
+    }
 
     #[test]
     fn only_image_payload_prefers_image_pipeline() {

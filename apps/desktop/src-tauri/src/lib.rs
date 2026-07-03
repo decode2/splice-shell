@@ -354,6 +354,14 @@ fn active_pty_process_name(state: &State<'_, PtyState>) -> Result<String, String
         .to_owned())
 }
 
+// `async` so Tauri runs this on a worker thread: the Win32 clipboard open can
+// contend (a clipboard manager holding it), and the bounded retry/backoff would
+// otherwise stall the main UI thread for up to ~90ms on a plain Ctrl+C.
+#[tauri::command(async)]
+fn clipboard_write_text(text: String) -> Result<(), String> {
+    splice_clipboard::write_clipboard_text(&text).map_err(|error| error.to_string())
+}
+
 fn read_clipboard_image_paste_payload() -> Result<PastePayload, String> {
     let temp_dir = std::env::temp_dir().join("splice-shell").join("clipboard");
     splice_clipboard::read_clipboard_image_paste_payload(&temp_dir)
@@ -417,6 +425,7 @@ pub fn run() {
             pty_interrupt,
             pty_resize,
             pty_kill,
+            clipboard_write_text,
             open_path
         ])
         .run(tauri::generate_context!())

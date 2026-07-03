@@ -8,7 +8,8 @@ import type { ActivePasteTargetState } from "../paste/activePasteTarget";
 import type { PastePreviewState } from "../paste/pastePreview";
 import { createLocalFileLinkProvider } from "../terminal/fileLinks";
 import { shouldRefreshTargetAfterInput } from "../terminal/inputActivity";
-import { isTerminalInterruptShortcut } from "../terminal/keyboardShortcuts";
+import { resolveTerminalKeyAction } from "../terminal/keyboardShortcuts";
+import { writeClipboardText } from "../terminal/clipboardClient";
 import {
   killPty,
   isPtyExitPayload,
@@ -363,13 +364,31 @@ export function TerminalView({
     };
 
     const handleTerminalKeyDown = (event: KeyboardEvent) => {
-      if (!isTerminalInterruptShortcut(event)) {
+      const action = resolveTerminalKeyAction(event, terminal.hasSelection());
+
+      if (action === "copy") {
+        const selection = terminal.getSelection();
+        // An empty selection (e.g. hasSelection reporting a zero-width range)
+        // must NOT eat the key: leave the event untouched so its default
+        // behavior proceeds instead of swallowing a no-op copy.
+        if (!selection) {
+          return;
+        }
+
+        event.preventDefault();
+        event.stopPropagation();
+        void writeClipboardText(selection).catch((error) => {
+          terminal.write(`\r\nCopy to clipboard failed: ${String(error)}\r\n`);
+        });
+        terminal.clearSelection();
         return;
       }
 
-      event.preventDefault();
-      event.stopPropagation();
-      sendTerminalInput("\x03");
+      if (action === "interrupt") {
+        event.preventDefault();
+        event.stopPropagation();
+        sendTerminalInput("\x03");
+      }
     };
 
     terminalElement.addEventListener("paste", handlePaste, { capture: true });

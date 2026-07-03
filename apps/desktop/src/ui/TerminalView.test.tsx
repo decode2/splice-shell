@@ -37,6 +37,9 @@ const mocks = vi.hoisted(() => ({
   terminalOnResize: vi.fn<
     (handler: (size: { cols: number; rows: number }) => void) => { dispose: () => void }
   >(),
+  terminalHasSelection: vi.fn<() => boolean>(),
+  terminalGetSelection: vi.fn<() => string>(),
+  terminalClearSelection: vi.fn<() => void>(),
   fitAddonFit: vi.fn<() => void>(),
   fitAddonDispose: vi.fn<() => void>(),
   webglAddonOnContextLoss: vi.fn<(handler: () => void) => void>(),
@@ -94,6 +97,18 @@ vi.mock("@xterm/xterm", () => {
 
     registerLinkProvider(provider: unknown) {
       return mocks.terminalRegisterLinkProvider(provider);
+    }
+
+    hasSelection() {
+      return mocks.terminalHasSelection();
+    }
+
+    getSelection() {
+      return mocks.terminalGetSelection();
+    }
+
+    clearSelection() {
+      mocks.terminalClearSelection();
     }
 
     dispose() {
@@ -206,6 +221,12 @@ beforeEach(() => {
 
   mocks.terminalOnResize.mockReset();
   mocks.terminalOnResize.mockImplementation(() => ({ dispose: vi.fn() }));
+
+  mocks.terminalHasSelection.mockReset();
+  mocks.terminalHasSelection.mockReturnValue(false);
+  mocks.terminalGetSelection.mockReset();
+  mocks.terminalGetSelection.mockReturnValue("");
+  mocks.terminalClearSelection.mockReset();
 
   mocks.fitAddonFit.mockReset();
   mocks.fitAddonDispose.mockReset();
@@ -537,5 +558,100 @@ describe("TerminalView pty-exit driven restart", () => {
     await waitFor(() => {
       expect(getInvokeCallsFor("pty_spawn")).toHaveLength(3);
     });
+  });
+});
+
+describe("TerminalView copy / interrupt key handling", () => {
+  // The keydown listener is registered on the terminal host element in the
+  // capture phase (before xterm's own handling), so tests dispatch a real
+  // KeyboardEvent on that element to exercise the production wiring.
+  async function renderAndGetHost() {
+    const { container } = render(
+      <TerminalView activePasteTargetState={readyPasteTarget} pasteState={idlePasteState} />,
+    );
+
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
+    });
+
+    const host = container.querySelector(".terminal-host") as HTMLElement;
+    expect(host).toBeTruthy();
+    return host;
+  }
+
+  function dispatchKeyDown(
+    host: HTMLElement,
+    init: { key: string; ctrlKey?: boolean; shiftKey?: boolean },
+  ) {
+    act(() => {
+      host.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          bubbles: true,
+          cancelable: true,
+          ...init,
+        }),
+      );
+    });
+  }
+
+  it("copies the selection on Ctrl+C and does not send SIGINT", async () => {
+    mocks.terminalHasSelection.mockReturnValue(true);
+    mocks.terminalGetSelection.mockReturnValue("selected text");
+    const host = await renderAndGetHost();
+
+    dispatchKeyDown(host, { key: "c", ctrlKey: true });
+    await flushAsync();
+
+    expect(getInvokeCallsFor("clipboard_write_text")).toHaveLength(1);
+    expect(getInvokeCallsFor("clipboard_write_text")[0]?.[1]).toEqual({ text: "selected text" });
+    expect(mocks.terminalClearSelection).toHaveBeenCalledTimes(1);
+    expect(
+      getInvokeCallsFor("pty_write").some(([, args]) => (args as { data: string }).data === "\x03"),
+    ).toBe(false);
+  });
+
+  it("sends SIGINT on Ctrl+C when there is no selection and does not copy", async () => {
+    mocks.terminalHasSelection.mockReturnValue(false);
+    const host = await renderAndGetHost();
+
+    dispatchKeyDown(host, { key: "c", ctrlKey: true });
+    await flushAsync();
+
+    expect(
+      getInvokeCallsFor("pty_write").some(([, args]) => (args as { data: string }).data === "\x03"),
+    ).toBe(true);
+    expect(getInvokeCallsFor("clipboard_write_text")).toHaveLength(0);
+  });
+
+  it("copies the selection on Ctrl+Shift+C", async () => {
+    mocks.terminalHasSelection.mockReturnValue(true);
+    mocks.terminalGetSelection.mockReturnValue("shift copy");
+    const host = await renderAndGetHost();
+
+    dispatchKeyDown(host, { key: "c", ctrlKey: true, shiftKey: true });
+    await flushAsync();
+
+    expect(getInvokeCallsFor("clipboard_write_text")).toHaveLength(1);
+    expect(getInvokeCallsFor("clipboard_write_text")[0]?.[1]).toEqual({ text: "shift copy" });
+    expect(
+      getInvokeCallsFor("pty_write").some(([, args]) => (args as { data: string }).data === "\x03"),
+    ).toBe(false);
+  });
+
+  it("does nothing on Ctrl+C when the selection resolves to an empty string", async () => {
+    // hasSelection() can report true while getSelection() yields "" (e.g. a
+    // zero-width selection). The handler must neither copy nor eat the key.
+    mocks.terminalHasSelection.mockReturnValue(true);
+    mocks.terminalGetSelection.mockReturnValue("");
+    const host = await renderAndGetHost();
+
+    dispatchKeyDown(host, { key: "c", ctrlKey: true });
+    await flushAsync();
+
+    expect(getInvokeCallsFor("clipboard_write_text")).toHaveLength(0);
+    expect(mocks.terminalClearSelection).not.toHaveBeenCalled();
+    expect(
+      getInvokeCallsFor("pty_write").some(([, args]) => (args as { data: string }).data === "\x03"),
+    ).toBe(false);
   });
 });
