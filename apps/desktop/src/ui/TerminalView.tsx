@@ -168,7 +168,6 @@ export function TerminalView({
     let pendingExit = false;
     let unlistenPtyOutput: UnlistenFn | undefined;
     let unlistenPtyExit: UnlistenFn | undefined;
-    const outputFilter = createTerminalOutputFilter();
     const MAX_CONSECUTIVE_RESTARTS = 5;
     // A session must stay up at least this long before its output is taken as
     // proof of health. Output before this window is likely a dying shell's
@@ -186,6 +185,24 @@ export function TerminalView({
         outputScheduler.write(action.data);
       }
     };
+    // Created here (after `writeTerminalActions`) so the cursor-show holdback's
+    // deferred emissions can route through the exact same actions → scheduler →
+    // xterm pipeline as normal write() output. The sink is disposed-guarded: a
+    // quiet-timer fire that somehow lands after teardown must not touch a
+    // disposed terminal. In practice teardown's `outputFilter.flush()` cancels
+    // the timer, so this guard is defensive. A real setTimeout/clearTimeout is
+    // injected for production timing.
+    const outputFilter = createTerminalOutputFilter({
+      onDeferredOutput: (actions) => {
+        if (!disposed) {
+          writeTerminalActions(actions);
+        }
+      },
+      timer: {
+        set: (callback, ms) => setTimeout(callback, ms),
+        clear: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+      },
+    });
     const writePtyOutput = (chunk: string) => {
       if (!outputSeen) {
         outputSeen = true;

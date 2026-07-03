@@ -9,9 +9,43 @@ export type TerminalOutputFilter = {
   reset: () => void;
 };
 
+// Injected timer seam so the quiet-timer is deterministic under test. The filter
+// NEVER calls the global `setTimeout` directly; it drives this instead, which
+// tests replace with a fake that fires the callback on demand. `set` returns an
+// opaque handle that is later passed back to `clear`.
+export type TerminalOutputTimer = {
+  set: (callback: () => void, ms: number) => unknown;
+  clear: (handle: unknown) => void;
+};
+
+export type TerminalOutputFilterOptions = {
+  // Sink for timer-driven deferred emissions (the released held cursor-show).
+  // When ABSENT, cursor-show holdback is DISABLED and the filter behaves exactly
+  // as it did before this feature: the show passes through inline. This keeps
+  // every existing caller/test untouched and guarantees held bytes can never
+  // strand (there is no held state without a sink).
+  onDeferredOutput?: (actions: TerminalOutputAction[]) => void;
+  // Deterministic timer seam; defaults to the real setTimeout/clearTimeout.
+  timer?: TerminalOutputTimer;
+};
+
+// The quiet-timer interval: how long a cursor-show is held after the last show
+// before it is released to paint. Tunable in the 150–200ms band; must exceed the
+// shimmer inter-frame gap so consecutive frames' hides cancel it before it fires.
+// Exported so tests reference the single source of truth rather than a literal.
+export const CURSOR_SHOW_HOLDBACK_MS = 175;
+
+const DEFAULT_TIMER: TerminalOutputTimer = {
+  set: (callback, ms) => setTimeout(callback, ms),
+  clear: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+};
+
 // The synthetic DECSET 2026 brackets we synthesize around each cursor-hidden
-// span. These are the ONLY bytes the filter ever inserts; everything else
-// passes through byte-identical and in order.
+// span. Synthetic 2026 brackets are the only bytes the filter ever INSERTS.
+// Everything else passes through byte-identical and in order, except cursor-show
+// (mode-25 `h`) sequences under the holdback feature: those are conserved, not
+// dropped — deferred behind the quiet timer and re-emitted verbatim inline on
+// the next show/hide or released by the timer / flush().
 const BEGIN_SYNC = "\x1b[?2026h";
 const END_SYNC = "\x1b[?2026l";
 
@@ -108,12 +142,23 @@ const isRealSyncBracket = (params: string[]) =>
 //     safety timeout force-clears the mode and painting resumes normally. It
 //     is a bounded startup stall, never a freeze.
 //
-// State (`syncActive`, `realSyncActive`, `pending`) persists across chunks
-// because the filter instance lives for the terminal's lifetime. `flush()`
-// and `reset()` return the filter to a clean, reusable state so it can be
-// safely reused across a PTY restart. Everything except the injected 8-byte
-// brackets passes through byte-identical and in order.
-export function createTerminalOutputFilter(): TerminalOutputFilter {
+// State (`syncActive`, `realSyncActive`, `pending`, plus `heldShow`/`timerHandle`
+// for the cursor-show holdback) persists across chunks because the filter
+// instance lives for the terminal's lifetime. `flush()` and `reset()` return the
+// filter to a clean, reusable state so it can be safely reused across a PTY
+// restart. Everything except the injected 8-byte 2026 brackets AND deferred /
+// re-emitted cursor-shows passes through byte-identical and in order — and the
+// shows themselves are conserved (deferred or re-emitted inline), never dropped.
+export function createTerminalOutputFilter(
+  options: TerminalOutputFilterOptions = {},
+): TerminalOutputFilter {
+  const onDeferredOutput = options.onDeferredOutput;
+  const timer = options.timer ?? DEFAULT_TIMER;
+  // Holdback is only active when a deferred-output sink exists; without one there
+  // is nowhere to release a held show, so the show must pass through inline (the
+  // pre-feature behavior) and no held state is ever created.
+  const holdbackEnabled = typeof onDeferredOutput === "function";
+
   // Whether a SYNTHETIC 2026 span (one we injected) is currently open.
   // Invariant: `syncActive` is only ever true while `realSyncActive` is false —
   // any real 2026 event takes authority over the shared boolean and clears it.
@@ -126,6 +171,39 @@ export function createTerminalOutputFilter(): TerminalOutputFilter {
   // split across two `pty-output` events is still recognized once the next
   // chunk arrives. Held bytes are emitted verbatim (never dropped or reordered).
   let pending = "";
+  // The exact bytes of the latest cursor-show being held behind the quiet timer,
+  // or null when none is held. Conserved: it is re-emitted inline on the next
+  // show/hide, released by the timer, or released by flush() — never discarded
+  // except by the discard-only reset().
+  let heldShow: string | null = null;
+  // The opaque handle of the armed quiet timer, or null when disarmed.
+  let timerHandle: unknown | null = null;
+
+  // Release the held show through the sink when the quiet interval elapses with
+  // no intervening show/hide. Ordered after all prior write() output because it
+  // only ever fires between chunks, once output has gone quiet.
+  const fireDeferred = () => {
+    const show = heldShow;
+    heldShow = null;
+    timerHandle = null;
+    if (show !== null) {
+      onDeferredOutput?.([{ kind: "write", data: show }]);
+    }
+  };
+
+  const armTimer = () => {
+    if (timerHandle !== null) {
+      timer.clear(timerHandle);
+    }
+    timerHandle = timer.set(fireDeferred, CURSOR_SHOW_HOLDBACK_MS);
+  };
+
+  const cancelTimer = () => {
+    if (timerHandle !== null) {
+      timer.clear(timerHandle);
+      timerHandle = null;
+    }
+  };
 
   const write = (chunk: string): TerminalOutputAction[] => {
     const buffer = pending + chunk;
@@ -172,18 +250,46 @@ export function createTerminalOutputFilter(): TerminalOutputFilter {
 
       if (togglesCursorVisibility(match.params)) {
         if (match.final === "l") {
-          // Cursor HIDE. Open a synthetic sync unless a real one already
-          // protects the span, or one is already open (idempotent under nesting).
+          // Cursor HIDE.
+          if (holdbackEnabled && heldShow !== null) {
+            // A show was held behind the quiet timer; a hide arrived first.
+            // Re-emit the held show verbatim INLINE, immediately before the hide
+            // and WITHIN THIS SAME output action (load-bearing: byte-conserving
+            // cancel that never depends on downstream coalescing). The transient
+            // show never samples visible because paints are rAF-coalesced per
+            // chunk. Cancel the quiet timer and clear the held state.
+            out += heldShow;
+            heldShow = null;
+            cancelTimer();
+          }
+          // Open a synthetic sync unless a real one already protects the span, or
+          // one is already open (idempotent under nesting).
           out += sequence;
           if (!realSyncActive && !syncActive) {
             out += BEGIN_SYNC;
             syncActive = true;
           }
+        } else if (holdbackEnabled) {
+          // Cursor SHOW with holdback active. Close our synthetic sync (if any)
+          // immediately so the buffered frame still paints atomically — but do
+          // NOT emit the show inline. Instead hold it behind the quiet timer.
+          if (syncActive) {
+            out += END_SYNC;
+            syncActive = false;
+          }
+          if (heldShow !== null) {
+            // A show is already held with no intervening hide: re-emit the old
+            // one inline (latest-wins, byte-conserving) before superseding it.
+            out += heldShow;
+          }
+          // Hold regardless of syncActive/realSyncActive — the shimmer walk
+          // exists inside real 2026 spans too, and real brackets continue to
+          // govern the sync flags untouched. (Re)arm the quiet timer.
+          heldShow = sequence;
+          armTimer();
         } else {
-          // Cursor SHOW. Close our synthetic sync (if any) immediately BEFORE
-          // the show, releasing the buffered frame to paint atomically. When a
-          // real span is in charge, `syncActive` is false, so nothing is
-          // injected and the real `2026l` remains the sole closer.
+          // Cursor SHOW without a sink: pre-feature behavior. Close the synthetic
+          // sync immediately BEFORE the show and pass the show through inline.
           if (syncActive) {
             out += END_SYNC;
             syncActive = false;
@@ -205,13 +311,26 @@ export function createTerminalOutputFilter(): TerminalOutputFilter {
   };
 
   const reset = () => {
+    // Discard-only API: it drops `pending` and a held show WITHOUT emitting them,
+    // and cancels the quiet timer so no deferred emission can fire later. This is
+    // safe for production because teardown/restart use flush() (which releases a
+    // held show) — reset cannot strand a hidden cursor on those paths.
+    cancelTimer();
     pending = "";
+    heldShow = null;
     syncActive = false;
     realSyncActive = false;
   };
 
   const flush = (): TerminalOutputAction[] => {
     let out = "";
+    // Release any held cursor-show verbatim first. In stream order the held show
+    // was toggled before any trailing partial of the final chunk, so it leads.
+    // (A held show implies `syncActive` is false — a show always closes an open
+    // synthetic sync — so it never straddles the END_SYNC below.)
+    if (heldShow !== null) {
+      out += heldShow;
+    }
     // Release any held partial escape verbatim — it never completed a target.
     if (pending) {
       out += pending;
@@ -222,7 +341,8 @@ export function createTerminalOutputFilter(): TerminalOutputFilter {
       out += END_SYNC;
     }
     // Leave a clean, reusable state so the same filter can be safely reused
-    // across a PTY restart without leaking pending bytes or a stale sync flag.
+    // across a PTY restart without leaking pending bytes, a held show, an armed
+    // timer, or a stale sync flag.
     reset();
     return out ? [{ kind: "write", data: out }] : [];
   };

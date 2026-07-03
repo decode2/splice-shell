@@ -597,6 +597,54 @@ describe("TerminalView pty-exit driven restart", () => {
       expect(getInvokeCallsFor("pty_spawn")).toHaveLength(3);
     });
   });
+
+  // Cursor-show holdback wiring (change: codex-cursor-holdback). The filter is
+  // now constructed with an `onDeferredOutput` sink and a real timer, so a
+  // cursor-show is HELD rather than written inline, and the disposed-guarded sink
+  // plus teardown flush guarantee the held show is released exactly once — never
+  // stranded and never double-emitted by a post-dispose timer fire.
+  it("holds the cursor-show, then releases it exactly once at teardown with no post-dispose double emit", async () => {
+    const { unmount } = render(
+      <TerminalView activePasteTargetState={readyPasteTarget} pasteState={idlePasteState} />,
+    );
+
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
+    });
+    await waitFor(() => {
+      expect(capturedOutputHandlers.length).toBeGreaterThan(0);
+    });
+
+    // A cursor-hidden span that then shows the cursor: hide opens a synthetic
+    // sync (BEGIN_SYNC), show closes it (END_SYNC) but the show is HELD behind
+    // the quiet timer instead of being written inline.
+    const outputHandler = capturedOutputHandlers.at(-1);
+    act(() => {
+      outputHandler?.({ event: PTY_OUTPUT_EVENT, id: 1, payload: "\x1b[?25l frame \x1b[?25h" });
+    });
+    await flushAsync();
+
+    const showWrites = () =>
+      mocks.terminalWrite.mock.calls.filter(
+        ([data]) => typeof data === "string" && data.includes("\x1b[?25h"),
+      ).length;
+
+    // Holdback active: the show has NOT been written to the terminal yet. Without
+    // the sink wiring it would have been emitted inline immediately.
+    expect(showWrites()).toBe(0);
+
+    // Teardown flush() releases the held show and cancels the quiet timer.
+    act(() => {
+      unmount();
+    });
+    const releasedAtTeardown = showWrites();
+    expect(releasedAtTeardown).toBe(1);
+
+    // Wait well past the quiet interval: a cancelled/disposed-guarded timer must
+    // NOT fire a second, stranded deferred emission after the component is gone.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(showWrites()).toBe(releasedAtTeardown);
+  });
 });
 
 describe("TerminalView copy / interrupt key handling", () => {
