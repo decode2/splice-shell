@@ -88,11 +88,31 @@ function defaultContainerResizeObserver(container: HTMLElement, handler: () => v
     };
   }
 
-  const observer = new ResizeObserver(handler);
+  // Defer the fit to the next animation frame and coalesce a burst of
+  // observations into a single frame. Calling fit() synchronously inside the
+  // observer callback mutates layout during delivery, which re-triggers the
+  // observer and produces "ResizeObserver loop completed with undelivered
+  // notifications". Deferring breaks that self-trigger; the pending frame is
+  // cancelled on dispose so no fit runs after disconnect.
+  let frame = 0;
+  const observer = new ResizeObserver(() => {
+    if (frame !== 0) {
+      return;
+    }
+
+    frame = requestAnimationFrame(() => {
+      frame = 0;
+      handler();
+    });
+  });
   observer.observe(container);
 
   return {
     dispose: () => {
+      if (frame !== 0) {
+        cancelAnimationFrame(frame);
+      }
+
       observer.disconnect();
     },
   };
