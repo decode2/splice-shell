@@ -2,7 +2,7 @@
 import { StrictMode } from "react";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { useWindowMaximized, type WindowChrome } from "./windowChrome";
+import { useWindowFocused, useWindowMaximized, type WindowChrome } from "./windowChrome";
 
 function noopChrome(overrides: Partial<WindowChrome> = {}): WindowChrome {
   return {
@@ -11,6 +11,7 @@ function noopChrome(overrides: Partial<WindowChrome> = {}): WindowChrome {
     close: vi.fn(async () => {}),
     isMaximized: vi.fn(async () => false),
     onResized: vi.fn(async () => () => {}),
+    onFocusChanged: vi.fn(async () => () => {}),
     ...overrides,
   };
 }
@@ -90,6 +91,104 @@ describe("useWindowMaximized", () => {
     for (const unlisten of unlistens) {
       expect(unlisten).toHaveBeenCalledTimes(1);
     }
+    expect(errorSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe("useWindowFocused", () => {
+  it("assumes focused on mount (the app opens focused, no sync getter exists)", async () => {
+    const chrome = noopChrome();
+
+    const { result } = renderHook(() => useWindowFocused(chrome));
+
+    // Initial state is true immediately, before any focus event arrives.
+    expect(result.current).toBe(true);
+    await flush();
+    expect(result.current).toBe(true);
+  });
+
+  it("flips to false on blur and back to true on focus", async () => {
+    let focusHandler: ((focused: boolean) => void) | undefined;
+    const chrome = noopChrome({
+      onFocusChanged: vi.fn(async (handler: (focused: boolean) => void) => {
+        focusHandler = handler;
+        return () => {};
+      }),
+    });
+
+    const { result } = renderHook(() => useWindowFocused(chrome));
+
+    await waitFor(() => expect(focusHandler).toBeDefined());
+    expect(result.current).toBe(true);
+
+    // The window lost OS focus.
+    act(() => {
+      focusHandler?.(false);
+    });
+    await waitFor(() => expect(result.current).toBe(false));
+
+    // Focus returns.
+    act(() => {
+      focusHandler?.(true);
+    });
+    await waitFor(() => expect(result.current).toBe(true));
+  });
+
+  it("tears down every focus listener across StrictMode's double mount without leaking state updates", async () => {
+    const unlistens: Array<ReturnType<typeof vi.fn>> = [];
+    const onFocusChanged = vi.fn(async () => {
+      const unlisten = vi.fn();
+      unlistens.push(unlisten);
+      return unlisten;
+    });
+    const chrome = noopChrome({ onFocusChanged });
+    // A setState after dispose or an unhandled rejection would surface as a
+    // console.error; assert it stays silent to prove the disposed guard holds.
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const { unmount } = renderHook(() => useWindowFocused(chrome), {
+      wrapper: StrictMode,
+    });
+    await flush();
+    act(() => {
+      unmount();
+    });
+    await flush();
+
+    // StrictMode mounts the effect twice, so onFocusChanged is registered twice.
+    expect(onFocusChanged).toHaveBeenCalledTimes(2);
+    expect(unlistens).toHaveLength(2);
+    // The discarded first mount is disposed by the resolved-after-dispose guard;
+    // the live mount by the unmount cleanup. Each listener is torn down once.
+    for (const unlisten of unlistens) {
+      expect(unlisten).toHaveBeenCalledTimes(1);
+    }
+    expect(errorSpy).not.toHaveBeenCalled();
+  });
+
+  it("does not setState after dispose when a focus event fires post-unmount", async () => {
+    let focusHandler: ((focused: boolean) => void) | undefined;
+    const chrome = noopChrome({
+      onFocusChanged: vi.fn(async (handler: (focused: boolean) => void) => {
+        focusHandler = handler;
+        return () => {};
+      }),
+    });
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const { result, unmount } = renderHook(() => useWindowFocused(chrome));
+    await waitFor(() => expect(focusHandler).toBeDefined());
+
+    act(() => {
+      unmount();
+    });
+    // A late event after unmount must be ignored (no setState-after-dispose).
+    act(() => {
+      focusHandler?.(false);
+    });
+    await flush();
+
+    expect(result.current).toBe(true);
     expect(errorSpy).not.toHaveBeenCalled();
   });
 });

@@ -319,6 +319,79 @@ body {
 }
 
 /*
+ * Focus dimming. When the OS window loses focus, softly dim the title-bar
+ * chrome — text, controls, brand glow, and the hairlines — so the app reads as
+ * inactive, the way premium native apps do. Only the chrome dims; the terminal
+ * content is never touched. A short ease on focus/blur keeps the transition
+ * from snapping. The health dot keeps its meaningful color and is dimmed only
+ * slightly, so a reconnecting/failed signal stays legible while blurred.
+ */
+.titlebar,
+.titlebar-brand,
+.titlebar-brand-mark,
+.titlebar-chip,
+.titlebar-health-dot,
+.titlebar-health-label,
+.titlebar-icon-button,
+.window-control {
+  transition:
+    color 120ms ease,
+    opacity 120ms ease,
+    border-color 120ms ease,
+    filter 120ms ease;
+}
+
+.app-shell:not([data-focused]) .titlebar {
+  color: rgba(124, 138, 165, 0.55);
+  border-bottom-color: rgba(148, 163, 184, 0.09);
+}
+
+.app-shell:not([data-focused]) .titlebar-brand,
+.app-shell:not([data-focused]) .titlebar-chip {
+  color: rgba(229, 237, 247, 0.55);
+}
+
+.app-shell:not([data-focused]) .titlebar-brand {
+  border-right-color: rgba(148, 163, 184, 0.08);
+}
+
+.app-shell:not([data-focused]) .titlebar-brand-mark {
+  color: rgba(56, 189, 248, 0.5);
+  filter: drop-shadow(0 0 3px rgba(56, 189, 248, 0.15));
+}
+
+.app-shell:not([data-focused]) .titlebar-health-label {
+  opacity: 0.7;
+}
+
+.app-shell:not([data-focused]) .titlebar-icon-button,
+.app-shell:not([data-focused]) .window-control {
+  color: rgba(215, 223, 236, 0.55);
+}
+
+/*
+ * The health dot stays meaningful when blurred — dim it only slightly so a
+ * reconnecting/failed signal never disappears behind the inactive chrome.
+ */
+.app-shell:not([data-focused]) .titlebar-health-dot {
+  opacity: 0.82;
+}
+
+/* Reduced motion: focus/blur snaps to the dim/full state instead of easing. */
+@media (prefers-reduced-motion: reduce) {
+  .titlebar,
+  .titlebar-brand,
+  .titlebar-brand-mark,
+  .titlebar-chip,
+  .titlebar-health-dot,
+  .titlebar-health-label,
+  .titlebar-icon-button,
+  .window-control {
+    transition: none;
+  }
+}
+
+/*
  * Transient paste feedback. Rendered in the title bar's status cluster ONLY
  * when the paste state is not idle, so it reads as a brief, subtle status item
  * rather than permanent chrome.

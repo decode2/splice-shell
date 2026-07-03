@@ -1,9 +1,9 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ActivePasteTargetState } from "../paste/activePasteTarget";
 import type { PastePreviewState } from "../paste/pastePreview";
-import type { WindowChrome } from "../window/windowChrome";
+import { useWindowFocused, type WindowChrome } from "../window/windowChrome";
 import { TitleBar } from "./TitleBar";
 
 const activePasteTarget: ActivePasteTargetState = {
@@ -23,6 +23,7 @@ function mockChrome(): WindowChrome {
     close: vi.fn(async () => {}),
     isMaximized: vi.fn(async () => false),
     onResized: vi.fn(async () => () => {}),
+    onFocusChanged: vi.fn(async () => () => {}),
   };
 }
 
@@ -216,5 +217,57 @@ describe("TitleBar drag regions", () => {
     for (const name of ["Settings", "Minimize", "Maximize", "Close"]) {
       expect(getByRole("button", { name }).hasAttribute("data-tauri-drag-region")).toBe(false);
     }
+  });
+});
+
+// The App wires window focus onto the shell as `data-focused` so the CSS can
+// dim the title-bar chrome on blur. This harness mirrors that exact wiring
+// (`data-focused={focused || undefined}`) without pulling in App's terminal /
+// paste pipeline, so we test the focus→attribute contract in isolation.
+function FocusShellHarness({ chrome }: { chrome: WindowChrome }) {
+  const focused = useWindowFocused(chrome);
+  return (
+    <main className="app-shell" data-focused={focused || undefined}>
+      <TitleBar
+        activePasteTargetState={activePasteTarget}
+        pasteState={idlePasteState}
+        sessionHealth="healthy"
+        settingsOpen={false}
+        onToggleSettings={vi.fn()}
+        isMaximized={false}
+        chrome={chrome}
+      />
+    </main>
+  );
+}
+
+describe("App shell focus dimming", () => {
+  it("sets data-focused on the shell while focused and removes it on blur", async () => {
+    let focusHandler: ((focused: boolean) => void) | undefined;
+    const chrome = mockChrome();
+    chrome.onFocusChanged = vi.fn(async (handler: (focused: boolean) => void) => {
+      focusHandler = handler;
+      return () => {};
+    });
+
+    const { container } = render(<FocusShellHarness chrome={chrome} />);
+    const shell = container.querySelector(".app-shell");
+
+    // Focused on mount → attribute present.
+    expect(shell?.hasAttribute("data-focused")).toBe(true);
+
+    await waitFor(() => expect(focusHandler).toBeDefined());
+
+    // Blur → attribute removed so `.app-shell:not([data-focused])` matches.
+    act(() => {
+      focusHandler?.(false);
+    });
+    await waitFor(() => expect(shell?.hasAttribute("data-focused")).toBe(false));
+
+    // Focus restored → attribute returns.
+    act(() => {
+      focusHandler?.(true);
+    });
+    await waitFor(() => expect(shell?.hasAttribute("data-focused")).toBe(true));
   });
 });

@@ -12,7 +12,7 @@ import {
   type PastePreviewState,
 } from "../paste/pastePreview";
 import { writePty } from "../terminal/ptyClient";
-import { getWindowChrome, useWindowMaximized } from "../window/windowChrome";
+import { getWindowChrome, useWindowFocused, useWindowMaximized } from "../window/windowChrome";
 import { TitleBar, type SessionHealth } from "./TitleBar";
 
 const TerminalView = lazy(() =>
@@ -25,6 +25,9 @@ export function App() {
   // controls, so getCurrentWindow() is resolved once (lazily, Tauri-safe).
   const chrome = useMemo(() => getWindowChrome(), []);
   const isMaximized = useWindowMaximized(chrome);
+  // Drives the title-bar dimming: on OS blur the chrome softens, on focus it
+  // restores. Shares the one chrome instance created above.
+  const isFocused = useWindowFocused(chrome);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const toggleSettings = useCallback(() => setSettingsOpen((current) => !current), []);
   const closeSettings = useCallback(() => setSettingsOpen(false), []);
@@ -106,7 +109,11 @@ export function App() {
   );
 
   return (
-    <main className="app-shell" data-maximized={isMaximized || undefined}>
+    <main
+      className="app-shell"
+      data-maximized={isMaximized || undefined}
+      data-focused={isFocused || undefined}
+    >
       <TitleBar
         activePasteTargetState={activePasteTargetState}
         pasteState={pasteState}
