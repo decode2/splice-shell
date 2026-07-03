@@ -2,8 +2,6 @@
 import React from "react";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ActivePasteTargetState } from "../paste/activePasteTarget";
-import type { PastePreviewState } from "../paste/pastePreview";
 import { PTY_EXIT_EVENT, PTY_OUTPUT_EVENT } from "../terminal/ptyClient";
 import { TerminalView } from "./TerminalView";
 
@@ -152,18 +150,11 @@ vi.mock("@xterm/addon-webgl", () => {
   return { WebglAddon: MockWebglAddon };
 });
 
-const readyPasteTarget: ActivePasteTargetState = {
-  kind: "ready",
-  processName: "codex.exe",
-  adapterName: "codex-cli",
-};
-const idlePasteState: PastePreviewState = {
-  kind: "idle",
-  message: "Paste preview idle",
-};
-
 let capturedOutputHandlers: PtyEventHandler[] = [];
 let capturedExitHandlers: PtyEventHandler[] = [];
+// The bridge wires terminal.onData -> sendTerminalInput; capturing it lets tests
+// simulate the user typing into xterm.
+let capturedOnData: ((data: string) => void) | undefined;
 let nextSpawnId = 0;
 
 function getInvokeCallsFor(command: string) {
@@ -190,6 +181,7 @@ async function flushAsync() {
 beforeEach(() => {
   capturedOutputHandlers = [];
   capturedExitHandlers = [];
+  capturedOnData = undefined;
   nextSpawnId = 0;
 
   mocks.invoke.mockReset();
@@ -222,7 +214,10 @@ beforeEach(() => {
   mocks.terminalRegisterLinkProvider.mockImplementation(() => ({ dispose: vi.fn() }));
 
   mocks.terminalOnData.mockReset();
-  mocks.terminalOnData.mockImplementation(() => ({ dispose: vi.fn() }));
+  mocks.terminalOnData.mockImplementation((handler) => {
+    capturedOnData = handler;
+    return { dispose: vi.fn() };
+  });
 
   mocks.terminalOnResize.mockReset();
   mocks.terminalOnResize.mockImplementation(() => ({ dispose: vi.fn() }));
@@ -247,9 +242,7 @@ afterEach(() => {
 
 describe("TerminalView PTY lifecycle", () => {
   it("spawns the PTY, registers the output listener, streams output, and disposes everything on unmount", async () => {
-    const { unmount } = render(
-      <TerminalView activePasteTargetState={readyPasteTarget} pasteState={idlePasteState} />,
-    );
+    const { unmount } = render(<TerminalView />);
 
     await waitFor(() => {
       expect(mocks.listen).toHaveBeenCalledWith(PTY_OUTPUT_EVENT, expect.any(Function));
@@ -301,7 +294,7 @@ describe("TerminalView PTY lifecycle", () => {
   it("collapses React 19 StrictMode's mount/cleanup/mount cycle into a single PTY spawn", async () => {
     const { unmount } = render(
       <React.StrictMode>
-        <TerminalView activePasteTargetState={readyPasteTarget} pasteState={idlePasteState} />
+        <TerminalView />
       </React.StrictMode>,
     );
 
@@ -328,9 +321,7 @@ describe("TerminalView PTY lifecycle", () => {
 
 describe("TerminalView pty-exit driven restart", () => {
   it("restarts the shell when the current session emits pty-exit", async () => {
-    render(
-      <TerminalView activePasteTargetState={readyPasteTarget} pasteState={idlePasteState} />,
-    );
+    render(<TerminalView />);
 
     await waitFor(() => {
       expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
@@ -348,9 +339,7 @@ describe("TerminalView pty-exit driven restart", () => {
   });
 
   it("flushes the output filter before respawning so a mid-span restart cannot corrupt the next session", async () => {
-    render(
-      <TerminalView activePasteTargetState={readyPasteTarget} pasteState={idlePasteState} />,
-    );
+    render(<TerminalView />);
 
     await waitFor(() => {
       expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
@@ -386,9 +375,7 @@ describe("TerminalView pty-exit driven restart", () => {
   });
 
   it("ignores a stale pty-exit for an already-superseded session", async () => {
-    render(
-      <TerminalView activePasteTargetState={readyPasteTarget} pasteState={idlePasteState} />,
-    );
+    render(<TerminalView />);
 
     await waitFor(() => {
       expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
@@ -408,9 +395,7 @@ describe("TerminalView pty-exit driven restart", () => {
   });
 
   it("ignores pty-exit that arrives after unmount", async () => {
-    const { unmount } = render(
-      <TerminalView activePasteTargetState={readyPasteTarget} pasteState={idlePasteState} />,
-    );
+    const { unmount } = render(<TerminalView />);
 
     await waitFor(() => {
       expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
@@ -428,9 +413,7 @@ describe("TerminalView pty-exit driven restart", () => {
   });
 
   it("caps consecutive restarts to prevent a restart storm", async () => {
-    render(
-      <TerminalView activePasteTargetState={readyPasteTarget} pasteState={idlePasteState} />,
-    );
+    render(<TerminalView />);
 
     await waitFor(() => {
       expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
@@ -464,9 +447,7 @@ describe("TerminalView pty-exit driven restart", () => {
     // trips and restarts spin forever.
     const nowSpy = vi.spyOn(Date, "now").mockReturnValue(1_000);
     try {
-      render(
-        <TerminalView activePasteTargetState={readyPasteTarget} pasteState={idlePasteState} />,
-      );
+      render(<TerminalView />);
 
       await waitFor(() => {
         expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
@@ -523,9 +504,7 @@ describe("TerminalView pty-exit driven restart", () => {
       return Promise.resolve(undefined);
     });
 
-    render(
-      <TerminalView activePasteTargetState={readyPasteTarget} pasteState={idlePasteState} />,
-    );
+    render(<TerminalView />);
 
     // Listeners are registered before the (still-pending) first spawn.
     await waitFor(() => {
@@ -573,9 +552,7 @@ describe("TerminalView pty-exit driven restart", () => {
       return Promise.resolve(undefined);
     });
 
-    render(
-      <TerminalView activePasteTargetState={readyPasteTarget} pasteState={idlePasteState} />,
-    );
+    render(<TerminalView />);
 
     await waitFor(() => {
       expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
@@ -610,9 +587,7 @@ describe("TerminalView pty-exit driven restart", () => {
   // plus teardown flush guarantee the held show is released exactly once — never
   // stranded and never double-emitted by a post-dispose timer fire.
   it("holds the cursor-show, then releases it exactly once at teardown with no post-dispose double emit", async () => {
-    const { unmount } = render(
-      <TerminalView activePasteTargetState={readyPasteTarget} pasteState={idlePasteState} />,
-    );
+    const { unmount } = render(<TerminalView />);
 
     await waitFor(() => {
       expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
@@ -653,14 +628,74 @@ describe("TerminalView pty-exit driven restart", () => {
   });
 });
 
+describe("TerminalView title bar extraction", () => {
+  it("no longer renders the status footer or a Settings toggle", async () => {
+    const { container, queryByRole } = render(<TerminalView />);
+
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
+    });
+
+    // The status cluster + Settings toggle moved to the TitleBar; the terminal
+    // frame must no longer host the footer or its toggle.
+    expect(container.querySelector(".terminal-statusbar")).toBeNull();
+    expect(queryByRole("button", { name: "Settings" })).toBeNull();
+  });
+
+  it("renders the terminal settings panel only when settingsOpen is true", async () => {
+    const { container, rerender } = render(
+      <TerminalView settingsOpen={false} onCloseSettings={vi.fn()} />,
+    );
+
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
+    });
+
+    expect(container.querySelector(".terminal-settings-panel")).toBeNull();
+
+    rerender(<TerminalView settingsOpen onCloseSettings={vi.fn()} />);
+    expect(container.querySelector(".terminal-settings-panel")).not.toBeNull();
+  });
+
+  it("fires onConnectionActivity once per kind, not per keystroke or per output chunk", async () => {
+    const onConnectionActivity = vi.fn<(kind: "input" | "output") => void>();
+    render(<TerminalView onConnectionActivity={onConnectionActivity} />);
+
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
+    });
+    await waitFor(() => {
+      expect(capturedOnData).toBeDefined();
+      expect(capturedOutputHandlers.length).toBeGreaterThan(0);
+    });
+
+    // Two keystrokes must announce input activity exactly once.
+    act(() => {
+      capturedOnData?.("a");
+      capturedOnData?.("b");
+    });
+    await flushAsync();
+
+    // Two output chunks must announce output activity exactly once.
+    const outputHandler = capturedOutputHandlers.at(-1);
+    act(() => {
+      outputHandler?.({ event: PTY_OUTPUT_EVENT, id: 1, payload: "one" });
+      outputHandler?.({ event: PTY_OUTPUT_EVENT, id: 1, payload: "two" });
+    });
+    await flushAsync();
+
+    const kinds = onConnectionActivity.mock.calls.map(([kind]) => kind);
+    expect(kinds.filter((kind) => kind === "input")).toHaveLength(1);
+    expect(kinds.filter((kind) => kind === "output")).toHaveLength(1);
+  });
+});
+
 describe("TerminalView copy / interrupt key handling", () => {
   // The keydown listener is registered on the terminal host element in the
   // capture phase (before xterm's own handling), so tests dispatch a real
   // KeyboardEvent on that element to exercise the production wiring.
   async function renderAndGetHost() {
-    const { container } = render(
-      <TerminalView activePasteTargetState={readyPasteTarget} pasteState={idlePasteState} />,
-    );
+    const { container } = render(<TerminalView />);
 
     await waitFor(() => {
       expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
@@ -751,15 +786,13 @@ describe("TerminalView copy / interrupt key handling", () => {
 describe("TerminalView paste key handling", () => {
   // The keydown listener runs in the capture phase before xterm maps Ctrl+V to
   // the C0 byte \x16, so tests dispatch a real KeyboardEvent on the host element.
-  async function renderAndGetHost(props: {
-    onClipboardImagePaste?: () => void | Promise<void>;
-  } = {}) {
+  async function renderAndGetHost(
+    props: {
+      onClipboardImagePaste?: () => void | Promise<void>;
+    } = {},
+  ) {
     const { container } = render(
-      <TerminalView
-        activePasteTargetState={readyPasteTarget}
-        pasteState={idlePasteState}
-        onClipboardImagePaste={props.onClipboardImagePaste}
-      />,
+      <TerminalView onClipboardImagePaste={props.onClipboardImagePaste} />,
     );
 
     await waitFor(() => {

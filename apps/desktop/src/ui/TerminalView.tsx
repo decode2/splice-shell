@@ -4,8 +4,6 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
-import type { ActivePasteTargetState } from "../paste/activePasteTarget";
-import type { PastePreviewState } from "../paste/pastePreview";
 import { createLocalFileLinkProvider } from "../terminal/fileLinks";
 import { shouldRefreshTargetAfterInput } from "../terminal/inputActivity";
 import { resolveTerminalKeyAction } from "../terminal/keyboardShortcuts";
@@ -42,22 +40,24 @@ const DEFAULT_TERMINAL_SETTINGS: TerminalSettings = {
 };
 
 type TerminalViewProps = {
-  activePasteTargetState: ActivePasteTargetState;
-  pasteState: PastePreviewState;
+  settingsOpen?: boolean;
+  onCloseSettings?: () => void;
   onClipboardImagePaste?: () => void | Promise<void>;
   onInput?: (data: string) => void | Promise<void>;
   onInputActivity?: () => void;
+  onConnectionActivity?: (kind: "input" | "output") => void;
   onTextPaste?: (text: string) => void | Promise<void>;
   onResize?: (size: { cols: number; rows: number }) => void;
   onPtyReady?: () => void;
 };
 
 export function TerminalView({
-  activePasteTargetState,
-  pasteState,
+  settingsOpen = false,
+  onCloseSettings,
   onClipboardImagePaste,
   onInput = writePty,
   onInputActivity,
+  onConnectionActivity,
   onTextPaste,
   onPtyReady,
   onResize = resizePty,
@@ -65,14 +65,12 @@ export function TerminalView({
   const terminalElementRef = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
-  const [hasInputActivity, setHasInputActivity] = useState(false);
-  const [hasPtyOutput, setHasPtyOutput] = useState(false);
-  const [settingsOpen, setSettingsOpen] = useState(false);
   const [terminalSettings, setTerminalSettings] = useState(DEFAULT_TERMINAL_SETTINGS);
   const handlersRef = useRef({
     onClipboardImagePaste,
     onInput,
     onInputActivity,
+    onConnectionActivity,
     onTextPaste,
     onPtyReady,
     onResize,
@@ -82,6 +80,7 @@ export function TerminalView({
     onClipboardImagePaste,
     onInput,
     onInputActivity,
+    onConnectionActivity,
     onTextPaste,
     onPtyReady,
     onResize,
@@ -142,6 +141,7 @@ export function TerminalView({
     const fileLinkProvider = terminal.registerLinkProvider(createLocalFileLinkProvider(terminal));
     let disposed = false;
     let outputSeen = false;
+    let inputSeen = false;
     let inputClosed = false;
     let restartInFlight = false;
     let ptyGeneration = 0;
@@ -206,7 +206,7 @@ export function TerminalView({
     const writePtyOutput = (chunk: string) => {
       if (!outputSeen) {
         outputSeen = true;
-        setHasPtyOutput(true);
+        handlersRef.current.onConnectionActivity?.("output");
       }
 
       // A session that has stayed up past the min-uptime threshold and is now
@@ -293,7 +293,10 @@ export function TerminalView({
       }
 
       const inputGeneration = ptyGeneration;
-      setHasInputActivity(true);
+      if (!inputSeen) {
+        inputSeen = true;
+        handlersRef.current.onConnectionActivity?.("input");
+      }
       if (shouldRefreshTargetAfterInput(data)) {
         handlersRef.current.onInputActivity?.();
       }
@@ -511,27 +514,11 @@ export function TerminalView({
   return (
     <section className="terminal-frame" aria-label="Terminal">
       <div className="terminal-host" ref={terminalElementRef} />
-      <footer className="terminal-statusbar">
-        <span>
-          ConPTY · input {hasInputActivity ? "yes" : "waiting"} · output{" "}
-          {hasPtyOutput ? "yes" : "waiting"}
-        </span>
-        <ActivePasteTargetPanel activePasteTargetState={activePasteTargetState} />
-        <PastePreviewPanel pasteState={pasteState} />
-        <button
-          className="terminal-settings-toggle"
-          type="button"
-          aria-expanded={settingsOpen}
-          onClick={() => setSettingsOpen((current) => !current)}
-        >
-          Settings
-        </button>
-      </footer>
       {settingsOpen ? (
         <TerminalSettingsPanel
           settings={terminalSettings}
           onChange={setTerminalSettings}
-          onClose={() => setSettingsOpen(false)}
+          onClose={() => onCloseSettings?.()}
         />
       ) : null}
     </section>
@@ -546,57 +533,6 @@ function isClosedPtyInputError(error: unknown) {
     message.includes("pipe is being closed") ||
     message.includes("pipe has been ended")
   );
-}
-
-function ActivePasteTargetPanel({
-  activePasteTargetState,
-}: Pick<TerminalViewProps, "activePasteTargetState">) {
-  if (activePasteTargetState.kind === "ready") {
-    return (
-      <p className="paste-preview paste-target muted">
-        Active paste target: {activePasteTargetState.adapterName} /{" "}
-        {activePasteTargetState.processName}
-      </p>
-    );
-  }
-
-  if (activePasteTargetState.kind === "unsupported") {
-    return (
-      <p className="paste-preview paste-target warning">
-        Active paste target unsupported: {activePasteTargetState.processName}
-      </p>
-    );
-  }
-
-  return <p className="paste-preview paste-target muted">{activePasteTargetState.message}</p>;
-}
-
-function PastePreviewPanel({ pasteState }: Pick<TerminalViewProps, "pasteState">) {
-  if (pasteState.kind === "idle") {
-    return <p className="paste-preview paste-route muted">{pasteState.message}</p>;
-  }
-
-  if (pasteState.kind === "ready") {
-    return (
-      <div className="paste-preview paste-route success">
-        <span>
-          Adapter {pasteState.adapterName} selected for {pasteState.processName}:
-        </span>
-        <code>{pasteState.text}</code>
-      </div>
-    );
-  }
-
-  if (pasteState.kind === "unsupported") {
-    return (
-      <p className="paste-preview paste-route warning">
-        Image was extracted, but the active process is unsupported: {pasteState.processName}.{" "}
-        {pasteState.path}
-      </p>
-    );
-  }
-
-  return <p className="paste-preview paste-route warning">{pasteState.message}</p>;
 }
 
 function TerminalSettingsPanel({

@@ -19,40 +19,26 @@ body {
 }
 
 .app-shell {
-  display: block;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
   height: 100vh;
-  padding: 0;
   background: #020617;
 }
 
-.app-toolbar {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  overflow: hidden;
-  clip: rect(0 0 0 0);
-  white-space: nowrap;
-}
-
-.eyebrow {
-  margin: 0 0 0.75rem;
-  color: #38bdf8;
-  font-size: 0.85rem;
-  font-weight: 700;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-}
-
-h1 {
-  margin: 0;
-  font-size: 1.25rem;
-  line-height: 1.1;
+/*
+ * When the OS window is maximized, DWM squares the corners and the window fills
+ * the work area. `--maximized-inset` defaults to 0; bump it to ~8px only if QA
+ * observes content bleeding under the taskbar at some DPI scale (tao clamps the
+ * size via WM_GETMINMAXINFO, but the exact fit is DPI-dependent).
+ */
+.app-shell[data-maximized] {
+  padding: var(--maximized-inset, 0px);
 }
 
 .terminal-frame {
   position: relative;
   display: grid;
-  grid-template-rows: minmax(0, 1fr) auto;
+  grid-template-rows: minmax(0, 1fr);
   overflow: hidden;
   width: 100%;
   height: 100%;
@@ -103,24 +89,81 @@ h1 {
   overflow-y: hidden;
 }
 
-.terminal-statusbar {
-  display: flex;
+/*
+ * Custom (undecorated) window title bar. Row 1 of `.app-shell`. Native
+ * decorations are off, so this bar owns dragging (data-tauri-drag-region on
+ * inert elements) and the window controls. Four columns: brand, elastic status
+ * cluster, Settings toggle, and the flush-right window controls.
+ */
+.titlebar {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
   align-items: center;
   gap: 0.75rem;
-  min-height: 1.75rem;
+  height: 2.25rem;
   min-width: 0;
-  border-top: 1px solid rgba(148, 163, 184, 0.12);
-  padding: 0.25rem 0.5rem;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+  padding-left: 0.75rem;
   background: #020617;
   color: rgba(148, 163, 184, 0.82);
   font-family: "Cascadia Code", "Fira Code", Consolas, monospace;
   font-size: 0.7rem;
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: default;
 }
 
-.terminal-statusbar > * {
+.titlebar-brand {
+  color: #cbd5e1;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.titlebar-status {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  min-width: 0;
+}
+
+.titlebar-status > * {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.window-controls {
+  display: flex;
+  align-self: stretch;
+  height: 100%;
+}
+
+.window-control {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 46px;
+  height: 100%;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  background: transparent;
+  color: #cbd5e1;
+  cursor: default;
+}
+
+.window-control:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.window-control-close:hover {
+  background: #c42b1c;
+  color: #ffffff;
+}
+
+.window-control .window-glyph {
+  width: 10px;
+  height: 10px;
 }
 
 .paste-preview {
@@ -183,8 +226,8 @@ h1 {
 
 .terminal-settings-panel {
   position: absolute;
+  top: 0.5rem;
   right: 0.75rem;
-  bottom: 2.25rem;
   z-index: 3;
   display: grid;
   gap: 0.75rem;
