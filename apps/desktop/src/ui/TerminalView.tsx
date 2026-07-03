@@ -26,6 +26,7 @@ import {
 } from "../terminal/terminalOutputFilter";
 import { createTerminalOutputScheduler } from "../terminal/terminalOutputScheduler";
 import { shouldRecoverClosedPtyInput } from "../terminal/ptyRecovery";
+import type { SessionHealth } from "./TitleBar";
 
 type TerminalSettings = {
   background: string;
@@ -45,7 +46,7 @@ type TerminalViewProps = {
   onClipboardImagePaste?: () => void | Promise<void>;
   onInput?: (data: string) => void | Promise<void>;
   onInputActivity?: () => void;
-  onConnectionActivity?: (kind: "input" | "output") => void;
+  onSessionHealth?: (status: SessionHealth) => void;
   onTextPaste?: (text: string) => void | Promise<void>;
   onResize?: (size: { cols: number; rows: number }) => void;
   onPtyReady?: () => void;
@@ -57,7 +58,7 @@ export function TerminalView({
   onClipboardImagePaste,
   onInput = writePty,
   onInputActivity,
-  onConnectionActivity,
+  onSessionHealth,
   onTextPaste,
   onPtyReady,
   onResize = resizePty,
@@ -70,7 +71,7 @@ export function TerminalView({
     onClipboardImagePaste,
     onInput,
     onInputActivity,
-    onConnectionActivity,
+    onSessionHealth,
     onTextPaste,
     onPtyReady,
     onResize,
@@ -80,7 +81,7 @@ export function TerminalView({
     onClipboardImagePaste,
     onInput,
     onInputActivity,
-    onConnectionActivity,
+    onSessionHealth,
     onTextPaste,
     onPtyReady,
     onResize,
@@ -140,8 +141,6 @@ export function TerminalView({
     terminal.loadAddon(fitAddon);
     const fileLinkProvider = terminal.registerLinkProvider(createLocalFileLinkProvider(terminal));
     let disposed = false;
-    let outputSeen = false;
-    let inputSeen = false;
     let inputClosed = false;
     let restartInFlight = false;
     let ptyGeneration = 0;
@@ -174,6 +173,19 @@ export function TerminalView({
     // banner/error and must not reset the restart-storm counter.
     const MIN_HEALTHY_UPTIME_MS = 2000;
 
+    // Session health drives the title bar's health dot. Emit only on real
+    // transitions: a healthy session produces output on every frame, and the
+    // storm guard can loop, so deduping here keeps the parent from being spammed
+    // with identical statuses (App also no-ops an unchanged status defensively).
+    let lastReportedHealth: SessionHealth | undefined;
+    const reportSessionHealth = (status: SessionHealth) => {
+      if (lastReportedHealth === status) {
+        return;
+      }
+      lastReportedHealth = status;
+      handlersRef.current.onSessionHealth?.(status);
+    };
+
     const writeTerminalChunk = (chunk: string) => {
       terminal.write(chunk);
     };
@@ -204,11 +216,6 @@ export function TerminalView({
       },
     });
     const writePtyOutput = (chunk: string) => {
-      if (!outputSeen) {
-        outputSeen = true;
-        handlersRef.current.onConnectionActivity?.("output");
-      }
-
       // A session that has stayed up past the min-uptime threshold and is now
       // producing output is genuinely healthy, so clear the restart-storm
       // counter: a later, legitimate one-off restart should not be counted
@@ -216,8 +223,10 @@ export function TerminalView({
       // arrives within the first `MIN_HEALTHY_UPTIME_MS` is NOT trusted — a
       // shell that prints then instantly dies must keep accumulating restarts
       // toward the cap, otherwise the storm guard is defeated by any output.
+      // The same proof-of-health drives the title bar dot back to "healthy".
       if (Date.now() - spawnTime > MIN_HEALTHY_UPTIME_MS) {
         consecutiveRestarts = 0;
+        reportSessionHealth("healthy");
       }
 
       writeTerminalActions(outputFilter.write(chunk));
@@ -239,7 +248,14 @@ export function TerminalView({
         lastUnmatchedExitId = undefined;
         inputClosed = true;
         void restartPty();
+        return;
       }
+
+      // The session spawned and was not pre-empted by a stashed instant-exit:
+      // treat the settle as proof it booted so the title bar dot returns to
+      // quiet. Genuinely unhealthy sessions die and re-enter reconnecting via
+      // `restartPty` before this matters.
+      reportSessionHealth("healthy");
     };
     const restartPty = async () => {
       if (disposed) {
@@ -259,12 +275,18 @@ export function TerminalView({
       try {
         consecutiveRestarts += 1;
         if (consecutiveRestarts > MAX_CONSECUTIVE_RESTARTS) {
+          // The storm guard gives up: surface a terminal "failed" state so the
+          // title bar dot goes red instead of silently pretending to reconnect.
+          reportSessionHealth("failed");
           terminal.write(
             "\r\nPTY session keeps exiting immediately; automatic restart stopped.\r\n",
           );
           return;
         }
 
+        // A restart is under way: the dot pulses amber until the new session
+        // proves healthy (output past the min uptime) or the cap gives up.
+        reportSessionHealth("reconnecting");
         terminal.write("\r\nPTY session ended. Starting a new shell...\r\n");
         // Flush AND reset the output filter before the new session starts. A
         // session that died mid-escape can leave a held partial (e.g.
@@ -293,10 +315,6 @@ export function TerminalView({
       }
 
       const inputGeneration = ptyGeneration;
-      if (!inputSeen) {
-        inputSeen = true;
-        handlersRef.current.onConnectionActivity?.("input");
-      }
       if (shouldRefreshTargetAfterInput(data)) {
         handlersRef.current.onInputActivity?.();
       }

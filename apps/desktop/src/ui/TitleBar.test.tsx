@@ -9,7 +9,7 @@ import { TitleBar } from "./TitleBar";
 const activePasteTarget: ActivePasteTargetState = {
   kind: "ready",
   processName: "codex.exe",
-  adapterName: "codex-cli",
+  adapterName: "codex",
 };
 const idlePasteState: PastePreviewState = {
   kind: "idle",
@@ -33,9 +33,9 @@ function renderTitleBar(
   const onToggleSettings = overrides.onToggleSettings ?? vi.fn();
   const result = render(
     <TitleBar
-      connection={{ input: false, output: false }}
       activePasteTargetState={activePasteTarget}
       pasteState={idlePasteState}
+      sessionHealth="healthy"
       settingsOpen={false}
       onToggleSettings={onToggleSettings}
       isMaximized={false}
@@ -91,11 +91,105 @@ describe("TitleBar settings toggle", () => {
     fireEvent.click(settings);
     expect(onToggleSettings).toHaveBeenCalledTimes(1);
   });
+
+  it("renders settings as an icon button (inline SVG), not a text pill", () => {
+    const { getByRole } = renderTitleBar();
+
+    const settings = getByRole("button", { name: "Settings" });
+    // The redesigned settings control uses an inline gear glyph, matching the
+    // window controls' visual language rather than a "Settings" text pill.
+    expect(settings.querySelector("svg")).toBeTruthy();
+    expect(settings.textContent?.trim()).toBe("");
+  });
+});
+
+describe("TitleBar adapter chip", () => {
+  it("renders the adapter name (what you are talking to), without the process .exe", () => {
+    const { container, getByText } = renderTitleBar({
+      activePasteTargetState: {
+        kind: "ready",
+        processName: "codex.exe",
+        adapterName: "codex",
+      },
+    });
+
+    const chip = container.querySelector(".titlebar-chip");
+    expect(chip).toBeTruthy();
+    expect(getByText("codex")).toBeTruthy();
+    // The redundant process/.exe is dropped from the chip.
+    expect(container.textContent).not.toContain(".exe");
+    expect(chip?.classList.contains("titlebar-chip--unsupported")).toBe(false);
+  });
+
+  it("goes amber for an unsupported target", () => {
+    const { container } = renderTitleBar({
+      activePasteTargetState: { kind: "unsupported", processName: "notepad.exe" },
+    });
+
+    const chip = container.querySelector(".titlebar-chip");
+    expect(chip).toBeTruthy();
+    expect(chip?.classList.contains("titlebar-chip--unsupported")).toBe(true);
+    expect(container.textContent).not.toContain(".exe");
+  });
+
+  it("renders no chip while the target is still loading", () => {
+    const { container } = renderTitleBar({
+      activePasteTargetState: { kind: "loading", message: "Detecting…" },
+    });
+
+    expect(container.querySelector(".titlebar-chip")).toBeNull();
+  });
+});
+
+describe("TitleBar health dot", () => {
+  it("stays quiet (no label) when healthy", () => {
+    const { container } = renderTitleBar({ sessionHealth: "healthy" });
+
+    const dot = container.querySelector(".titlebar-health-dot");
+    expect(dot).toBeTruthy();
+    expect(dot?.getAttribute("data-health")).toBe("healthy");
+    expect(container.querySelector(".titlebar-health-label")).toBeNull();
+  });
+
+  it("shows an amber reconnecting label while reconnecting", () => {
+    const { container, getByText } = renderTitleBar({ sessionHealth: "reconnecting" });
+
+    const dot = container.querySelector(".titlebar-health-dot");
+    expect(dot?.getAttribute("data-health")).toBe("reconnecting");
+    expect(getByText(/reconnecting/i)).toBeTruthy();
+  });
+
+  it("shows a session failed label when failed", () => {
+    const { container, getByText } = renderTitleBar({ sessionHealth: "failed" });
+
+    const dot = container.querySelector(".titlebar-health-dot");
+    expect(dot?.getAttribute("data-health")).toBe("failed");
+    expect(getByText(/session failed/i)).toBeTruthy();
+  });
+});
+
+describe("TitleBar paste feedback", () => {
+  it("renders nothing for the paste feedback while idle", () => {
+    const { container } = renderTitleBar({ pasteState: idlePasteState });
+
+    expect(container.querySelector(".paste-preview")).toBeNull();
+  });
+
+  it("renders the transient paste feedback for a non-idle state", () => {
+    const { container } = renderTitleBar({
+      pasteState: {
+        kind: "error",
+        message: "Image paste failed",
+      },
+    });
+
+    expect(container.querySelector(".paste-preview")).toBeTruthy();
+  });
 });
 
 describe("TitleBar drag regions", () => {
   it("marks the header and its inert children as drag regions but never the buttons", () => {
-    const { container, getByRole, getByText } = renderTitleBar();
+    const { container, getByRole } = renderTitleBar();
 
     const header = container.querySelector(".titlebar");
     expect(header?.hasAttribute("data-tauri-drag-region")).toBe(true);
@@ -105,21 +199,22 @@ describe("TitleBar drag regions", () => {
     expect(
       container.querySelector(".titlebar-status")?.hasAttribute("data-tauri-drag-region"),
     ).toBe(true);
-    // The ConPTY status text is an exact drag target: Tauri matches the event
-    // target itself, not ancestors, so the text span must carry the attribute.
-    expect(getByText(/ConPTY/).hasAttribute("data-tauri-drag-region")).toBe(true);
+    // Tauri matches the exact event target, not ancestors, so every inert leaf
+    // the user might grab carries the attribute: the chip, the dot, the health
+    // wrapper.
+    expect(
+      container.querySelector(".titlebar-chip")?.hasAttribute("data-tauri-drag-region"),
+    ).toBe(true);
+    expect(
+      container.querySelector(".titlebar-health")?.hasAttribute("data-tauri-drag-region"),
+    ).toBe(true);
+    expect(
+      container.querySelector(".titlebar-health-dot")?.hasAttribute("data-tauri-drag-region"),
+    ).toBe(true);
 
-    // Buttons opt out of dragging by NOT carrying the attribute.
+    // Buttons (window controls AND the settings icon) opt out of dragging.
     for (const name of ["Settings", "Minimize", "Maximize", "Close"]) {
       expect(getByRole("button", { name }).hasAttribute("data-tauri-drag-region")).toBe(false);
     }
-  });
-});
-
-describe("TitleBar status cluster", () => {
-  it("renders the ConPTY connection status from the connection prop", () => {
-    const { getByText } = renderTitleBar({ connection: { input: true, output: false } });
-
-    expect(getByText(/input yes · output waiting/)).toBeTruthy();
   });
 });

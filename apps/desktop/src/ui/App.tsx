@@ -13,7 +13,7 @@ import {
 } from "../paste/pastePreview";
 import { writePty } from "../terminal/ptyClient";
 import { getWindowChrome, useWindowMaximized } from "../window/windowChrome";
-import { TitleBar, type ConnectionState } from "./TitleBar";
+import { TitleBar, type SessionHealth } from "./TitleBar";
 
 const TerminalView = lazy(() =>
   import("./TerminalView").then((module) => ({ default: module.TerminalView })),
@@ -28,15 +28,13 @@ export function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const toggleSettings = useCallback(() => setSettingsOpen((current) => !current), []);
   const closeSettings = useCallback(() => setSettingsOpen(false), []);
-  // Latched ConPTY connection status shown in the title bar. The transition
-  // guard returns the SAME object once a flag is already set, so a stream of
-  // keystrokes/output chunks does not re-render the shell after the first one.
-  const [connection, setConnection] = useState<ConnectionState>({
-    input: false,
-    output: false,
-  });
-  const handleConnectionActivity = useCallback((kind: "input" | "output") => {
-    setConnection((current) => (current[kind] ? current : { ...current, [kind]: true }));
+  // Session health drives the title bar's health dot. It starts "healthy" and
+  // only changes on real transitions (reconnecting / failed / back to healthy).
+  // The setter no-ops when the status is unchanged, so a stream of healthy
+  // output chunks cannot re-render the shell after the first transition.
+  const [sessionHealth, setSessionHealth] = useState<SessionHealth>("healthy");
+  const handleSessionHealth = useCallback((status: SessionHealth) => {
+    setSessionHealth((current) => (current === status ? current : status));
   }, []);
   const [pasteState, setPasteState] = useState<PastePreviewState>({
     kind: "idle",
@@ -110,9 +108,9 @@ export function App() {
   return (
     <main className="app-shell" data-maximized={isMaximized || undefined}>
       <TitleBar
-        connection={connection}
         activePasteTargetState={activePasteTargetState}
         pasteState={pasteState}
+        sessionHealth={sessionHealth}
         settingsOpen={settingsOpen}
         onToggleSettings={toggleSettings}
         isMaximized={isMaximized}
@@ -122,7 +120,7 @@ export function App() {
         <TerminalView
           onClipboardImagePaste={pasteClipboardImageIntoTerminal}
           onInputActivity={debouncedActivePasteTargetRefresh.schedule}
-          onConnectionActivity={handleConnectionActivity}
+          onSessionHealth={handleSessionHealth}
           onTextPaste={pasteTextIntoTerminal}
           onPtyReady={refreshActivePasteTarget}
           settingsOpen={settingsOpen}

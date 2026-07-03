@@ -152,9 +152,6 @@ vi.mock("@xterm/addon-webgl", () => {
 
 let capturedOutputHandlers: PtyEventHandler[] = [];
 let capturedExitHandlers: PtyEventHandler[] = [];
-// The bridge wires terminal.onData -> sendTerminalInput; capturing it lets tests
-// simulate the user typing into xterm.
-let capturedOnData: ((data: string) => void) | undefined;
 let nextSpawnId = 0;
 
 function getInvokeCallsFor(command: string) {
@@ -181,7 +178,6 @@ async function flushAsync() {
 beforeEach(() => {
   capturedOutputHandlers = [];
   capturedExitHandlers = [];
-  capturedOnData = undefined;
   nextSpawnId = 0;
 
   mocks.invoke.mockReset();
@@ -214,10 +210,7 @@ beforeEach(() => {
   mocks.terminalRegisterLinkProvider.mockImplementation(() => ({ dispose: vi.fn() }));
 
   mocks.terminalOnData.mockReset();
-  mocks.terminalOnData.mockImplementation((handler) => {
-    capturedOnData = handler;
-    return { dispose: vi.fn() };
-  });
+  mocks.terminalOnData.mockImplementation(() => ({ dispose: vi.fn() }));
 
   mocks.terminalOnResize.mockReset();
   mocks.terminalOnResize.mockImplementation(() => ({ dispose: vi.fn() }));
@@ -439,6 +432,42 @@ describe("TerminalView pty-exit driven restart", () => {
     expect(lastSpawnCount).toBeLessThanOrEqual(6);
   });
 
+  it("signals reconnecting on a restart and failed when the storm cap gives up", async () => {
+    const onSessionHealth = vi.fn<(status: string) => void>();
+    render(<TerminalView onSessionHealth={onSessionHealth} />);
+
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
+    });
+    await waitFor(() => {
+      expect(capturedExitHandlers.length).toBeGreaterThan(0);
+    });
+
+    // A single restart announces "reconnecting" the moment restartPty begins.
+    emitPtyExit(1);
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(2);
+    });
+    await flushAsync();
+    expect(onSessionHealth.mock.calls.map(([status]) => status)).toContain("reconnecting");
+
+    // Keep exiting with no healthy output in between so the storm cap trips.
+    let lastSpawnCount = getInvokeCallsFor("pty_spawn").length;
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      emitPtyExit(lastSpawnCount);
+      await flushAsync();
+      const spawnCount = getInvokeCallsFor("pty_spawn").length;
+      if (spawnCount === lastSpawnCount) {
+        break;
+      }
+      lastSpawnCount = spawnCount;
+    }
+
+    // When consecutiveRestarts exceeds the cap, the guard gives up and the
+    // health signal reports "failed".
+    expect(onSessionHealth.mock.calls.map(([status]) => status)).toContain("failed");
+  });
+
   it("does not reset the restart-storm cap for output that arrives before the minimum healthy uptime", async () => {
     // Pin the clock so every spawn and its output share the same timestamp:
     // the session's uptime is always 0, i.e. below MIN_HEALTHY_UPTIME_MS. A
@@ -657,36 +686,18 @@ describe("TerminalView title bar extraction", () => {
     expect(container.querySelector(".terminal-settings-panel")).not.toBeNull();
   });
 
-  it("fires onConnectionActivity once per kind, not per keystroke or per output chunk", async () => {
-    const onConnectionActivity = vi.fn<(kind: "input" | "output") => void>();
-    render(<TerminalView onConnectionActivity={onConnectionActivity} />);
+  it("signals healthy once the initial session settles", async () => {
+    const onSessionHealth = vi.fn<(status: string) => void>();
+    render(<TerminalView onSessionHealth={onSessionHealth} />);
 
     await waitFor(() => {
       expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
     });
-    await waitFor(() => {
-      expect(capturedOnData).toBeDefined();
-      expect(capturedOutputHandlers.length).toBeGreaterThan(0);
-    });
-
-    // Two keystrokes must announce input activity exactly once.
-    act(() => {
-      capturedOnData?.("a");
-      capturedOnData?.("b");
-    });
     await flushAsync();
 
-    // Two output chunks must announce output activity exactly once.
-    const outputHandler = capturedOutputHandlers.at(-1);
-    act(() => {
-      outputHandler?.({ event: PTY_OUTPUT_EVENT, id: 1, payload: "one" });
-      outputHandler?.({ event: PTY_OUTPUT_EVENT, id: 1, payload: "two" });
-    });
-    await flushAsync();
-
-    const kinds = onConnectionActivity.mock.calls.map(([kind]) => kind);
-    expect(kinds.filter((kind) => kind === "input")).toHaveLength(1);
-    expect(kinds.filter((kind) => kind === "output")).toHaveLength(1);
+    // A successful startPty settling proves the session booted; the health
+    // signal reports "healthy" so the title bar dot stays quiet.
+    expect(onSessionHealth.mock.calls.map(([status]) => status)).toContain("healthy");
   });
 });
 
