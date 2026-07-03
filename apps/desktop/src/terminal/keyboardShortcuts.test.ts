@@ -46,11 +46,28 @@ describe("resolveTerminalKeyAction", () => {
     expect(resolveTerminalKeyAction(keyboardEvent({ key: "Insert" }), false)).toBe("copy");
   });
 
-  it("does nothing for Shift+Insert (paste) or a bare key", () => {
+  it("does nothing for a bare key", () => {
+    expect(resolveTerminalKeyAction(keyboardEvent({ ctrlKey: false }), true)).toBe("none");
+  });
+
+  it("pastes on Ctrl+V regardless of selection", () => {
+    expect(resolveTerminalKeyAction(keyboardEvent({ key: "v" }), true)).toBe("paste");
+    expect(resolveTerminalKeyAction(keyboardEvent({ key: "v" }), false)).toBe("paste");
+  });
+
+  it("pastes on Shift+Insert (Windows Terminal parity)", () => {
     expect(
       resolveTerminalKeyAction(keyboardEvent({ key: "Insert", ctrlKey: false, shiftKey: true }), true),
+    ).toBe("paste");
+    expect(
+      resolveTerminalKeyAction(keyboardEvent({ key: "Insert", ctrlKey: false, shiftKey: true }), false),
+    ).toBe("paste");
+  });
+
+  it("does not paste on Ctrl+Shift+V (only Ctrl+V and Shift+Insert paste)", () => {
+    expect(
+      resolveTerminalKeyAction(keyboardEvent({ key: "v", shiftKey: true }), true),
     ).toBe("none");
-    expect(resolveTerminalKeyAction(keyboardEvent({ ctrlKey: false }), true)).toBe("none");
   });
 
   it("does nothing for platform or menu chord variants", () => {
@@ -59,5 +76,8 @@ describe("resolveTerminalKeyAction", () => {
     expect(resolveTerminalKeyAction(keyboardEvent({ key: "Insert", altKey: true }), true)).toBe(
       "none",
     );
+    // Ctrl+V with Alt or Meta must not paste — those are platform/menu chords.
+    expect(resolveTerminalKeyAction(keyboardEvent({ key: "v", altKey: true }), true)).toBe("none");
+    expect(resolveTerminalKeyAction(keyboardEvent({ key: "v", metaKey: true }), true)).toBe("none");
   });
 });

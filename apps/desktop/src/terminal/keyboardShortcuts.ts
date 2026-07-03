@@ -6,13 +6,17 @@ type TerminalKeyboardEvent = {
   metaKey: boolean;
 };
 
-export type TerminalKeyAction = "copy" | "interrupt" | "none";
+export type TerminalKeyAction = "copy" | "paste" | "interrupt" | "none";
 
 // Resolve the intent of a terminal keydown. Copy vs. interrupt is selection-aware
 // so a bare Ctrl+C still sends SIGINT (\x03) when nothing is selected — matching
 // Windows Terminal's default "copy falls through to the app when there's no
 // selection" behavior. Ctrl+Shift+C and Ctrl+Insert are unconditional copy
-// chords. Modifier-laden variants (Alt/Meta) and unrelated keys are left alone.
+// chords. Paste is Ctrl+V or Shift+Insert (Windows Terminal parity); it must be
+// intercepted here because xterm otherwise maps Ctrl+V to the C0 byte \x16 and
+// cancels the keydown, so no DOM paste event ever fires. Ctrl+Shift+V is
+// deliberately NOT a paste chord. Modifier-laden variants (Alt/Meta) and
+// unrelated keys are left alone.
 export function resolveTerminalKeyAction(
   event: TerminalKeyboardEvent,
   hasSelection: boolean,
@@ -33,6 +37,14 @@ export function resolveTerminalKeyAction(
 
   if (event.ctrlKey && !event.shiftKey && key === "insert") {
     return "copy";
+  }
+
+  if (event.ctrlKey && !event.shiftKey && key === "v") {
+    return "paste";
+  }
+
+  if (!event.ctrlKey && event.shiftKey && key === "insert") {
+    return "paste";
   }
 
   return "none";

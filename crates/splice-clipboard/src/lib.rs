@@ -261,6 +261,21 @@ fn encode_clipboard_text_utf16(text: &str) -> Vec<u16> {
     units
 }
 
+// Decode UTF-16 code units (as read from a CF_UNICODETEXT global) into a String,
+// stopping at the first NUL terminator. CF_UNICODETEXT buffers are NUL-terminated
+// and the backing GlobalAlloc block can be larger than the string, so everything
+// from the first NUL onward is allocation slack and must be dropped. Lossy
+// decoding maps any unpaired surrogate to U+FFFD so a malformed clipboard payload
+// yields text rather than an error. Kept pure and platform-agnostic so it can be
+// unit-tested off Windows; the Win32 GetClipboardData path is Windows-only.
+fn decode_clipboard_text_utf16(units: &[u16]) -> String {
+    let end = units
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(units.len());
+    String::from_utf16_lossy(&units[..end])
+}
+
 #[cfg(not(windows))]
 pub fn write_clipboard_text(_text: &str) -> Result<(), ClipboardError> {
     Err(ClipboardError::UnsupportedPlatform)
@@ -270,6 +285,20 @@ pub fn write_clipboard_text(_text: &str) -> Result<(), ClipboardError> {
 pub fn write_clipboard_text(text: &str) -> Result<(), ClipboardError> {
     let utf16 = encode_clipboard_text_utf16(text);
     windows_clipboard::write_unicode_text(&utf16)
+}
+
+#[cfg(not(windows))]
+pub fn read_clipboard_text() -> Result<String, ClipboardError> {
+    Err(ClipboardError::UnsupportedPlatform)
+}
+
+// Read CF_UNICODETEXT from the OS clipboard. When no text format is present (e.g.
+// the clipboard holds only an image), returns Ok(String::new()) so callers can
+// cleanly fall through to the image paste route instead of treating "no text" as
+// an error.
+#[cfg(windows)]
+pub fn read_clipboard_text() -> Result<String, ClipboardError> {
+    windows_clipboard::read_unicode_text()
 }
 
 #[cfg(not(windows))]
@@ -375,6 +404,25 @@ mod windows_clipboard {
         Ok(locked.bytes().to_vec())
     }
 
+    // Read CF_UNICODETEXT and decode it to a String. Symmetric with
+    // write_unicode_text: it reuses open_with_retry (the clipboard can be briefly
+    // owned by another process) and GlobalLockGuard (RAII unlock). A missing text
+    // format is NOT an error — it signals "no text to paste" as an empty String so
+    // the caller can fall back to the image route.
+    pub fn read_unicode_text() -> Result<String, ClipboardError> {
+        let _clipboard = ClipboardGuard::open_with_retry()?;
+
+        if unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT.0 as u32) }.is_err() {
+            return Ok(String::new());
+        }
+
+        let handle = unsafe { GetClipboardData(CF_UNICODETEXT.0 as u32)? };
+        let global = HGLOBAL(handle.0);
+        let locked = GlobalLockGuard::lock(global)?;
+
+        Ok(super::decode_clipboard_text_utf16(locked.utf16_units()))
+    }
+
     fn available_image_format() -> Result<u32, ClipboardError> {
         // Prefer DIBV5 when available because it can preserve richer bitmap metadata
         // (including a real alpha channel from well-behaved apps). The zero-alpha
@@ -456,6 +504,14 @@ mod windows_clipboard {
         fn bytes(&self) -> &[u8] {
             unsafe { slice::from_raw_parts(self.ptr.as_ptr().cast::<u8>(), self.size) }
         }
+
+        // View the locked block as UTF-16 code units for CF_UNICODETEXT. GlobalAlloc
+        // memory is at least pointer-aligned, so the u16 cast is sound; a trailing
+        // odd byte (size not a multiple of 2) is truncated by the integer division,
+        // which cannot form a complete code unit anyway.
+        fn utf16_units(&self) -> &[u16] {
+            unsafe { slice::from_raw_parts(self.ptr.as_ptr().cast::<u16>(), self.size / 2) }
+        }
     }
 
     impl Drop for GlobalLockGuard {
@@ -506,6 +562,46 @@ mod tests {
             encode_clipboard_text_utf16("\u{1F600}"),
             vec![0xD83D, 0xDE00, 0x0000]
         );
+    }
+
+    #[test]
+    fn decodes_utf16_up_to_the_nul_terminator() {
+        // CF_UNICODETEXT buffers are NUL-terminated; the decode must stop at the
+        // first NUL and ignore any trailing allocation slack after it.
+        let units = [0x0061u16, 0x0062, 0x0000, 0x00FF, 0x00FF];
+        assert_eq!(decode_clipboard_text_utf16(&units), "ab");
+    }
+
+    #[test]
+    fn decodes_empty_utf16_buffer_to_empty_string() {
+        // A lone NUL (the empty-string clipboard payload) and a truly empty slice
+        // both decode to "".
+        assert_eq!(decode_clipboard_text_utf16(&[0x0000u16]), "");
+        assert_eq!(decode_clipboard_text_utf16(&[]), "");
+    }
+
+    #[test]
+    fn decodes_utf16_without_a_nul_terminator() {
+        // A buffer with no NUL must decode all of its units rather than panic or
+        // truncate.
+        assert_eq!(decode_clipboard_text_utf16(&[0x0061u16, 0x0062]), "ab");
+    }
+
+    #[test]
+    fn decodes_utf16_surrogate_pairs_before_the_nul() {
+        // U+1F600 (😀) is the surrogate pair D83D DE00; it must round-trip through
+        // the decode and stop at the following NUL.
+        let units = [0xD83Du16, 0xDE00, 0x0000];
+        assert_eq!(decode_clipboard_text_utf16(&units), "\u{1F600}");
+    }
+
+    #[test]
+    fn round_trips_clipboard_encode_then_decode() {
+        // The write path CRLF-normalizes and NUL-terminates; decoding that exact
+        // buffer must recover the CRLF-normalized text (the shape the clipboard
+        // actually holds).
+        let encoded = encode_clipboard_text_utf16("line1\nline2");
+        assert_eq!(decode_clipboard_text_utf16(&encoded), "line1\r\nline2");
     }
 
     #[test]

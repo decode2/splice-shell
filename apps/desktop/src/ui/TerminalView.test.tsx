@@ -40,6 +40,7 @@ const mocks = vi.hoisted(() => ({
   terminalHasSelection: vi.fn<() => boolean>(),
   terminalGetSelection: vi.fn<() => string>(),
   terminalClearSelection: vi.fn<() => void>(),
+  terminalPaste: vi.fn<(data: string) => void>(),
   fitAddonFit: vi.fn<() => void>(),
   fitAddonDispose: vi.fn<() => void>(),
   webglAddonOnContextLoss: vi.fn<(handler: () => void) => void>(),
@@ -109,6 +110,10 @@ vi.mock("@xterm/xterm", () => {
 
     clearSelection() {
       mocks.terminalClearSelection();
+    }
+
+    paste(data: string) {
+      mocks.terminalPaste(data);
     }
 
     dispose() {
@@ -227,6 +232,7 @@ beforeEach(() => {
   mocks.terminalGetSelection.mockReset();
   mocks.terminalGetSelection.mockReturnValue("");
   mocks.terminalClearSelection.mockReset();
+  mocks.terminalPaste.mockReset();
 
   mocks.fitAddonFit.mockReset();
   mocks.fitAddonDispose.mockReset();
@@ -739,5 +745,113 @@ describe("TerminalView copy / interrupt key handling", () => {
     expect(
       getInvokeCallsFor("pty_write").some(([, args]) => (args as { data: string }).data === "\x03"),
     ).toBe(false);
+  });
+});
+
+describe("TerminalView paste key handling", () => {
+  // The keydown listener runs in the capture phase before xterm maps Ctrl+V to
+  // the C0 byte \x16, so tests dispatch a real KeyboardEvent on the host element.
+  async function renderAndGetHost(props: {
+    onClipboardImagePaste?: () => void | Promise<void>;
+  } = {}) {
+    const { container } = render(
+      <TerminalView
+        activePasteTargetState={readyPasteTarget}
+        pasteState={idlePasteState}
+        onClipboardImagePaste={props.onClipboardImagePaste}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
+    });
+
+    const host = container.querySelector(".terminal-host") as HTMLElement;
+    expect(host).toBeTruthy();
+    return host;
+  }
+
+  function dispatchKeyDown(
+    host: HTMLElement,
+    init: { key: string; ctrlKey?: boolean; shiftKey?: boolean },
+  ) {
+    act(() => {
+      host.dispatchEvent(
+        new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...init }),
+      );
+    });
+  }
+
+  function mockClipboardReadText(text: string) {
+    mocks.invoke.mockImplementation((command) => {
+      if (command === "pty_spawn") {
+        nextSpawnId += 1;
+        return Promise.resolve(nextSpawnId);
+      }
+      if (command === "clipboard_read_text") {
+        return Promise.resolve(text);
+      }
+      return Promise.resolve(undefined);
+    });
+  }
+
+  it("reads the clipboard and pastes text via terminal.paste on Ctrl+V (never the \\x16 byte)", async () => {
+    mockClipboardReadText("hello world");
+    const onClipboardImagePaste = vi.fn<() => Promise<void>>().mockResolvedValue();
+    const host = await renderAndGetHost({ onClipboardImagePaste });
+
+    dispatchKeyDown(host, { key: "v", ctrlKey: true });
+    await flushAsync();
+
+    expect(getInvokeCallsFor("clipboard_read_text")).toHaveLength(1);
+    // terminal.paste applies bracketed-paste wrapping + CRLF normalization; the
+    // raw \x16 control byte must never be sent to the PTY.
+    expect(mocks.terminalPaste).toHaveBeenCalledWith("hello world");
+    expect(
+      getInvokeCallsFor("pty_write").some(([, args]) => (args as { data: string }).data === "\x16"),
+    ).toBe(false);
+    // Prefer text over image when text is present.
+    expect(onClipboardImagePaste).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the image paste route when the clipboard has no text", async () => {
+    mockClipboardReadText("");
+    const onClipboardImagePaste = vi.fn<() => Promise<void>>().mockResolvedValue();
+    const host = await renderAndGetHost({ onClipboardImagePaste });
+
+    dispatchKeyDown(host, { key: "v", ctrlKey: true });
+    await flushAsync();
+
+    expect(getInvokeCallsFor("clipboard_read_text")).toHaveLength(1);
+    expect(mocks.terminalPaste).not.toHaveBeenCalled();
+    expect(onClipboardImagePaste).toHaveBeenCalledTimes(1);
+  });
+
+  it("is a clean no-op on Ctrl+V when there is neither text nor an image handler", async () => {
+    mockClipboardReadText("");
+    const host = await renderAndGetHost();
+
+    dispatchKeyDown(host, { key: "v", ctrlKey: true });
+    await flushAsync();
+
+    expect(getInvokeCallsFor("clipboard_read_text")).toHaveLength(1);
+    expect(mocks.terminalPaste).not.toHaveBeenCalled();
+    // No image handler was provided: the handler must not throw or write an error.
+    expect(
+      mocks.terminalWrite.mock.calls.some(
+        ([data]) => typeof data === "string" && data.includes("Paste failed"),
+      ),
+    ).toBe(false);
+  });
+
+  it("pastes clipboard text on Shift+Insert as well", async () => {
+    mockClipboardReadText("insert paste");
+    const host = await renderAndGetHost();
+
+    dispatchKeyDown(host, { key: "Insert", ctrlKey: false, shiftKey: true });
+    await flushAsync();
+
+    expect(getInvokeCallsFor("clipboard_read_text")).toHaveLength(1);
+    expect(mocks.terminalPaste).toHaveBeenCalledWith("insert paste");
   });
 });

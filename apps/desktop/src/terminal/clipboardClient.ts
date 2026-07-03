@@ -8,3 +8,11 @@ export function writeClipboardText(text: string) {
     text,
   });
 }
+
+// Read plain text from the system clipboard via the custom Tauri command, backed
+// by the Win32 GetClipboardData(CF_UNICODETEXT) path in splice-clipboard. Resolves
+// to an empty string when the clipboard holds no text (e.g. only an image), so
+// callers can fall back to the image paste route.
+export async function readClipboardText(): Promise<string> {
+  return await invoke<string>("clipboard_read_text");
+}

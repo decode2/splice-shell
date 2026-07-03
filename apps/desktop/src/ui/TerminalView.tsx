@@ -9,7 +9,7 @@ import type { PastePreviewState } from "../paste/pastePreview";
 import { createLocalFileLinkProvider } from "../terminal/fileLinks";
 import { shouldRefreshTargetAfterInput } from "../terminal/inputActivity";
 import { resolveTerminalKeyAction } from "../terminal/keyboardShortcuts";
-import { writeClipboardText } from "../terminal/clipboardClient";
+import { readClipboardText, writeClipboardText } from "../terminal/clipboardClient";
 import {
   killPty,
   isPtyExitPayload,
@@ -406,6 +406,44 @@ export function TerminalView({
           terminal.write(`\r\nCopy to clipboard failed: ${String(error)}\r\n`);
         });
         terminal.clearSelection();
+        return;
+      }
+
+      if (action === "paste") {
+        // xterm maps Ctrl+V to the C0 byte \x16 and cancels the keydown, so the
+        // DOM paste event never fires. Intercept here, read the OS clipboard
+        // natively, and prefer text: terminal.paste() applies bracketed-paste
+        // (DECSET 2004) wrapping + CRLF→CR normalization so a multi-line paste
+        // into codex stays one block instead of auto-executing, then flows
+        // through the existing onData → writePty + paste-target refresh path.
+        // When there is no text, fall back to the existing image paste route.
+        // Neither present → a clean no-op. Fire-and-forget with .catch so the
+        // keydown handler can never throw.
+        event.preventDefault();
+        event.stopPropagation();
+        void readClipboardText()
+          .then((text) => {
+            // The read is async: guard against the terminal being torn down
+            // (StrictMode remount, app shutdown) before it resolves, so we
+            // never inject input into a disposed xterm.
+            if (disposed) {
+              return undefined;
+            }
+
+            if (text) {
+              terminal.paste(text);
+              return undefined;
+            }
+
+            return handlersRef.current.onClipboardImagePaste?.();
+          })
+          .catch((error) => {
+            if (disposed) {
+              return;
+            }
+
+            terminal.write(`\r\nPaste failed: ${String(error)}\r\n`);
+          });
         return;
       }
 

@@ -362,6 +362,15 @@ fn clipboard_write_text(text: String) -> Result<(), String> {
     splice_clipboard::write_clipboard_text(&text).map_err(|error| error.to_string())
 }
 
+// `async` for the same reason as `clipboard_write_text`: the Win32 clipboard open
+// can contend and retry/backoff, which must not stall the main UI thread on a
+// plain Ctrl+V. Returns the CF_UNICODETEXT contents, or an empty string when the
+// clipboard holds no text (so the frontend can fall back to the image route).
+#[tauri::command(async)]
+fn clipboard_read_text() -> Result<String, String> {
+    splice_clipboard::read_clipboard_text().map_err(|error| error.to_string())
+}
+
 fn read_clipboard_image_paste_payload() -> Result<PastePayload, String> {
     let temp_dir = std::env::temp_dir().join("splice-shell").join("clipboard");
     splice_clipboard::read_clipboard_image_paste_payload(&temp_dir)
@@ -426,6 +435,7 @@ pub fn run() {
             pty_resize,
             pty_kill,
             clipboard_write_text,
+            clipboard_read_text,
             open_path
         ])
         .run(tauri::generate_context!())
