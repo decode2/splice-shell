@@ -82,6 +82,27 @@ h1 {
   height: 100%;
 }
 
+/*
+ * xterm 6 rewrote the viewport around a ScrollableElement: `.xterm-viewport`
+ * is now an empty, unthemed layer that keeps xterm.css's stock `#000`
+ * background and `overflow-y: scroll`. Left alone it paints a black band in
+ * the sub-cell remainder below the themed grid, and WebView2 renders a
+ * vestigial native scrollbar (arrow buttons) along its edge. The real
+ * scrolling and mouse-wheel live on `.xterm-scrollable-element`, so making
+ * this layer transparent and non-scrolling loses nothing and lets the navy
+ * frame show through edge-to-edge. Revisit if a future xterm drops this
+ * element.
+ *
+ * The selector must out-specify xterm.css's own `.xterm .xterm-viewport`
+ * (0,2,0). styles.css loads before the lazy-loaded xterm.css chunk, so an
+ * equal-specificity rule loses the cascade tie — the extra `.xterm` raises
+ * this to (0,3,0) so it wins regardless of load order.
+ */
+.terminal-host .xterm .xterm-viewport {
+  background-color: transparent;
+  overflow-y: hidden;
+}
+
 .terminal-statusbar {
   display: flex;
   align-items: center;

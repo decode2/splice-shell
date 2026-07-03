@@ -63,6 +63,7 @@ export function TerminalView({
 }: TerminalViewProps) {
   const terminalElementRef = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<Terminal | null>(null);
+  const fitAddonRef = useRef<FitAddon | null>(null);
   const [hasInputActivity, setHasInputActivity] = useState(false);
   const [hasPtyOutput, setHasPtyOutput] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -98,6 +99,12 @@ export function TerminalView({
       cursor: "#38bdf8",
       selectionBackground: "#1e3a8a",
     };
+
+    // Changing the font size changes the cell dimensions, so the grid must be
+    // refit or the row/col count goes stale — leaving a growing unpainted band
+    // and a ConPTY size mismatch. fit() flows through terminal.onResize ->
+    // the bridge's onResize -> resizePty, keeping the backend in sync.
+    fitAddonRef.current?.fit();
   }, [terminalSettings]);
 
   useEffect(() => {
@@ -129,6 +136,7 @@ export function TerminalView({
     });
     terminalRef.current = terminal;
     const fitAddon = new FitAddon();
+    fitAddonRef.current = fitAddon;
     terminal.loadAddon(fitAddon);
     const fileLinkProvider = terminal.registerLinkProvider(createLocalFileLinkProvider(terminal));
     let disposed = false;
