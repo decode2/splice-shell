@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
@@ -26,23 +26,26 @@ import {
 } from "../terminal/terminalOutputFilter";
 import { createTerminalOutputScheduler } from "../terminal/terminalOutputScheduler";
 import { shouldRecoverClosedPtyInput } from "../terminal/ptyRecovery";
+import { DEFAULT_TERMINAL_SETTINGS, type TerminalSettings } from "./terminalSettings";
 import type { SessionHealth } from "./TitleBar";
 
-type TerminalSettings = {
-  background: string;
-  foreground: string;
-  fontSize: number;
-};
-
-const DEFAULT_TERMINAL_SETTINGS: TerminalSettings = {
-  background: "#020617",
-  foreground: "#dbeafe",
-  fontSize: 14,
-};
-
 type TerminalViewProps = {
-  settingsOpen?: boolean;
-  onCloseSettings?: () => void;
+  // Whether this instance is the visible/foreground tab. When it flips true the
+  // instance re-fits (it may have been hidden and resized) and takes focus.
+  // Defaults to false so existing single-instance callers keep exactly one
+  // mount-time focus (from the bridge) and no extra activation fit.
+  active?: boolean;
+  // Whether the instance's frame is shown. Inactive tabs stay MOUNTED (so their
+  // session keeps draining) but hidden via CSS; App owns the stacking layout in
+  // a later slice. Defaults to true so current callers render unchanged.
+  visible?: boolean;
+  // Global terminal settings, owned by App so every tab shares ONE source of
+  // truth (spec: settings MUST NOT diverge per tab). App always supplies this;
+  // it defaults to the module constant `DEFAULT_TERMINAL_SETTINGS` so there is
+  // no per-instance mutable settings state to drift — the local settings
+  // `useState` and the embedded panel were removed when the panel was lifted to
+  // App (App renders a single `TerminalSettingsPanel`).
+  settings?: TerminalSettings;
   onClipboardImagePaste?: () => void | Promise<void>;
   onInput?: (data: string) => void | Promise<void>;
   onInputActivity?: () => void;
@@ -53,8 +56,9 @@ type TerminalViewProps = {
 };
 
 export function TerminalView({
-  settingsOpen = false,
-  onCloseSettings,
+  active = false,
+  visible = true,
+  settings = DEFAULT_TERMINAL_SETTINGS,
   onClipboardImagePaste,
   onInput,
   onInputActivity,
@@ -66,7 +70,9 @@ export function TerminalView({
   const terminalElementRef = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
-  const [terminalSettings, setTerminalSettings] = useState(DEFAULT_TERMINAL_SETTINGS);
+  // Settings are global: they arrive as a prop from App (defaulting to the
+  // shared module constant). No local state means no per-tab divergence.
+  const effectiveSettings = settings;
   const handlersRef = useRef({
     onClipboardImagePaste,
     onInput,
@@ -93,10 +99,10 @@ export function TerminalView({
       return;
     }
 
-    terminal.options.fontSize = terminalSettings.fontSize;
+    terminal.options.fontSize = effectiveSettings.fontSize;
     terminal.options.theme = {
-      background: terminalSettings.background,
-      foreground: terminalSettings.foreground,
+      background: effectiveSettings.background,
+      foreground: effectiveSettings.foreground,
       cursor: "#38bdf8",
       selectionBackground: "#1e3a8a",
     };
@@ -104,9 +110,23 @@ export function TerminalView({
     // Changing the font size changes the cell dimensions, so the grid must be
     // refit or the row/col count goes stale — leaving a growing unpainted band
     // and a ConPTY size mismatch. fit() flows through terminal.onResize ->
-    // the bridge's onResize -> resizePty, keeping the backend in sync.
+    // the bridge's onResize -> resizePty, keeping the backend in sync. With
+    // global settings this now fires in EVERY mounted instance, so one
+    // font-size change refits all tabs (hidden ones included).
     fitAddonRef.current?.fit();
-  }, [terminalSettings]);
+  }, [effectiveSettings]);
+
+  // Activation insurance. When this instance becomes the foreground tab, refit
+  // (it may have been hidden while the window resized) and route focus to it.
+  // fit() is a cheap no-op when cols/rows are unchanged; focus is required for
+  // input routing regardless.
+  useEffect(() => {
+    if (!active) {
+      return;
+    }
+    fitAddonRef.current?.fit();
+    terminalRef.current?.focus();
+  }, [active]);
 
   useEffect(() => {
     const terminalElement = terminalElementRef.current;
@@ -119,10 +139,10 @@ export function TerminalView({
       cursorBlink: true,
       fontFamily:
         '"CaskaydiaCove Nerd Font", "CaskaydiaCove NF", "JetBrainsMono Nerd Font", "FiraCode Nerd Font", "Cascadia Code", "Fira Code", Consolas, monospace',
-      fontSize: terminalSettings.fontSize,
+      fontSize: effectiveSettings.fontSize,
       theme: {
-        background: terminalSettings.background,
-        foreground: terminalSettings.foreground,
+        background: effectiveSettings.background,
+        foreground: effectiveSettings.foreground,
         cursor: "#38bdf8",
         selectionBackground: "#1e3a8a",
       },
@@ -145,6 +165,14 @@ export function TerminalView({
     let restartInFlight = false;
     let ptyGeneration = 0;
     let currentSessionId: number | undefined;
+    // Tauri's `pty-output`/`pty-exit` events are GLOBAL: with N mounted
+    // TerminalViews, every instance's listeners receive EVERY session's events.
+    // `spawnInFlight` scopes this instance's willingness to retain
+    // non-matching events to its own spawn round-trip ONLY. While false, any
+    // event whose id !== currentSessionId is dropped outright, so a sibling
+    // tab's stream can never accumulate here. Set true synchronously right
+    // before `spawnPty` is awaited and cleared on EVERY settle path.
+    let spawnInFlight = false;
     // Ordered FIFO queue of session-attributed output chunks that arrived
     // BEFORE their session id was recorded. The reader thread can emit
     // `pty-output` before `spawnPty` resolves over IPC (an instant-exit shell's
@@ -168,9 +196,16 @@ export function TerminalView({
     // A `pty-exit` can arrive for a session id we have not recorded yet: an
     // instant-exit child emits `pty-exit(N)` BEFORE `spawnPty` resolves and
     // sets `currentSessionId = N`. The (FnOnce) event would be dropped forever,
-    // leaving a dead terminal. Stash such a newer-than-recorded id here so
-    // `startPty` can act on it the moment it records that id.
-    let lastUnmatchedExitId: number | undefined;
+    // leaving a dead terminal. Stash such ids here so `startPty` can act on the
+    // one matching its own resolved id the moment it records it.
+    //
+    // A SET, not a single slot: under N>1, a foreign tab's insta-exit can land
+    // between this instance's own stash and its `spawnPty` resolving. A single
+    // slot would be clobbered by that foreign id, so this instance's own
+    // insta-exit would be missed and its dead terminal reported healthy. The
+    // set is clobber-proof and stays bounded — it only fills while
+    // `spawnInFlight` is true and is cleared on every settle.
+    const unmatchedExitIds = new Set<number>();
     // Set when a `pty-exit` for the live session lands while a restart is
     // already in flight, so the restart is coalesced (see `restartPty`).
     let pendingExit = false;
@@ -272,43 +307,80 @@ export function TerminalView({
       }
       earlyOutputQueue.length = 0;
     };
+    // Empty this instance's spawn-window scratch state. Invariant: whenever
+    // `spawnInFlight` is false, the early-output queue and the unmatched-exit
+    // set are both empty. Called on EVERY settle path (resolve-live,
+    // resolve-disposed, reject) so no cross-session event is ever retained
+    // outside an active spawn window.
+    const closeSpawnWindow = () => {
+      spawnInFlight = false;
+      earlyOutputQueue.length = 0;
+      unmatchedExitIds.clear();
+    };
     const startPty = async () => {
-      const spawnedSessionId = await spawnPty({ cols: terminal.cols, rows: terminal.rows });
+      // Open the spawn window synchronously BEFORE the await, so any
+      // early-output / instant-exit for this pending session is retained (and
+      // any foreign event during the window is bounded by its duration).
+      spawnInFlight = true;
+      let spawnedSessionId: number;
+      try {
+        spawnedSessionId = await spawnPty({ cols: terminal.cols, rows: terminal.rows });
+      } catch (error) {
+        // Reject settle: close the window (flag false, queue + set emptied) so a
+        // doomed spawn leaks nothing into the next session, then rethrow for the
+        // caller's catch (restartPty / the mount-effect starter) to surface.
+        closeSpawnWindow();
+        throw error;
+      }
       // The view was torn down while this spawn was in flight. Removing
       // `pty_spawn`'s predecessor reaping means nothing else will reap this
       // now-orphaned session, so kill it explicitly by id and record no state.
       if (disposed) {
         void killPty(spawnedSessionId);
+        closeSpawnWindow();
         return;
       }
       currentSessionId = spawnedSessionId;
       spawnTime = Date.now();
       ptyGeneration += 1;
       inputClosed = false;
-      handlersRef.current.onPtyReady?.(spawnedSessionId);
+      // A throw from the ready callback or the flush write-pipeline would skip
+      // the settle-path closeSpawnWindow() below, stranding spawnInFlight=true
+      // so every sibling tab's output/exit would accumulate unbounded — the
+      // exact leak this window guards against. Close the window and rethrow so
+      // the caller's catch surfaces it, mirroring the reject-settle path above.
+      try {
+        handlersRef.current.onPtyReady?.(spawnedSessionId);
 
-      // Drain any output that raced ahead of this spawn resolving. This runs
-      // BEFORE the stashed-exit early-return below so an instant-exit shell's
-      // banner (queued here) still prints, matching today's single-session
-      // behavior where the first bytes always render.
-      flushEarlyOutputQueue(spawnedSessionId);
+        // Drain any output that raced ahead of this spawn resolving. This writes
+        // only chunks for `spawnedSessionId`, drops the rest, and clears the
+        // queue. It runs BEFORE the stashed-exit check below so an instant-exit
+        // shell's banner (queued here) still prints.
+        flushEarlyOutputQueue(spawnedSessionId);
+      } catch (error) {
+        closeSpawnWindow();
+        throw error;
+      }
 
       // A `pty-exit` for this exact session may have raced ahead of `spawnPty`
       // resolving (instant-exit child) and been stashed by `handlePtyExit`.
-      // Now that the id is recorded, treat it as an immediate exit and restart.
-      // This shares the restart path, so the storm cap still bounds an
-      // instant-exit shell instead of letting it loop forever.
-      if (lastUnmatchedExitId === spawnedSessionId) {
-        lastUnmatchedExitId = undefined;
+      // `has(spawnedSessionId)` — not equality against a single slot — is what
+      // makes this immune to a foreign tab's exit clobbering the stash. Now that
+      // the id is recorded, treat it as an immediate exit and restart. This
+      // shares the restart path, so the storm cap still bounds an instant-exit
+      // shell instead of letting it loop forever.
+      if (unmatchedExitIds.has(spawnedSessionId)) {
+        closeSpawnWindow();
         inputClosed = true;
         void restartPty();
         return;
       }
 
       // The session spawned and was not pre-empted by a stashed instant-exit:
-      // treat the settle as proof it booted so the title bar dot returns to
-      // quiet. Genuinely unhealthy sessions die and re-enter reconnecting via
-      // `restartPty` before this matters.
+      // close the window and treat the settle as proof it booted so the title
+      // bar dot returns to quiet. Genuinely unhealthy sessions die and re-enter
+      // reconnecting via `restartPty` before this matters.
+      closeSpawnWindow();
       reportSessionHealth("healthy");
     };
     const restartPty = async () => {
@@ -443,7 +515,14 @@ export function TerminalView({
         return;
       }
 
-      lastUnmatchedExitId = payload;
+      // Above current, or none recorded yet. Only stash it while THIS instance
+      // is spawning — an unrecorded id could be this instance's own instant-exit
+      // racing its spawn. While not spawning, such an exit belongs to a foreign
+      // tab and is DROPPED (never stashed), so a sibling's exit can never mark
+      // this instance dead nor clobber its stash.
+      if (spawnInFlight) {
+        unmatchedExitIds.add(payload);
+      }
     };
 
     const handlePaste = (event: ClipboardEvent) => {
@@ -542,17 +621,21 @@ export function TerminalView({
         }
 
         const { sessionId, data } = event.payload;
-        // Demultiplex by the live session id, mirroring `pty-exit` filtering:
-        //   - equal to current            → this view's output; write it.
-        //   - above current, or none yet  → raced ahead of `spawnPty`
-        //     resolving; queue it FIFO for `startPty` to flush on record.
-        //   - below current               → stale, already-superseded; drop.
+        // Demultiplex by the live session id:
+        //   - equal to current   → this view's output; write it.
+        //   - otherwise, and this instance is SPAWNING → it may be this
+        //     instance's own session racing ahead of `spawnPty` resolving;
+        //     queue it FIFO for `startPty` to flush (matching) or drop
+        //     (non-matching) on record. Bounded by the spawn window.
+        //   - otherwise, and NOT spawning → a foreign tab's stream (or a stale
+        //     superseded session); DROP it. Never enqueue, so a sibling's output
+        //     can never accumulate here unbounded.
         if (sessionId === currentSessionId) {
           writePtyOutput(data);
           return;
         }
 
-        if (currentSessionId === undefined || sessionId > currentSessionId) {
+        if (spawnInFlight) {
           earlyOutputQueue.push({ sessionId, data });
         }
       }),
@@ -604,15 +687,18 @@ export function TerminalView({
   }, []);
 
   return (
-    <section className="terminal-frame" aria-label="Terminal">
+    <section
+      className={visible ? "terminal-frame" : "terminal-frame terminal-frame--hidden"}
+      aria-label="Terminal"
+      aria-hidden={!visible || undefined}
+      data-active={active || undefined}
+      // Inactive tabs stay MOUNTED so their session keeps draining; they are
+      // hidden with `visibility` (never `display:none`, which would collapse the
+      // fit to 0×0). App owns the stacked-frame layout in a later slice; this
+      // inline fallback keeps the prop meaningful until then.
+      style={visible ? undefined : { visibility: "hidden" }}
+    >
       <div className="terminal-host" ref={terminalElementRef} />
-      {settingsOpen ? (
-        <TerminalSettingsPanel
-          settings={terminalSettings}
-          onChange={setTerminalSettings}
-          onClose={() => onCloseSettings?.()}
-        />
-      ) : null}
     </section>
   );
 }
@@ -624,57 +710,5 @@ function isClosedPtyInputError(error: unknown) {
     message.includes("PTY session is not running") ||
     message.includes("pipe is being closed") ||
     message.includes("pipe has been ended")
-  );
-}
-
-function TerminalSettingsPanel({
-  onChange,
-  onClose,
-  settings,
-}: {
-  onChange: (settings: TerminalSettings) => void;
-  onClose: () => void;
-  settings: TerminalSettings;
-}) {
-  return (
-    <aside className="terminal-settings-panel" aria-label="Terminal settings">
-      <div className="settings-panel-header">
-        <strong>Terminal settings</strong>
-        <button type="button" onClick={onClose}>
-          Close
-        </button>
-      </div>
-      <label>
-        Text
-        <input
-          type="color"
-          value={settings.foreground}
-          onChange={(event) => onChange({ ...settings, foreground: event.currentTarget.value })}
-        />
-      </label>
-      <label>
-        Background
-        <input
-          type="color"
-          value={settings.background}
-          onChange={(event) => onChange({ ...settings, background: event.currentTarget.value })}
-        />
-      </label>
-      <label>
-        Font size
-        <input
-          max="22"
-          min="10"
-          type="number"
-          value={settings.fontSize}
-          onChange={(event) =>
-            onChange({
-              ...settings,
-              fontSize: Number(event.currentTarget.value),
-            })
-          }
-        />
-      </label>
-    </aside>
   );
 }

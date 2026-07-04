@@ -1,15 +1,19 @@
-import type { ActivePasteTargetState } from "../paste/activePasteTarget";
 import type { PastePreviewState } from "../paste/pastePreview";
 import { getWindowChrome, type WindowChrome } from "../window/windowChrome";
+import { TabStrip } from "./TabStrip";
+import type { TabState } from "./useSessions";
 
-// Session health drives the title bar's single bold element: the health dot.
-// It is deliberately three-state — the dot speaks ONLY when not "healthy".
+// Session health drives each tab's health dot. It is deliberately three-state —
+// the dot speaks ONLY when not "healthy". Kept here as the shared health type.
 export type SessionHealth = "healthy" | "reconnecting" | "failed";
 
 type TitleBarProps = {
-  activePasteTargetState: ActivePasteTargetState;
+  tabs: TabState[];
+  activeId: string;
+  onSelectTab: (tabId: string) => void;
+  onCloseTab: (tabId: string) => void;
+  onCreateTab: () => void;
   pasteState: PastePreviewState;
-  sessionHealth: SessionHealth;
   settingsOpen: boolean;
   onToggleSettings: () => void;
   isMaximized: boolean;
@@ -20,16 +24,23 @@ type TitleBarProps = {
 // The custom (undecorated) window title bar. Because native decorations are
 // off, this bar owns dragging AND the window controls.
 //
+// Layout: Brand | TabStrip (elastic, per-tab adapter + health + close) +
+// transient PastePreview | Gear | WindowControls. The adapter chip and health
+// dot moved OUT of the title bar and INTO each tab (see TabStrip), so there is
+// no single global chip/health anymore.
+//
 // Dragging: Tauri's drag handler checks `data-tauri-drag-region` on the EXACT
 // event target, not its ancestors, and it does NOT honor Electron's CSS
-// `-webkit-app-region`. So the attribute goes on the header AND every inert
-// child the user might grab (brand, chip, health dot/label, status wrapper).
-// Buttons and the settings icon omit it so clicks act instead of starting a
-// drag.
+// `-webkit-app-region`. So the attribute goes on the header, the brand, the
+// elastic center wrapper, and the empty strip area; tabs, buttons, and the
+// settings icon omit it so clicks act instead of starting a drag.
 export function TitleBar({
-  activePasteTargetState,
+  tabs,
+  activeId,
+  onSelectTab,
+  onCloseTab,
+  onCreateTab,
   pasteState,
-  sessionHealth,
   settingsOpen,
   onToggleSettings,
   isMaximized,
@@ -45,9 +56,14 @@ export function TitleBar({
           splice
         </span>
       </span>
-      <div className="titlebar-status" data-tauri-drag-region>
-        <AdapterChip activePasteTargetState={activePasteTargetState} />
-        <HealthDot sessionHealth={sessionHealth} />
+      <div className="titlebar-center" data-tauri-drag-region>
+        <TabStrip
+          tabs={tabs}
+          activeId={activeId}
+          onSelect={onSelectTab}
+          onClose={onCloseTab}
+          onCreate={onCreateTab}
+        />
         {pasteState.kind !== "idle" ? <PastePreviewPanel pasteState={pasteState} /> : null}
       </div>
       <button
@@ -61,66 +77,6 @@ export function TitleBar({
       </button>
       <WindowControls chrome={chrome} isMaximized={isMaximized} />
     </header>
-  );
-}
-
-// Strips a Windows executable suffix so the chip reads as a shell/tool name
-// ("pwsh", "cmd", "codex") rather than a raw process path.
-function stripExecutableSuffix(name: string) {
-  return name.replace(/\.exe$/i, "");
-}
-
-// The adapter chip answers "what am I talking to?" using a user-recognizable
-// name. It renders only once the target resolves; loading/error states stay
-// silent rather than surfacing diagnostic text.
-function AdapterChip({
-  activePasteTargetState,
-}: {
-  activePasteTargetState: ActivePasteTargetState;
-}) {
-  if (activePasteTargetState.kind === "ready") {
-    return (
-      <span className="titlebar-chip" data-tauri-drag-region>
-        {activePasteTargetState.adapterName}
-      </span>
-    );
-  }
-
-  if (activePasteTargetState.kind === "unsupported") {
-    return (
-      <span className="titlebar-chip titlebar-chip--unsupported" data-tauri-drag-region>
-        {stripExecutableSuffix(activePasteTargetState.processName)}
-      </span>
-    );
-  }
-
-  return null;
-}
-
-// The signature element. Quiet (a low-opacity emerald dot, no label) while
-// healthy; it earns attention only when the session is degraded.
-function HealthDot({ sessionHealth }: { sessionHealth: SessionHealth }) {
-  const label =
-    sessionHealth === "reconnecting"
-      ? "reconnecting…"
-      : sessionHealth === "failed"
-        ? "session failed"
-        : null;
-
-  return (
-    <span className="titlebar-health" data-tauri-drag-region>
-      <span
-        className={`titlebar-health-dot titlebar-health-dot--${sessionHealth}`}
-        data-health={sessionHealth}
-        data-tauri-drag-region
-        aria-hidden="true"
-      />
-      {label ? (
-        <span className="titlebar-health-label" data-tauri-drag-region>
-          {label}
-        </span>
-      ) : null}
-    </span>
   );
 }
 

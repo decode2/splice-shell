@@ -49,6 +49,35 @@ body {
   box-shadow: none;
 }
 
+/*
+ * Tab stack. Row 2 of `.app-shell` hosts EVERY tab's terminal at once. All
+ * frames are absolutely stacked in this one positioned cell so they share the
+ * exact same box; only the active one is visible (`z-index: 1`), the rest are
+ * kept mounted but `visibility: hidden` (NEVER `display: none`, which would
+ * collapse fit() to 0 cols/rows). Because layout is preserved, hidden tabs keep
+ * real dimensions and their ResizeObserver still fires on window resize, so a
+ * background TUI stays correctly sized and is already right the instant it is
+ * shown. The single settings overlay also anchors to this positioned host.
+ */
+.terminal-stack {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+}
+
+.terminal-stack .terminal-frame {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+}
+
+.terminal-stack .terminal-frame--hidden {
+  visibility: hidden;
+  pointer-events: none;
+  z-index: 0;
+}
+
 .terminal-loading {
   padding: 1.5rem;
   color: #94a3b8;
@@ -149,6 +178,196 @@ body {
   font-size: 0.72rem;
   line-height: 1;
   filter: drop-shadow(0 0 4px rgba(56, 189, 248, 0.45));
+}
+
+/*
+ * Elastic center column: the tab strip plus the transient paste preview. Full
+ * bar height so tabs can carry their active underline edge-to-edge; the empty
+ * area drags the window (data-tauri-drag-region on the wrapper AND the strip).
+ */
+.titlebar-center {
+  display: flex;
+  align-items: stretch;
+  gap: 0.5rem;
+  min-width: 0;
+  height: 100%;
+}
+
+/* Tab strip: one tab per session, scrollable, scrollbar hidden. */
+.tabstrip {
+  display: flex;
+  align-items: stretch;
+  flex: 1 1 auto;
+  gap: 2px;
+  height: 100%;
+  min-width: 0;
+  padding-left: 0.5rem;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.tabstrip::-webkit-scrollbar {
+  display: none;
+}
+
+.tabstrip-tab {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  /* Hug content: a terminal's titles are short adapter names ("pwsh",
+   * "codex"), so tabs size to their label and cap at max-width, truncating
+   * long ones — no acres of empty space, no forced uniform width. The strip
+   * scrolls when they overflow. */
+  flex: 0 0 auto;
+  max-width: 13rem;
+  min-width: 0;
+  height: 100%;
+  padding: 0 0.4rem 0 0.7rem;
+  border: 0;
+  background: transparent;
+  color: var(--tb-text-dim);
+  overflow: hidden;
+  cursor: default;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* Hairline between adjacent tabs so inactive tabs read as distinct rather than
+ * an ambiguous run of labels. Suppressed on the pair straddling the active or a
+ * hovered tab, so the highlighted tab's edges stay clean (Chrome/Warp trick). */
+.tabstrip-tab + .tabstrip-tab::before {
+  content: "";
+  position: absolute;
+  left: -1px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 1px;
+  height: 1.05rem;
+  background: var(--tb-border, rgba(148, 163, 184, 0.16));
+}
+
+.tabstrip-tab:hover::before,
+.tabstrip-tab:hover + .tabstrip-tab::before,
+.tabstrip-tab--active::before,
+.tabstrip-tab--active + .tabstrip-tab::before {
+  opacity: 0;
+}
+
+.tabstrip-tab:hover {
+  background: var(--tb-hover);
+}
+
+/* Active tab: a faint cyan wash + a cyan underline as THE active signal. */
+.tabstrip-tab--active {
+  background: rgba(56, 189, 248, 0.07);
+  box-shadow: inset 0 -1.5px 0 var(--tb-accent);
+  color: var(--tb-text);
+}
+
+/* Per-tab health dot: the three shipped states, scaled to 6px. */
+.tabstrip-dot {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+}
+
+.tabstrip-dot--healthy {
+  background: transparent;
+  border: 1.5px solid rgba(52, 211, 153, 0.75);
+}
+
+.tabstrip-dot--reconnecting {
+  background: var(--tb-amber);
+  animation: titlebar-health-pulse 1.4s ease-in-out infinite;
+}
+
+.tabstrip-dot--failed {
+  background: var(--tb-red);
+  box-shadow: 0 0 6px rgba(244, 63, 94, 0.55);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tabstrip-dot--reconnecting {
+    animation: none;
+  }
+}
+
+.tabstrip-title {
+  /* Shrink-and-truncate but do NOT grow: growing would reopen the gap between
+   * the title and the close affordance that made short-titled tabs look empty. */
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.68rem;
+  letter-spacing: 0.01em;
+}
+
+.tabstrip-title--unsupported {
+  color: var(--tb-amber);
+}
+
+/* Close affordance: hidden until the tab is hovered/active/focused. */
+.tabstrip-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  border: 0;
+  border-radius: 3px;
+  padding: 0;
+  background: transparent;
+  color: var(--tb-text-dim);
+  opacity: 0;
+  cursor: default;
+}
+
+.tabstrip-tab:hover .tabstrip-close,
+.tabstrip-tab--active .tabstrip-close,
+.tabstrip-close:focus-visible {
+  opacity: 1;
+}
+
+.tabstrip-close:hover {
+  background: var(--tb-hover);
+  color: var(--tb-text);
+}
+
+/* New-tab button: fixed at the right of the strip. */
+.tabstrip-new {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  align-self: center;
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  border: 0;
+  border-radius: 4px;
+  padding: 0;
+  background: transparent;
+  color: var(--tb-text-dim);
+  cursor: default;
+}
+
+.tabstrip-new:hover {
+  background: var(--tb-hover);
+  color: var(--tb-text);
+}
+
+.tabstrip-glyph {
+  width: 10px;
+  height: 10px;
+}
+
+.tabstrip-new .tabstrip-glyph {
+  width: 12px;
+  height: 12px;
 }
 
 .titlebar-status {
@@ -374,6 +593,23 @@ body {
  * reconnecting/failed signal never disappears behind the inactive chrome.
  */
 .app-shell:not([data-focused]) .titlebar-health-dot {
+  opacity: 0.82;
+}
+
+/*
+ * Tab strip inherits the same focus-dimming language: titles fade, the active
+ * underline softens, and per-tab dots keep the slight-dim treatment so a
+ * degraded session stays legible while the window is blurred.
+ */
+.app-shell:not([data-focused]) .tabstrip-title {
+  opacity: 0.55;
+}
+
+.app-shell:not([data-focused]) .tabstrip-tab--active {
+  box-shadow: inset 0 -1.5px 0 rgba(56, 189, 248, 0.45);
+}
+
+.app-shell:not([data-focused]) .tabstrip-dot {
   opacity: 0.82;
 }
 

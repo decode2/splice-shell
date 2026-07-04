@@ -1,20 +1,25 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ActivePasteTargetState } from "../paste/activePasteTarget";
 import type { PastePreviewState } from "../paste/pastePreview";
 import { useWindowFocused, type WindowChrome } from "../window/windowChrome";
 import { TitleBar } from "./TitleBar";
+import { DEFAULT_TAB_ADAPTER_STATE, type TabState } from "./useSessions";
 
-const activePasteTarget: ActivePasteTargetState = {
-  kind: "ready",
-  processName: "codex.exe",
-  adapterName: "codex",
-};
 const idlePasteState: PastePreviewState = {
   kind: "idle",
   message: "Paste preview idle",
 };
+
+function tab(overrides: Partial<TabState> = {}): TabState {
+  return {
+    tabId: "tab-0",
+    title: "shell",
+    adapterState: DEFAULT_TAB_ADAPTER_STATE,
+    health: "healthy",
+    ...overrides,
+  };
+}
 
 function mockChrome(): WindowChrome {
   return {
@@ -27,16 +32,17 @@ function mockChrome(): WindowChrome {
   };
 }
 
-function renderTitleBar(
-  overrides: Partial<Parameters<typeof TitleBar>[0]> = {},
-) {
+function renderTitleBar(overrides: Partial<Parameters<typeof TitleBar>[0]> = {}) {
   const chrome = overrides.chrome ?? mockChrome();
   const onToggleSettings = overrides.onToggleSettings ?? vi.fn();
   const result = render(
     <TitleBar
-      activePasteTargetState={activePasteTarget}
+      tabs={[tab()]}
+      activeId="tab-0"
+      onSelectTab={vi.fn()}
+      onCloseTab={vi.fn()}
+      onCreateTab={vi.fn()}
       pasteState={idlePasteState}
-      sessionHealth="healthy"
       settingsOpen={false}
       onToggleSettings={onToggleSettings}
       isMaximized={false}
@@ -104,68 +110,43 @@ describe("TitleBar settings toggle", () => {
   });
 });
 
-describe("TitleBar adapter chip", () => {
-  it("renders the adapter name (what you are talking to), without the process .exe", () => {
-    const { container, getByText } = renderTitleBar({
-      activePasteTargetState: {
-        kind: "ready",
-        processName: "codex.exe",
-        adapterName: "codex",
-      },
+describe("TitleBar tab strip", () => {
+  it("hosts the per-tab strip (tablist) instead of a single global adapter chip + health dot", () => {
+    const { getByRole, container } = renderTitleBar({
+      tabs: [
+        tab({
+          tabId: "tab-0",
+          adapterState: { kind: "ready", processName: "codex.exe", adapterName: "codex" },
+        }),
+      ],
+      activeId: "tab-0",
     });
 
-    const chip = container.querySelector(".titlebar-chip");
-    expect(chip).toBeTruthy();
-    expect(getByText("codex")).toBeTruthy();
-    // The redundant process/.exe is dropped from the chip.
-    expect(container.textContent).not.toContain(".exe");
-    expect(chip?.classList.contains("titlebar-chip--unsupported")).toBe(false);
-  });
-
-  it("goes amber for an unsupported target", () => {
-    const { container } = renderTitleBar({
-      activePasteTargetState: { kind: "unsupported", processName: "notepad.exe" },
-    });
-
-    const chip = container.querySelector(".titlebar-chip");
-    expect(chip).toBeTruthy();
-    expect(chip?.classList.contains("titlebar-chip--unsupported")).toBe(true);
-    expect(container.textContent).not.toContain(".exe");
-  });
-
-  it("renders no chip while the target is still loading", () => {
-    const { container } = renderTitleBar({
-      activePasteTargetState: { kind: "loading", message: "Detecting…" },
-    });
-
+    // The strip is present…
+    expect(getByRole("tablist", { name: "Terminal tabs" })).toBeTruthy();
+    // …and the OLD global title-bar chip / health dot are gone (they moved into
+    // each tab).
     expect(container.querySelector(".titlebar-chip")).toBeNull();
-  });
-});
-
-describe("TitleBar health dot", () => {
-  it("stays quiet (no label) when healthy", () => {
-    const { container } = renderTitleBar({ sessionHealth: "healthy" });
-
-    const dot = container.querySelector(".titlebar-health-dot");
-    expect(dot).toBeTruthy();
-    expect(dot?.getAttribute("data-health")).toBe("healthy");
-    expect(container.querySelector(".titlebar-health-label")).toBeNull();
+    expect(container.querySelector(".titlebar-health-dot")).toBeNull();
   });
 
-  it("shows an amber reconnecting label while reconnecting", () => {
-    const { container, getByText } = renderTitleBar({ sessionHealth: "reconnecting" });
+  it("forwards strip interactions to its tab callbacks", () => {
+    const onSelectTab = vi.fn();
+    const onCloseTab = vi.fn();
+    const onCreateTab = vi.fn();
+    const { getByRole } = renderTitleBar({
+      tabs: [tab({ tabId: "tab-0" })],
+      activeId: "tab-0",
+      onSelectTab,
+      onCloseTab,
+      onCreateTab,
+    });
 
-    const dot = container.querySelector(".titlebar-health-dot");
-    expect(dot?.getAttribute("data-health")).toBe("reconnecting");
-    expect(getByText(/reconnecting/i)).toBeTruthy();
-  });
+    fireEvent.click(getByRole("button", { name: "New tab" }));
+    expect(onCreateTab).toHaveBeenCalledTimes(1);
 
-  it("shows a session failed label when failed", () => {
-    const { container, getByText } = renderTitleBar({ sessionHealth: "failed" });
-
-    const dot = container.querySelector(".titlebar-health-dot");
-    expect(dot?.getAttribute("data-health")).toBe("failed");
-    expect(getByText(/session failed/i)).toBeTruthy();
+    fireEvent.click(getByRole("button", { name: "Close tab" }));
+    expect(onCloseTab).toHaveBeenCalledWith("tab-0");
   });
 });
 
@@ -189,7 +170,7 @@ describe("TitleBar paste feedback", () => {
 });
 
 describe("TitleBar drag regions", () => {
-  it("marks the header and its inert children as drag regions but never the buttons", () => {
+  it("marks the header, brand, and empty strip area as drag regions but never the buttons", () => {
     const { container, getByRole } = renderTitleBar();
 
     const header = container.querySelector(".titlebar");
@@ -197,24 +178,17 @@ describe("TitleBar drag regions", () => {
     expect(
       container.querySelector(".titlebar-brand")?.hasAttribute("data-tauri-drag-region"),
     ).toBe(true);
+    // The elastic center wrapper and the strip's empty area drag the window.
     expect(
-      container.querySelector(".titlebar-status")?.hasAttribute("data-tauri-drag-region"),
-    ).toBe(true);
-    // Tauri matches the exact event target, not ancestors, so every inert leaf
-    // the user might grab carries the attribute: the chip, the dot, the health
-    // wrapper.
-    expect(
-      container.querySelector(".titlebar-chip")?.hasAttribute("data-tauri-drag-region"),
+      container.querySelector(".titlebar-center")?.hasAttribute("data-tauri-drag-region"),
     ).toBe(true);
     expect(
-      container.querySelector(".titlebar-health")?.hasAttribute("data-tauri-drag-region"),
-    ).toBe(true);
-    expect(
-      container.querySelector(".titlebar-health-dot")?.hasAttribute("data-tauri-drag-region"),
+      container.querySelector(".tabstrip")?.hasAttribute("data-tauri-drag-region"),
     ).toBe(true);
 
-    // Buttons (window controls AND the settings icon) opt out of dragging.
-    for (const name of ["Settings", "Minimize", "Maximize", "Close"]) {
+    // Buttons (window controls, the settings icon, and the tab strip's own
+    // controls) opt out of dragging so a click acts instead of dragging.
+    for (const name of ["Settings", "Minimize", "Maximize", "Close", "New tab", "Close tab"]) {
       expect(getByRole("button", { name }).hasAttribute("data-tauri-drag-region")).toBe(false);
     }
   });
@@ -229,9 +203,12 @@ function FocusShellHarness({ chrome }: { chrome: WindowChrome }) {
   return (
     <main className="app-shell" data-focused={focused || undefined}>
       <TitleBar
-        activePasteTargetState={activePasteTarget}
+        tabs={[tab()]}
+        activeId="tab-0"
+        onSelectTab={vi.fn()}
+        onCloseTab={vi.fn()}
+        onCreateTab={vi.fn()}
         pasteState={idlePasteState}
-        sessionHealth="healthy"
         settingsOpen={false}
         onToggleSettings={vi.fn()}
         isMaximized={false}

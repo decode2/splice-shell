@@ -25,6 +25,7 @@ const mocks = vi.hoisted(() => ({
   invoke: vi.fn<InvokeMock>(),
   listen: vi.fn<ListenMock>(),
   unlisten: vi.fn<() => void>(),
+  terminalConstruct: vi.fn<(options: Record<string, unknown>) => void>(),
   terminalOpen: vi.fn<(container: HTMLElement) => void>(),
   terminalFocus: vi.fn<() => void>(),
   terminalWrite: vi.fn<(data: string) => void>(),
@@ -67,6 +68,9 @@ vi.mock("@xterm/xterm", () => {
 
     constructor(options: Record<string, unknown>) {
       this.options = options;
+      // Capture the live options object so tests can assert that the settings
+      // effect mutates fontSize/theme in place after construction.
+      mocks.terminalConstruct(options);
     }
 
     open(container: HTMLElement) {
@@ -218,6 +222,7 @@ beforeEach(() => {
   });
 
   mocks.unlisten.mockReset();
+  mocks.terminalConstruct.mockReset();
   mocks.terminalOpen.mockReset();
   mocks.terminalFocus.mockReset();
   mocks.terminalWrite.mockReset();
@@ -940,19 +945,17 @@ describe("TerminalView title bar extraction", () => {
     expect(queryByRole("button", { name: "Settings" })).toBeNull();
   });
 
-  it("renders the terminal settings panel only when settingsOpen is true", async () => {
-    const { container, rerender } = render(
-      <TerminalView settingsOpen={false} onCloseSettings={vi.fn()} />,
-    );
+  it("no longer renders its own settings panel (the panel was lifted to App)", async () => {
+    // Settings are global now: App owns the single TerminalSettingsPanel. The
+    // per-tab TerminalView must never render a settings panel of its own,
+    // regardless of props, so N tabs cannot each pop their own overlay.
+    const { container } = render(<TerminalView />);
 
     await waitFor(() => {
       expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
     });
 
     expect(container.querySelector(".terminal-settings-panel")).toBeNull();
-
-    rerender(<TerminalView settingsOpen onCloseSettings={vi.fn()} />);
-    expect(container.querySelector(".terminal-settings-panel")).not.toBeNull();
   });
 
   it("signals healthy once the initial session settles", async () => {
@@ -1166,5 +1169,242 @@ describe("TerminalView paste key handling", () => {
 
     expect(getInvokeCallsFor("clipboard_read_text")).toHaveLength(1);
     expect(mocks.terminalPaste).toHaveBeenCalledWith("insert paste");
+  });
+});
+
+describe("TerminalView active prop", () => {
+  it("refits and focuses when the active prop flips to true", async () => {
+    const { rerender } = render(<TerminalView active={false} />);
+
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
+    });
+    await flushAsync();
+
+    // Baseline counts after the initial mount (bridge fits + focuses once).
+    const fitsBefore = mocks.fitAddonFit.mock.calls.length;
+    const focusBefore = mocks.terminalFocus.mock.calls.length;
+
+    // Activating a previously-inactive tab must re-fit (it may have been hidden
+    // and resized) and route focus to it.
+    rerender(<TerminalView active />);
+    await flushAsync();
+
+    expect(mocks.fitAddonFit.mock.calls.length).toBeGreaterThan(fitsBefore);
+    expect(mocks.terminalFocus.mock.calls.length).toBeGreaterThan(focusBefore);
+  });
+});
+
+describe("TerminalView settings prop", () => {
+  it("applies fontSize/theme to xterm and refits when the settings prop changes", async () => {
+    const { rerender } = render(
+      <TerminalView settings={{ background: "#000000", foreground: "#ffffff", fontSize: 14 }} />,
+    );
+
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
+    });
+    await flushAsync();
+
+    const options = mocks.terminalConstruct.mock.calls.at(-1)?.[0] as
+      | Record<string, unknown>
+      | undefined;
+    expect(options?.fontSize).toBe(14);
+
+    const fitsBefore = mocks.fitAddonFit.mock.calls.length;
+
+    rerender(
+      <TerminalView settings={{ background: "#111111", foreground: "#eeeeee", fontSize: 20 }} />,
+    );
+    await flushAsync();
+
+    // The settings effect mutates the live options object and refits so the
+    // grid tracks the new cell size.
+    expect(options?.fontSize).toBe(20);
+    expect((options?.theme as { background?: string })?.background).toBe("#111111");
+    expect(mocks.fitAddonFit.mock.calls.length).toBeGreaterThan(fitsBefore);
+  });
+});
+
+describe("TerminalView multi-instance event isolation", () => {
+  it("drops foreign-session pty-output while not spawning (never enqueued)", async () => {
+    render(<TerminalView />);
+
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
+    });
+    // Settle the spawn so spawnInFlight is false and currentSessionId === 1.
+    await flushAsync();
+
+    // A sibling tab's session (id 99) emits output on the shared global stream.
+    // This instance is NOT spawning, so the chunk must be DROPPED outright, not
+    // enqueued into earlyOutputQueue where it would leak forever.
+    emitPtyOutput(99, "FOREIGN-OUTPUT");
+    await flushAsync();
+
+    expect(joinedTerminalWrites()).not.toContain("FOREIGN-OUTPUT");
+
+    // Proof the instance's own pipeline is intact: its own session output still
+    // writes, and a foreign chunk never sneaks in via a later own-session flush.
+    emitPtyOutput(1, "OWN-OUTPUT");
+    await flushAsync();
+    await waitFor(() => {
+      expect(joinedTerminalWrites()).toContain("OWN-OUTPUT");
+    });
+    expect(joinedTerminalWrites()).not.toContain("FOREIGN-OUTPUT");
+  });
+
+  it("drops a foreign pty-exit while not spawning and does not mark itself dead", async () => {
+    const onSessionHealth = vi.fn<(status: string) => void>();
+    render(<TerminalView onSessionHealth={onSessionHealth} />);
+
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
+    });
+    await flushAsync();
+
+    // A sibling tab's session exits. This instance is not spawning, so the exit
+    // must be dropped: no restart, no health change from the foreign event.
+    emitPtyExit(99);
+    await flushAsync();
+    expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
+
+    // This instance's own machinery is untouched: its own exit still restarts.
+    emitPtyExit(1);
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(2);
+    });
+  });
+
+  it("keeps its own stashed instant-exit even when a foreign exit interleaves in the spawn window", async () => {
+    // Defer session 1's spawn so exits can land BEFORE currentSessionId = 1 is
+    // recorded — this is the spawn window where the old single-slot stash was
+    // clobberable by a foreign exit.
+    let resolveSpawn1: (() => void) | undefined;
+    let spawnId = 0;
+    mocks.invoke.mockImplementation((command) => {
+      if (command === "pty_spawn") {
+        spawnId += 1;
+        const thisId = spawnId;
+        if (thisId === 1) {
+          return new Promise<number>((resolve) => {
+            resolveSpawn1 = () => resolve(thisId);
+          });
+        }
+        return Promise.resolve(thisId);
+      }
+      return Promise.resolve(undefined);
+    });
+
+    render(<TerminalView />);
+
+    await waitFor(() => {
+      expect(capturedExitHandlers.length).toBeGreaterThan(0);
+    });
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
+    });
+
+    // This instance's own session (1) instant-exits, then a FOREIGN session (99)
+    // exit lands right after — both inside this instance's spawn window. With a
+    // single slot, 99 would overwrite 1 and the own insta-exit would be lost.
+    emitPtyExit(1);
+    emitPtyExit(99);
+    await flushAsync();
+    expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
+
+    // Recording id 1 must still detect its OWN stashed insta-exit (the Set is
+    // clobber-proof) and drive exactly one restart.
+    await act(async () => {
+      resolveSpawn1?.();
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    });
+
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(2);
+    });
+    await flushAsync();
+    // Exactly one restart — the foreign exit neither added a second restart nor
+    // suppressed the own one.
+    expect(getInvokeCallsFor("pty_spawn")).toHaveLength(2);
+  });
+
+  it("clears the early-output queue on a spawn reject so nothing leaks into a later session", async () => {
+    // Session 1's spawn rejects. Any output queued during its (now-doomed) spawn
+    // window must be dropped, not carried forward.
+    let rejectSpawn1: ((reason: unknown) => void) | undefined;
+    let spawnId = 0;
+    mocks.invoke.mockImplementation((command) => {
+      if (command === "pty_spawn") {
+        spawnId += 1;
+        const thisId = spawnId;
+        if (thisId === 1) {
+          return new Promise<number>((_resolve, reject) => {
+            rejectSpawn1 = reject;
+          });
+        }
+        return Promise.resolve(thisId);
+      }
+      return Promise.resolve(undefined);
+    });
+
+    render(<TerminalView />);
+
+    await waitFor(() => {
+      expect(capturedOutputHandlers.length).toBeGreaterThan(0);
+    });
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
+    });
+
+    // Output arrives while spawn 1 is in flight (queued), then the spawn fails.
+    emitPtyOutput(1, "PRE-REJECT-OUTPUT");
+    await act(async () => {
+      rejectSpawn1?.(new Error("spawn boom"));
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    });
+    await flushAsync();
+
+    // The reject settle path surfaces the failure and clears the queue: the
+    // queued chunk is never flushed to the terminal.
+    expect(
+      mocks.terminalWrite.mock.calls.some(
+        ([data]) => typeof data === "string" && data.includes("Failed to start ConPTY session"),
+      ),
+    ).toBe(true);
+    expect(joinedTerminalWrites()).not.toContain("PRE-REJECT-OUTPUT");
+  });
+
+  it("closes the spawn window when onPtyReady throws so a later foreign chunk is dropped", async () => {
+    // If the ready callback (or the flush write-pipeline) throws AFTER the spawn
+    // resolves, the settle-path closeSpawnWindow() below would be skipped,
+    // stranding spawnInFlight=true — every sibling tab's output would then
+    // accumulate here unbounded. The try/catch around onPtyReady closes the
+    // window and rethrows; this test locks that in: with the window closed, a
+    // foreign chunk arriving afterward is DROPPED, never enqueued.
+    const onPtyReady = vi.fn<(sessionId: number) => void>(() => {
+      throw new Error("ready boom");
+    });
+    render(<TerminalView onPtyReady={onPtyReady} />);
+
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
+    });
+    // Let startPty settle: onPtyReady throws, the window closes, and the caller's
+    // catch surfaces the failure.
+    await flushAsync();
+
+    expect(onPtyReady).toHaveBeenCalledWith(1);
+    expect(
+      mocks.terminalWrite.mock.calls.some(
+        ([data]) => typeof data === "string" && data.includes("Failed to start ConPTY session"),
+      ),
+    ).toBe(true);
+
+    // Spawn window is closed (spawnInFlight=false): a foreign session's output
+    // must be dropped outright, not enqueued into the early-output queue.
+    emitPtyOutput(99, "FOREIGN-AFTER-THROW");
+    await flushAsync();
+    expect(joinedTerminalWrites()).not.toContain("FOREIGN-AFTER-THROW");
   });
 });

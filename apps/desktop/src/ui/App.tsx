@@ -1,9 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import {
-  activePasteTargetToState,
-  getActivePasteTarget,
-  type ActivePasteTargetState,
-} from "../paste/activePasteTarget";
+import { activePasteTargetToState, getActivePasteTarget } from "../paste/activePasteTarget";
 import { createDebouncedRefresh } from "../paste/debouncedRefresh";
 import {
   pastePreviewToState,
@@ -11,9 +7,13 @@ import {
   previewActiveClipboardImagePaste,
   type PastePreviewState,
 } from "../paste/pastePreview";
+import { resolveTabKeyAction } from "../terminal/keyboardShortcuts";
 import { writePty } from "../terminal/ptyClient";
 import { getWindowChrome, useWindowFocused, useWindowMaximized } from "../window/windowChrome";
+import { TerminalSettingsPanel } from "./TerminalSettingsPanel";
+import { DEFAULT_TERMINAL_SETTINGS, type TerminalSettings } from "./terminalSettings";
 import { TitleBar, type SessionHealth } from "./TitleBar";
+import { useSessions } from "./useSessions";
 
 const TerminalView = lazy(() =>
   import("./TerminalView").then((module) => ({ default: module.TerminalView })),
@@ -21,55 +21,79 @@ const TerminalView = lazy(() =>
 
 export function App() {
   const disposedRef = useRef(false);
-  // The active PTY session's monotonic id, published by `TerminalView` via
-  // `onPtyReady`. Threaded into the id-scoped `writePty` and paste-target
-  // commands. Undefined until the first session is recorded; the `?? 0`
-  // sentinel (the counter starts at 1) makes a pre-session write a guaranteed
-  // backend miss that maps to today's "not running" error, and the
-  // paste-target commands accept the undefined as a `None` fallback.
-  const activeSessionIdRef = useRef<number | undefined>(undefined);
-  // One window-chrome instance shared by the maximized hook and the title bar's
-  // controls, so getCurrentWindow() is resolved once (lazily, Tauri-safe).
+  // The tab model: an ordered list of tabs (each with its own sessionId,
+  // adapter, health) plus the active tab id. All tabs stay mounted; only the
+  // active one is visible/focused.
+  const {
+    tabs,
+    activeId,
+    createTab,
+    closeTab,
+    setActive,
+    cycleTab,
+    recordSession,
+    recordHealth,
+    recordAdapter,
+  } = useSessions();
+
+  // One window-chrome instance shared by the maximized/focused hooks and the
+  // title bar's controls, so getCurrentWindow() is resolved once (lazily).
   const chrome = useMemo(() => getWindowChrome(), []);
   const isMaximized = useWindowMaximized(chrome);
-  // Drives the title-bar dimming: on OS blur the chrome softens, on focus it
-  // restores. Shares the one chrome instance created above.
   const isFocused = useWindowFocused(chrome);
+
+  // Settings are GLOBAL/shared: one source of truth in App, passed to every
+  // mounted terminal, edited through a single TerminalSettingsPanel. A change
+  // refits ALL terminals (each TerminalView's settings effect refits on change).
+  const [terminalSettings, setTerminalSettings] = useState<TerminalSettings>(
+    DEFAULT_TERMINAL_SETTINGS,
+  );
   const [settingsOpen, setSettingsOpen] = useState(false);
   const toggleSettings = useCallback(() => setSettingsOpen((current) => !current), []);
   const closeSettings = useCallback(() => setSettingsOpen(false), []);
-  // Session health drives the title bar's health dot. It starts "healthy" and
-  // only changes on real transitions (reconnecting / failed / back to healthy).
-  // The setter no-ops when the status is unchanged, so a stream of healthy
-  // output chunks cannot re-render the shell after the first transition.
-  const [sessionHealth, setSessionHealth] = useState<SessionHealth>("healthy");
-  const handleSessionHealth = useCallback((status: SessionHealth) => {
-    setSessionHealth((current) => (current === status ? current : status));
-  }, []);
+
   const [pasteState, setPasteState] = useState<PastePreviewState>({
     kind: "idle",
     message: "Press Ctrl+V with an image in the clipboard to preview the paste route.",
   });
-  const [activePasteTargetState, setActivePasteTargetState] =
-    useState<ActivePasteTargetState>({
-      kind: "loading",
-      message: "Detecting active paste target…",
-    });
+
+  // Refs mirror the ACTIVE tab so stable callbacks (paste, adapter refresh, the
+  // window chord handler) always target the current active tab/session without
+  // being rebound on every switch. Assigned in effects below so the mirror
+  // tracks state commits.
+  const activeIdRef = useRef(activeId);
+  const activeSessionIdRef = useRef<number | undefined>(undefined);
+  const activeTab = tabs.find((tab) => tab.tabId === activeId);
+  const activeSessionId = activeTab?.sessionId;
+  // Declared BEFORE the refresh effect so the mirrors are up to date before any
+  // refresh reads them.
+  useEffect(() => {
+    activeIdRef.current = activeId;
+  }, [activeId]);
+  useEffect(() => {
+    activeSessionIdRef.current = activeSessionId;
+  }, [activeSessionId]);
+
+  // Refresh the ACTIVE tab's adapter chip only (inactive tabs keep their
+  // last-known adapter). Records into the active tab via the reducer so each
+  // tab owns its chip independently.
   const refreshActivePasteTarget = useCallback(async () => {
+    const tabId = activeIdRef.current;
     try {
       const target = await getActivePasteTarget(activeSessionIdRef.current);
       if (!disposedRef.current) {
-        setActivePasteTargetState(activePasteTargetToState(target));
+        recordAdapter(tabId, activePasteTargetToState(target));
       }
     } catch (error) {
       if (!disposedRef.current) {
-        setActivePasteTargetState({
+        recordAdapter(tabId, {
           kind: "error",
           message: error instanceof Error ? error.message : String(error),
         });
       }
     }
-  }, []);
+  }, [recordAdapter]);
+
   const debouncedActivePasteTargetRefresh = useMemo(
     () =>
       createDebouncedRefresh({
@@ -81,14 +105,17 @@ export function App() {
 
   useEffect(() => {
     disposedRef.current = false;
-
-    void refreshActivePasteTarget();
-
     return () => {
       disposedRef.current = true;
       debouncedActivePasteTargetRefresh.cancel();
     };
-  }, [debouncedActivePasteTargetRefresh, refreshActivePasteTarget]);
+  }, [debouncedActivePasteTargetRefresh]);
+
+  // Refresh on mount and whenever the active tab changes, so switching tabs
+  // updates the newly-active tab's chip.
+  useEffect(() => {
+    void refreshActivePasteTarget();
+  }, [activeId, refreshActivePasteTarget]);
 
   const pasteClipboardImageIntoTerminal = useCallback(async () => {
     try {
@@ -115,13 +142,56 @@ export function App() {
     [debouncedActivePasteTargetRefresh],
   );
 
+  // Per-tab PTY-ready: record the (re)spawned session id for that tab. When it
+  // is the active tab, mirror the session id immediately and refresh its chip.
   const handlePtyReady = useCallback(
-    (sessionId: number) => {
-      activeSessionIdRef.current = sessionId;
-      void refreshActivePasteTarget();
+    (tabId: string, sessionId: number) => {
+      recordSession(tabId, sessionId);
+      if (tabId === activeIdRef.current) {
+        activeSessionIdRef.current = sessionId;
+        void refreshActivePasteTarget();
+      }
     },
-    [refreshActivePasteTarget],
+    [recordSession, refreshActivePasteTarget],
   );
+
+  const handleTabSessionHealth = useCallback(
+    (tabId: string, status: SessionHealth) => {
+      recordHealth(tabId, status);
+    },
+    [recordHealth],
+  );
+
+  // Tab chords are app-scoped: a window-level capture listener fires BEFORE
+  // TerminalView's element listener, so the active terminal never swallows tab
+  // navigation. The resolver already ignores auto-repeat and disjoint keys.
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const action = resolveTabKeyAction(event);
+      if (action === "none") {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      switch (action) {
+        case "new-tab":
+          createTab();
+          break;
+        case "close-tab":
+          closeTab(activeIdRef.current);
+          break;
+        case "next-tab":
+          cycleTab("next");
+          break;
+        case "prev-tab":
+          cycleTab("prev");
+          break;
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown, { capture: true });
+    return () => window.removeEventListener("keydown", handleKeyDown, { capture: true });
+  }, [createTab, closeTab, cycleTab]);
 
   return (
     <main
@@ -130,25 +200,43 @@ export function App() {
       data-focused={isFocused || undefined}
     >
       <TitleBar
-        activePasteTargetState={activePasteTargetState}
+        tabs={tabs}
+        activeId={activeId}
+        onSelectTab={setActive}
+        onCloseTab={closeTab}
+        onCreateTab={createTab}
         pasteState={pasteState}
-        sessionHealth={sessionHealth}
         settingsOpen={settingsOpen}
         onToggleSettings={toggleSettings}
         isMaximized={isMaximized}
         chrome={chrome}
       />
-      <Suspense fallback={<div className="terminal-frame terminal-loading">Loading terminal UI…</div>}>
-        <TerminalView
-          onClipboardImagePaste={pasteClipboardImageIntoTerminal}
-          onInputActivity={debouncedActivePasteTargetRefresh.schedule}
-          onSessionHealth={handleSessionHealth}
-          onTextPaste={pasteTextIntoTerminal}
-          onPtyReady={handlePtyReady}
-          settingsOpen={settingsOpen}
-          onCloseSettings={closeSettings}
-        />
-      </Suspense>
+      <div className="terminal-stack">
+        <Suspense
+          fallback={<div className="terminal-frame terminal-loading">Loading terminal UI…</div>}
+        >
+          {tabs.map((tab) => (
+            <TerminalView
+              key={tab.tabId}
+              active={tab.tabId === activeId}
+              visible={tab.tabId === activeId}
+              settings={terminalSettings}
+              onClipboardImagePaste={pasteClipboardImageIntoTerminal}
+              onInputActivity={debouncedActivePasteTargetRefresh.schedule}
+              onSessionHealth={(status) => handleTabSessionHealth(tab.tabId, status)}
+              onTextPaste={pasteTextIntoTerminal}
+              onPtyReady={(sessionId) => handlePtyReady(tab.tabId, sessionId)}
+            />
+          ))}
+        </Suspense>
+        {settingsOpen ? (
+          <TerminalSettingsPanel
+            settings={terminalSettings}
+            onChange={setTerminalSettings}
+            onClose={closeSettings}
+          />
+        ) : null}
+      </div>
     </main>
   );
 }
