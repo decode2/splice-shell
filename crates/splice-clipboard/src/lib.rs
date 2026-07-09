@@ -2,7 +2,7 @@ use splice_core::{ImagePaste, PastePayload};
 use std::{
     fs,
     path::Path,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -318,6 +318,47 @@ fn unique_clipboard_image_name() -> String {
         .unwrap_or_default();
 
     format!("splice-clipboard-{millis}.png")
+}
+
+pub fn sweep_temp_images(temp_dir: &Path) -> Result<(), ClipboardError> {
+    let entries = match fs::read_dir(temp_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(ClipboardError::Io(e)),
+    };
+
+    let now = SystemTime::now();
+    let five_minutes = Duration::from_secs(5 * 60);
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+            if file_name.starts_with("splice-clipboard-") && file_name.ends_with(".png") {
+                if let Ok(metadata) = entry.metadata() {
+                    let file_time = metadata.modified()
+                        .or_else(|_| metadata.created())
+                        .unwrap_or(now);
+
+                    if let Ok(duration) = now.duration_since(file_time) {
+                        if duration > five_minutes {
+                            let _ = fs::remove_file(path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1040,5 +1081,67 @@ mod tests {
         // must override that and keep the layout SHORT.
         dib.extend_from_slice(&[0u8; 12]);
         dib
+    }
+
+    fn set_file_modified_time(path: &std::path::Path, time: SystemTime) -> std::io::Result<()> {
+        let file = fs::OpenOptions::new().write(true).open(path)?;
+        let mut times = std::fs::FileTimes::new();
+        times = times.set_modified(time);
+        times = times.set_accessed(time);
+        file.set_times(times)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_sweep_temp_images_deletes_old_files() {
+        let temp_dir = fresh_temp_dir("sweep");
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let now = SystemTime::now();
+
+        // 1. Create an old matching file (10 minutes old)
+        let old_matching_path = temp_dir.join("splice-clipboard-111.png");
+        fs::write(&old_matching_path, b"dummy png content").unwrap();
+        set_file_modified_time(&old_matching_path, now - Duration::from_secs(600)).unwrap();
+
+        // 2. Create a new matching file (2 minutes old)
+        let new_matching_path = temp_dir.join("splice-clipboard-222.png");
+        fs::write(&new_matching_path, b"dummy png content").unwrap();
+        set_file_modified_time(&new_matching_path, now - Duration::from_secs(120)).unwrap();
+
+        // 3. Create an old non-matching file (10 minutes old, wrong prefix)
+        let old_non_matching_path = temp_dir.join("other-file-333.png");
+        fs::write(&old_non_matching_path, b"dummy png content").unwrap();
+        set_file_modified_time(&old_non_matching_path, now - Duration::from_secs(600)).unwrap();
+
+        // 4. Create an old non-matching file (10 minutes old, wrong extension)
+        let old_wrong_ext_path = temp_dir.join("splice-clipboard-444.txt");
+        fs::write(&old_wrong_ext_path, b"dummy txt content").unwrap();
+        set_file_modified_time(&old_wrong_ext_path, now - Duration::from_secs(600)).unwrap();
+
+        // Run the sweeper
+        sweep_temp_images(&temp_dir).unwrap();
+
+        // Assertions:
+        // Old matching file should be deleted
+        assert!(!old_matching_path.exists(), "Old matching file should be deleted");
+
+        // New matching file should still exist
+        assert!(new_matching_path.exists(), "New matching file should be preserved");
+
+        // Old non-matching files should still exist
+        assert!(old_non_matching_path.exists(), "Old non-matching file should be preserved");
+        assert!(old_wrong_ext_path.exists(), "Old file with wrong extension should be preserved");
+
+        // Cleanup
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_sweep_temp_images_handles_non_existent_directory() {
+        let temp_dir = fresh_temp_dir("non-existent");
+        // Do not create the directory
+        let result = sweep_temp_images(&temp_dir);
+        assert!(result.is_ok(), "Sweeping a non-existent directory should succeed with Ok(())");
     }
 }

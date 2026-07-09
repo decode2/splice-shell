@@ -30,7 +30,8 @@ npm test
 Rust checks, once Rust is installed:
 
 ```powershell
-cargo test
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 cargo check --workspace
 ```
 
@@ -39,3 +40,7 @@ cargo check --workspace
 Terminal hosting is implemented. Splice Shell launches a real shell through Windows ConPTY, renders output with xterm.js, sends keyboard input, and handles resize. Clipboard image extraction and adapter-routed paste are in place on top of that foundation.
 
 See [`docs/mvp.md`](mvp.md) for the full list of what the MVP supports and what is intentionally out of scope.
+
+## Releases
+
+Versioning is automated with release-please and SemVer. See [`docs/releases.md`](releases.md) for the release flow, signing setup, and auto-updater behaviour.

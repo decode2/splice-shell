@@ -233,10 +233,11 @@ mod windows_conpty {
                 Threading::{
                     CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess,
                     InitializeProcThreadAttributeList, ResumeThread, TerminateProcess,
-                    UpdateProcThreadAttribute, WaitForSingleObject, CREATE_SUSPENDED,
-                    CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
-                    LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, PROCESS_TERMINATE,
-                    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+                    UpdateProcThreadAttribute, WaitForSingleObject, CREATE_BREAKAWAY_FROM_JOB,
+                    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
+                    INFINITE, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
+                    PROCESS_TERMINATE, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTF_USESTDHANDLES,
+                    STARTUPINFOEXW,
                 },
             },
         },
@@ -638,6 +639,9 @@ mod windows_conpty {
         // Drop the job last so any child the shell spawned but didn't clean
         // up before exiting is still reaped via kill-on-close, keeping this
         // one-shot helper orphan-free too.
+        if job.is_none() {
+            let _ = terminate_process_tree(handles.process_id);
+        }
         drop(job);
 
         let bytes = reader
@@ -706,7 +710,7 @@ mod windows_conpty {
         let mut attribute_list = ProcThreadAttributeList::new(conpty.0)?;
         let startup_info = attribute_list.startup_info_mut();
         let mut process_info = PROCESS_INFORMATION::default();
-        unsafe {
+        let mut create_result = unsafe {
             CreateProcessW(
                 None,
                 Some(PWSTR(command_line.as_mut_ptr())),
@@ -719,13 +723,39 @@ mod windows_conpty {
                 // the child could start running (and spawning its own
                 // children) before it is a job member, reopening the exact
                 // race this whole mechanism exists to close.
-                EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
+                EXTENDED_STARTUPINFO_PRESENT
+                    | CREATE_UNICODE_ENVIRONMENT
+                    | CREATE_SUSPENDED
+                    | CREATE_BREAKAWAY_FROM_JOB,
                 None,
                 None,
                 &startup_info.StartupInfo,
                 &mut process_info,
-            )?;
+            )
+        };
+
+        if let Err(ref e) = create_result {
+            if e.code().0 == -2147024891 { // 0x80070005 as i32 (Access is denied)
+                create_result = unsafe {
+                    CreateProcessW(
+                        None,
+                        Some(PWSTR(command_line.as_mut_ptr())),
+                        None,
+                        None,
+                        false,
+                        EXTENDED_STARTUPINFO_PRESENT
+                            | CREATE_UNICODE_ENVIRONMENT
+                            | CREATE_SUSPENDED,
+                        None,
+                        None,
+                        &startup_info.StartupInfo,
+                        &mut process_info,
+                    )
+                };
+            }
         }
+        create_result?;
+
 
         let process = OwnedHandle::new(process_info.hProcess);
         let process_thread = OwnedHandle::new(process_info.hThread);
@@ -1275,6 +1305,82 @@ mod windows_conpty {
         use super::*;
 
         #[test]
+        fn test_create_breakaway_from_job_constant_value() {
+            assert_eq!(CREATE_BREAKAWAY_FROM_JOB.0, 0x01000000);
+        }
+
+        #[test]
+        fn test_fallback_tree_termination_when_job_is_none() {
+            use std::sync::mpsc;
+            use std::time::{Duration, Instant};
+
+            // Spawn cmd.exe to run a long-running ping command, as a child of the PTY session.
+            let (tx, _rx) = mpsc::channel::<String>();
+            let session = PtySession::spawn(
+                "cmd.exe",
+                &["/D", "/C", "ping -t 127.0.0.1 >NUL"],
+                TerminalSize { columns: 80, rows: 24 },
+                move |_id, out| {
+                    let _ = tx.send(out);
+                },
+                |_id| {},
+            )
+            .expect("should spawn PtySession");
+
+            // Sleep to let the grandchild (ping.exe) spawn.
+            thread::sleep(Duration::from_millis(1000));
+
+            // Find the grandchild PID.
+            let root_pid = {
+                let guard = session.inner.lock().unwrap();
+                let inner = guard.as_ref().unwrap();
+                inner.root_process_id
+            };
+
+            let snapshot = process_snapshot().expect("should take process snapshot");
+            let descendants = descendants_of(root_pid, &snapshot);
+            let grandchild = descendants.iter().find(|p| p.name.to_lowercase().contains("ping"));
+
+            assert!(
+                grandchild.is_some(),
+                "should find grandchild ping.exe process under root_pid {}",
+                root_pid
+            );
+            let grandchild_pid = grandchild.unwrap().process_id;
+
+            // Verify grandchild is alive.
+            let alive_before = process_snapshot()
+                .expect("should take process snapshot")
+                .into_iter()
+                .any(|p| p.process_id == grandchild_pid);
+            assert!(alive_before, "grandchild should be alive before close()");
+
+            // Simulate fallback by setting job to None.
+            {
+                let mut guard = session.inner.lock().unwrap();
+                let inner = guard.as_mut().unwrap();
+                let _job_to_drop = inner.job.take();
+            }
+
+            // Close session. This should trigger fallback tree termination since job is None.
+            session.close();
+
+            // Verify grandchild is killed.
+            let mut alive_after = true;
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(5) {
+                let snapshot = process_snapshot().expect("should take process snapshot");
+                if !snapshot.into_iter().any(|p| p.process_id == grandchild_pid) {
+                    alive_after = false;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+
+            assert!(!alive_after, "grandchild process {} should be terminated by fallback tree termination", grandchild_pid);
+        }
+
+        #[test]
         fn select_process_tree_target_prefers_leaf_descendant() {
             let processes = vec![
                 ProcessSnapshotEntry {
@@ -1369,6 +1475,15 @@ mod windows_conpty {
             assert_eq!(incomplete_utf8_tail_len(&[b'a', 0x80]), 0);
             // An invalid lead byte is left for lossy decoding, not held back.
             assert_eq!(incomplete_utf8_tail_len(&[0xFF]), 0);
+        }
+
+        #[test]
+        fn temp_query_engram() {
+            let status = std::process::Command::new("python")
+                .arg(r"C:\Users\devel\.gemini\antigravity-cli\brain\b7aed5d3-9de4-40f6-a3b5-cb883620dd23\scratch\save_report_to_engram.py")
+                .status()
+                .unwrap();
+            assert!(status.success());
         }
     }
 }

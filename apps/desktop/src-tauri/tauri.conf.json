@@ -27,6 +27,16 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "icon": ["icons/icon.ico"]
+    "icon": ["icons/icon.ico"],
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "active": true,
+      "endpoints": [
+        "https://github.com/decode2/splice-shell/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEI1RDJDMEE0RjYzRDY1ODQKUldTRVpUMzJwTURTdGJUaGR1NE1yREdQVW9taEtzR21ocE8ydld3RHFHMTBwdWFCN0hzV2dqTHoK"
+    }
   }
 }

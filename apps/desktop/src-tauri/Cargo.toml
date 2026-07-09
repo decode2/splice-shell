@@ -27,3 +27,6 @@ time.workspace = true
 splice-core = { path = "../../../crates/splice-core" }
 splice-pty = { path = "../../../crates/splice-pty" }
 splice-clipboard = { path = "../../../crates/splice-clipboard" }
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+log = "0.4"

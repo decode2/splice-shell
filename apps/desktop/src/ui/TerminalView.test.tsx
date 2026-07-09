@@ -387,15 +387,17 @@ describe("TerminalView pty-exit driven restart", () => {
     await waitFor(() => {
       expect(getInvokeCallsFor("pty_spawn")).toHaveLength(2);
     });
-    await flushAsync();
 
     // The fed output contained no cursor-show, so a synthetic `\x1b[?2026l` can
-    // only have been emitted by the restart flush. Its presence proves the
-    // filter was flushed (and thus reset) before the new session started.
-    const wroteSyntheticClose = mocks.terminalWrite.mock.calls.some(
-      ([data]) => typeof data === "string" && data.includes("\x1b[?2026l"),
-    );
-    expect(wroteSyntheticClose).toBe(true);
+    // only have been emitted by the restart flush. The flush writes through the
+    // rAF-backed output scheduler, so wait for the scheduled terminal write
+    // rather than asserting immediately after the restart promise settles.
+    await waitFor(() => {
+      const wroteSyntheticClose = mocks.terminalWrite.mock.calls.some(
+        ([data]) => typeof data === "string" && data.includes("\x1b[?2026l"),
+      );
+      expect(wroteSyntheticClose).toBe(true);
+    });
   });
 
   it("ignores a stale pty-exit for an already-superseded session", async () => {

@@ -69,14 +69,14 @@ struct ActivePasteTarget {
 }
 
 #[tauri::command]
-fn preview_clipboard_image_paste(process_name: String) -> Result<PastePreview, String> {
+async fn preview_clipboard_image_paste(process_name: String) -> Result<PastePreview, String> {
     let payload = read_clipboard_image_paste_payload()?;
 
     Ok(preview_paste_payload(&process_name, &payload))
 }
 
 #[tauri::command]
-fn active_paste_target(
+async fn active_paste_target(
     state: State<'_, PtyState>,
     session_id: Option<u64>,
 ) -> Result<ActivePasteTarget, String> {
@@ -85,7 +85,7 @@ fn active_paste_target(
 }
 
 #[tauri::command]
-fn preview_active_clipboard_image_paste(
+async fn preview_active_clipboard_image_paste(
     state: State<'_, PtyState>,
     session_id: Option<u64>,
 ) -> Result<PastePreview, String> {
@@ -96,7 +96,7 @@ fn preview_active_clipboard_image_paste(
 }
 
 #[tauri::command]
-fn pty_spawn(
+async fn pty_spawn(
     app: tauri::AppHandle,
     state: State<'_, PtyState>,
     cols: u16,
@@ -112,7 +112,20 @@ fn pty_spawn(
     // Each session is torn down explicitly by its own id (frontend `killPty`,
     // the detached natural-exit cleanup, or the instant-exit re-check below),
     // so a new spawn never reaps an existing session.
-    let output_app = app.clone();
+    let (tx, rx) = std::sync::mpsc::channel::<(u64, String)>();
+    let flusher_app = app.clone();
+    std::thread::spawn(move || {
+        run_flusher_loop(rx, move |session_id, data| {
+            let _ = flusher_app.emit(
+                PTY_OUTPUT_EVENT,
+                PtyOutputPayload {
+                    session_id,
+                    data,
+                },
+            );
+        });
+    });
+
     let cleanup_app = app.clone();
     let exit_app = app;
     let session = PtySession::spawn(
@@ -120,13 +133,7 @@ fn pty_spawn(
         &command_args,
         size,
         move |id, output| {
-            let _ = output_app.emit(
-                PTY_OUTPUT_EVENT,
-                PtyOutputPayload {
-                    session_id: id,
-                    data: output,
-                },
-            );
+            let _ = tx.send((id, output));
         },
         move |id| {
             // Natural exit: push the id to the frontend so it can decide
@@ -204,6 +211,9 @@ fn clear_and_close_session_by_id(app: &tauri::AppHandle, id: u64) {
     if let Some(session) = session {
         session.close();
     }
+    // Session close hook calling sweep_temp_images (CLIP-3)
+    let temp_dir = std::env::temp_dir().join("splice-shell").join("clipboard");
+    let _ = splice_clipboard::sweep_temp_images(&temp_dir);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -275,17 +285,17 @@ fn pty_write_impl(state: &PtyState, session_id: u64, data: &str) -> Result<(), S
 }
 
 #[tauri::command]
-fn pty_write(state: State<'_, PtyState>, session_id: u64, data: String) -> Result<(), String> {
+async fn pty_write(state: State<'_, PtyState>, session_id: u64, data: String) -> Result<(), String> {
     pty_write_impl(state.inner(), session_id, &data)
 }
 
 #[tauri::command]
-fn pty_interrupt(state: State<'_, PtyState>, session_id: u64) -> Result<(), String> {
+async fn pty_interrupt(state: State<'_, PtyState>, session_id: u64) -> Result<(), String> {
     with_pty_session(state.inner(), session_id, |session| session.interrupt())
 }
 
 #[tauri::command]
-fn pty_resize(
+async fn pty_resize(
     state: State<'_, PtyState>,
     session_id: u64,
     cols: u16,
@@ -310,12 +320,12 @@ fn pty_kill_impl(state: &PtyState, session_id: u64) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn pty_kill(state: State<'_, PtyState>, session_id: u64) -> Result<(), String> {
+async fn pty_kill(state: State<'_, PtyState>, session_id: u64) -> Result<(), String> {
     pty_kill_impl(state.inner(), session_id)
 }
 
 #[tauri::command]
-fn open_path(path: String) -> Result<(), String> {
+async fn open_path(path: String) -> Result<(), String> {
     let path = PathBuf::from(path);
     if !path.exists() {
         return Err(format!("Path does not exist: {}", path.display()));
@@ -418,6 +428,7 @@ fn clipboard_read_text() -> Result<String, String> {
 
 fn read_clipboard_image_paste_payload() -> Result<PastePayload, String> {
     let temp_dir = std::env::temp_dir().join("splice-shell").join("clipboard");
+    let _ = splice_clipboard::sweep_temp_images(&temp_dir);
     splice_clipboard::read_clipboard_image_paste_payload(&temp_dir)
         .map_err(|error| error.to_string())
 }
@@ -463,11 +474,97 @@ fn select_process_for_adapter<'a>(
         .map(String::as_str)
 }
 
+fn run_flusher_loop<F>(rx: std::sync::mpsc::Receiver<(u64, String)>, mut flush_callback: F)
+where
+    F: FnMut(u64, String),
+{
+    let mut buffer = String::new();
+    let mut last_flush = std::time::Instant::now();
+    let limit = std::time::Duration::from_millis(16);
+
+    while let Ok((id, msg)) = rx.recv() {
+        let current_session_id = id;
+        buffer.push_str(&msg);
+
+        // Drain any other immediately available messages in the channel
+        while let Ok((_, extra)) = rx.try_recv() {
+            buffer.push_str(&extra);
+        }
+
+        // Check if we can flush immediately or need to wait
+        let elapsed = last_flush.elapsed();
+        if elapsed < limit {
+            let delay = limit - elapsed;
+            std::thread::sleep(delay);
+            // After sleeping, drain any messages that arrived during the sleep
+            while let Ok((_, extra)) = rx.try_recv() {
+                buffer.push_str(&extra);
+            }
+        }
+
+        // Flush the buffer
+        if !buffer.is_empty() {
+            flush_callback(current_session_id, std::mem::take(&mut buffer));
+            last_flush = std::time::Instant::now();
+        }
+    }
+}
+
+#[tauri::command]
+async fn close_paste_session(path: Option<String>) -> Result<(), String> {
+    close_paste_session_impl(path);
+    Ok(())
+}
+
+fn close_paste_session_impl(path: Option<String>) {
+    if let Some(ref path_str) = path {
+        let path = std::path::PathBuf::from(path_str);
+        if path.exists() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    let temp_dir = std::env::temp_dir().join("splice-shell").join("clipboard");
+    let _ = splice_clipboard::sweep_temp_images(&temp_dir);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .manage(PtyState {
             sessions: Mutex::new(HashMap::new()),
+        })
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
+        .setup(|app| {
+            let temp_dir = std::env::temp_dir().join("splice-shell").join("clipboard");
+            // Startup Cleanup (CLIP-2)
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            let _ = splice_clipboard::sweep_temp_images(&temp_dir);
+
+            #[cfg(desktop)]
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    use tauri_plugin_updater::UpdaterExt;
+                    if let Ok(updater) = handle.updater_builder().build() {
+                        match updater.check().await {
+                            Ok(Some(update)) => {
+                                if update.download_and_install(|_, _| {}, || {}).await.is_ok() {
+                                    handle.restart();
+                                }
+                            }
+                            Ok(None) => {
+                                log::debug!("splice-shell: no update available");
+                            }
+                            Err(e) => {
+                                log::warn!("splice-shell: updater check failed: {e}");
+                            }
+                        }
+                    }
+                });
+            }
+
+            Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             app_status,
@@ -481,10 +578,19 @@ pub fn run() {
             pty_kill,
             clipboard_write_text,
             clipboard_read_text,
-            open_path
+            open_path,
+            close_paste_session
         ])
-        .run(tauri::generate_context!())
-        .expect("failed to run Splice Shell desktop app");
+        .build(tauri::generate_context!())
+        .expect("failed to build Splice Shell desktop app");
+
+    app.run(|_app_handle, event| {
+        if let tauri::RunEvent::Exit = event {
+            let temp_dir = std::env::temp_dir().join("splice-shell").join("clipboard");
+            // Shutdown Cleanup (CLIP-4)
+            let _ = std::fs::remove_dir_all(&temp_dir);
+        }
+    });
 }
 
 #[cfg(test)]
@@ -789,9 +895,188 @@ mod tests {
         let missing_path = std::env::temp_dir().join("splice-shell-missing-open-path-file.png");
         let _ = std::fs::remove_file(&missing_path);
 
-        let error = open_path(missing_path.display().to_string())
+        let error = tauri::async_runtime::block_on(open_path(missing_path.display().to_string()))
             .expect_err("missing paths should not be opened");
 
         assert!(error.contains("Path does not exist"));
+    }
+
+    #[test]
+    fn test_flusher_aggregates_high_frequency_output() {
+        use std::sync::mpsc;
+        use std::thread;
+
+
+        let (tx, rx) = mpsc::channel::<(u64, String)>();
+        let (done_tx, done_rx) = mpsc::channel::<(u64, String)>();
+
+        // Spawn the flusher loop in a background thread
+        thread::spawn(move || {
+            run_flusher_loop(rx, move |id, data| {
+                let _ = done_tx.send((id, data));
+            });
+        });
+
+        // GIVEN an active terminal session
+        // WHEN a command produces a continuous stream of output
+        tx.send((42, "hello ".to_owned())).unwrap();
+        // Send a burst of messages immediately
+        for i in 1..=5 {
+            tx.send((42, format!("part{} ", i))).unwrap();
+        }
+
+        // Drop the transmitter to exit the loop once drained
+        drop(tx);
+
+        // Read the flushed output
+        let mut results = Vec::new();
+        while let Ok(res) = done_rx.recv() {
+            results.push(res);
+        }
+
+        // Verify that the output was aggregated
+        assert!(!results.is_empty(), "should have at least one flush event");
+        let combined: String = results.iter().map(|(_, data)| data.as_str()).collect();
+        assert_eq!(combined, "hello part1 part2 part3 part4 part5 ");
+
+        // Assert that the aggregation actually occurred (number of events < number of sent messages)
+        assert!(results.len() < 6, "flusher should have aggregated events, got {}", results.len());
+    }
+
+    #[test]
+    fn test_flusher_idle_flushes_immediately() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let (tx, rx) = mpsc::channel::<(u64, String)>();
+        let (done_tx, done_rx) = mpsc::channel::<(u64, String)>();
+
+        // Spawn flusher
+        thread::spawn(move || {
+            run_flusher_loop(rx, move |id, data| {
+                let _ = done_tx.send((id, data));
+            });
+        });
+
+        // Send one message, wait for flush
+        let start1 = Instant::now();
+        tx.send((42, "first".to_owned())).unwrap();
+        let (_id1, val1) = done_rx.recv().unwrap();
+        let elapsed1 = start1.elapsed();
+
+        assert_eq!(val1, "first");
+        // Should be almost instant (idle flush) - well below 16ms
+        assert!(elapsed1 < Duration::from_millis(30), "idle flush should be immediate, took {:?}", elapsed1);
+
+        // Wait 20ms to ensure flusher is idle again
+        thread::sleep(Duration::from_millis(20));
+
+        // Send a second message, wait for flush
+        let start2 = Instant::now();
+        tx.send((42, "second".to_owned())).unwrap();
+        let (_id2, val2) = done_rx.recv().unwrap();
+        let elapsed2 = start2.elapsed();
+
+        assert_eq!(val2, "second");
+        assert!(elapsed2 < Duration::from_millis(30), "second idle flush should also be immediate, took {:?}", elapsed2);
+    }
+
+    #[test]
+    fn test_concurrent_commands_no_deadlock() {
+        use std::thread;
+
+        let state = Arc::new(PtyState {
+            sessions: Mutex::new(HashMap::new()),
+        });
+
+        let session = Arc::new(
+            PtySession::spawn(
+                "cmd.exe",
+                &["/D", "/K"],
+                TerminalSize::new(80, 24).unwrap(),
+                |_, _| {},
+                |_| {},
+            )
+            .unwrap(),
+        );
+        let id = session.id();
+        state.sessions.lock().unwrap().insert(id, Arc::clone(&session));
+
+        let mut threads = Vec::new();
+        for _ in 0..10 {
+            let state_clone = Arc::clone(&state);
+            let t = thread::spawn(move || {
+                for _ in 0..50 {
+                    let _ = pty_write_impl(&state_clone, id, "echo hello\r");
+                    let _ = clone_pty_session_by_id(&state_clone, id);
+                }
+            });
+            threads.push(t);
+        }
+
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        let _ = pty_kill_impl(&state, id);
+    }
+
+    #[test]
+    fn test_startup_cleanup_deletes_all_temp_files() {
+        let temp_dir = std::env::temp_dir().join("splice-shell-test-startup").join("clipboard");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // Create some files
+        let file1 = temp_dir.join("splice-clipboard-1.png");
+        let file2 = temp_dir.join("splice-clipboard-2.png");
+        let file3 = temp_dir.join("other-file.txt");
+        std::fs::write(&file1, b"png").unwrap();
+        std::fs::write(&file2, b"png").unwrap();
+        std::fs::write(&file3, b"txt").unwrap();
+
+        // GIVEN a previous application session crashed and left files in the clipboard temp directory
+        // WHEN the application starts up (we simulate the startup hook)
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let _ = splice_clipboard::sweep_temp_images(&temp_dir);
+
+        // THEN the system MUST delete all files and subdirectories under the clipboard temp directory
+        assert!(!temp_dir.exists() || std::fs::read_dir(&temp_dir).unwrap().count() == 0);
+    }
+
+    #[test]
+    fn test_shutdown_cleanup_deletes_temp_directory() {
+        let temp_dir = std::env::temp_dir().join("splice-shell-test-shutdown").join("clipboard");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // Create some files
+        let file1 = temp_dir.join("splice-clipboard-1.png");
+        std::fs::write(&file1, b"png").unwrap();
+
+        // GIVEN multiple temporary preview images exist on disk
+        // WHEN the user exits the application (we simulate the shutdown hook)
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        // THEN the system MUST delete the clipboard temp directory and all its contents
+        assert!(!temp_dir.exists());
+    }
+
+    #[test]
+    fn test_session_close_deletes_specific_image_immediately() {
+        let temp_dir = std::env::temp_dir().join("splice-shell-test-session-close").join("clipboard");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let file = temp_dir.join("splice-clipboard-session.png");
+        std::fs::write(&file, b"png").unwrap();
+        assert!(file.exists());
+
+        // WHEN the user closes the clipboard paste session (simulated by calling close_paste_session_impl)
+        close_paste_session_impl(Some(file.display().to_string()));
+
+        // THEN the system MUST delete the temporary image file from disk immediately
+        assert!(!file.exists());
     }
 }

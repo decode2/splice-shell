@@ -31,3 +31,6 @@ yarn-error.log*
 Thumbs.db
 .idea/
 .vscode/
+
+# Local browser/MCP traces
+.playwright-mcp/
