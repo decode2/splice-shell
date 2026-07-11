@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  ackPty,
   interruptPty,
   isPtyOutputPayload,
   killPty,
@@ -23,15 +24,26 @@ describe("ptyClient", () => {
     expect(PTY_OUTPUT_EVENT).toBe("pty-output");
   });
 
-  it("accepts only session-attributed object output payloads", () => {
-    expect(isPtyOutputPayload({ sessionId: 1, data: "hello" })).toBe(true);
-    // A bare string was the OLD payload shape; it must be rejected now.
+  it("accepts only session-attributed output payloads carrying a byte cost", () => {
+    expect(isPtyOutputPayload({ sessionId: 1, bytes: 5, data: "hello" })).toBe(true);
+    // A bare string was the OLDEST payload shape; it must be rejected now.
     expect(isPtyOutputPayload("hello")).toBe(false);
-    expect(isPtyOutputPayload({ data: "hello" })).toBe(false);
-    expect(isPtyOutputPayload({ sessionId: 1 })).toBe(false);
-    expect(isPtyOutputPayload({ sessionId: "1", data: "hello" })).toBe(false);
-    expect(isPtyOutputPayload({ sessionId: 1, data: 2 })).toBe(false);
+    // `bytes` is the credit cost the backend charged for this payload. Without
+    // it the frontend cannot ack the right amount, so a payload missing it is
+    // not a valid payload.
+    expect(isPtyOutputPayload({ sessionId: 1, data: "hello" })).toBe(false);
+    expect(isPtyOutputPayload({ bytes: 5, data: "hello" })).toBe(false);
+    expect(isPtyOutputPayload({ sessionId: 1, bytes: 5 })).toBe(false);
+    expect(isPtyOutputPayload({ sessionId: "1", bytes: 5, data: "hello" })).toBe(false);
+    expect(isPtyOutputPayload({ sessionId: 1, bytes: "5", data: "hello" })).toBe(false);
+    expect(isPtyOutputPayload({ sessionId: 1, bytes: 5, data: 2 })).toBe(false);
     expect(isPtyOutputPayload(null)).toBe(false);
+  });
+
+  it("acks consumed bytes back to the owning session", () => {
+    invokeMock.mockResolvedValue(undefined);
+    void ackPty(5, 262_144);
+    expect(invokeMock).toHaveBeenCalledWith("pty_ack", { sessionId: 5, bytes: 262_144 });
   });
 
   it("forwards the session id when writing to the PTY", () => {

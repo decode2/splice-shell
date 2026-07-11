@@ -13,6 +13,14 @@ export type PtyLaunchCommand = {
 // across concurrent sessions (mirroring the `pty-exit` id payload).
 export type PtyOutputPayload = {
   sessionId: number;
+  // UTF-8 byte cost the backend charged against this session's credit window
+  // for this payload. Echo it back through `ackPty` once xterm has actually
+  // consumed the data, or the window drains and the session stalls.
+  //
+  // Sent by the backend rather than recomputed here on purpose: `data.length`
+  // counts UTF-16 code units, which diverges from Rust's UTF-8 byte accounting
+  // on any non-ASCII output and would silently desynchronise the credit ledger.
+  bytes: number;
   data: string;
 };
 
@@ -21,6 +29,7 @@ export function isPtyOutputPayload(payload: unknown): payload is PtyOutputPayloa
     typeof payload === "object" &&
     payload !== null &&
     typeof (payload as { sessionId?: unknown }).sessionId === "number" &&
+    typeof (payload as { bytes?: unknown }).bytes === "number" &&
     typeof (payload as { data?: unknown }).data === "string"
   );
 }
@@ -75,5 +84,21 @@ export function resizePty(size: { cols: number; rows: number }, sessionId: numbe
 export function killPty(sessionId: number) {
   return invoke<void>("pty_kill", {
     sessionId,
+  });
+}
+
+// Return `bytes` of consumed output to the session's credit window, letting its
+// flusher emit again. This is the ACK half of the credit-based flow control:
+// without it the backend can never learn whether the webview actually consumed
+// what it emitted (Tauri's `emit` is fire-and-forget), and the real backlog just
+// piles up invisibly in the webview's message queue.
+//
+// Safe to call for a session that has already been torn down: the backend treats
+// an unknown id as a no-op, because an xterm write callback legitimately races
+// `pty_kill`.
+export function ackPty(sessionId: number, bytes: number) {
+  return invoke<void>("pty_ack", {
+    sessionId,
+    bytes,
   });
 }

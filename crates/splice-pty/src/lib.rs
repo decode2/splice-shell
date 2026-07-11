@@ -131,6 +131,22 @@ impl PtySession {
         Err(PtyError::UnsupportedPlatform)
     }
 
+    pub fn spawn_with_close_hook<F, G, H>(
+        _program: &str,
+        _args: &[&str],
+        _size: TerminalSize,
+        _on_output: F,
+        _on_exit: G,
+        _on_closing: H,
+    ) -> Result<Self, PtyError>
+    where
+        F: FnMut(u64, String) + Send + 'static,
+        G: FnOnce(u64) + Send + 'static,
+        H: Fn() + Send + Sync + 'static,
+    {
+        Err(PtyError::UnsupportedPlatform)
+    }
+
     pub fn id(&self) -> u64 {
         0
     }
@@ -269,6 +285,24 @@ mod windows_conpty {
         waiter: Mutex<Option<JoinHandle<()>>>,
         // Monotonic id assigned at spawn (see `SESSION_COUNTER`).
         id: u64,
+        // Invoked exactly once, at the very top of `close()`, BEFORE the child
+        // is terminated and long before the reader thread is joined.
+        //
+        // Why this exists: with credit-based flow control the consumer's
+        // `on_output` callback is ALLOWED to block (that is how backpressure
+        // reaches the child — a parked reader stops calling `ReadFile`, the
+        // ConPTY pipe fills, and the child blocks on write). But `close()`
+        // joins the reader thread, so a reader parked inside `on_output` would
+        // wedge `close()`, `kill()` and app shutdown forever. This hook is the
+        // consumer's deterministic chance to release whatever the reader is
+        // parked on (in `splice-shell` it closes the session's credit window,
+        // which makes the flusher exit and drop the channel receiver, which in
+        // turn makes the reader's `send` return `Err`).
+        //
+        // Fired from `close()` only, guarded by the `closing` flag's
+        // false->true transition, so it runs exactly once even though `close()`
+        // is idempotent and also runs from `Drop`.
+        on_closing: Box<dyn Fn() + Send + Sync>,
     }
 
     struct PtySessionInner {
@@ -300,12 +334,35 @@ mod windows_conpty {
             program: &str,
             args: &[&str],
             size: TerminalSize,
-            mut on_output: F,
+            on_output: F,
             on_exit: G,
         ) -> Result<Self, PtyError>
         where
             F: FnMut(u64, String) + Send + 'static,
             G: FnOnce(u64) + Send + 'static,
+        {
+            Self::spawn_with_close_hook(program, args, size, on_output, on_exit, || {})
+        }
+
+        /// Same as [`PtySession::spawn`], plus a teardown hook invoked once at
+        /// the top of [`PtySession::close`] (see `PtySession::on_closing`).
+        ///
+        /// Callers that make `on_output` blocking — which credit-based flow
+        /// control necessarily does — MUST use this constructor and release the
+        /// reader from the hook, otherwise `close()` deadlocks joining a reader
+        /// parked inside `on_output`.
+        pub fn spawn_with_close_hook<F, G, H>(
+            program: &str,
+            args: &[&str],
+            size: TerminalSize,
+            mut on_output: F,
+            on_exit: G,
+            on_closing: H,
+        ) -> Result<Self, PtyError>
+        where
+            F: FnMut(u64, String) + Send + 'static,
+            G: FnOnce(u64) + Send + 'static,
+            H: Fn() + Send + Sync + 'static,
         {
             let handles = spawn_process(program, args, size)?;
             let id = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -378,6 +435,7 @@ mod windows_conpty {
                 closing,
                 waiter: Mutex::new(Some(waiter)),
                 id,
+                on_closing: Box::new(on_closing),
             })
         }
 
@@ -507,7 +565,18 @@ mod windows_conpty {
             // top, before `terminate_process_tree`/`TerminateProcess` and the
             // job drop, otherwise the waiter could wake and fire `on_exit`
             // during teardown.
-            self.closing.store(true, Ordering::SeqCst);
+            //
+            // `swap` (not `store`) so the false->true transition also fires the
+            // teardown hook EXACTLY once, even though `close()` is idempotent
+            // and runs again from `Drop`.
+            if !self.closing.swap(true, Ordering::SeqCst) {
+                // MUST run before the reader join below: with credit-based flow
+                // control the reader can be parked inside a blocking
+                // `on_output`, and this hook is what releases it. Running it
+                // after the join would be too late — the join is the thing that
+                // would never return.
+                (self.on_closing)();
+            }
 
             if let Ok(mut guard) = self.inner.lock() {
                 if let Some(mut inner) = guard.take() {
@@ -1643,6 +1712,82 @@ mod windows_conpty {
                 "grandchild process {} should be terminated by fallback tree termination",
                 grandchild_pid
             );
+        }
+
+        /// DEADLOCK GUARD for credit-based backpressure.
+        ///
+        /// With flow control in place, `on_output` is allowed to BLOCK (that is
+        /// the whole point: a blocked reader stops calling `ReadFile`, the
+        /// ConPTY pipe fills, and the child blocks on write). But `close()`
+        /// joins the reader thread, so a reader parked inside `on_output`
+        /// would wedge `close()` — and therefore `kill()` and app shutdown —
+        /// forever.
+        ///
+        /// `spawn_with_close_hook` exists precisely to break that cycle:
+        /// `close()` invokes the hook BEFORE it joins the reader, giving the
+        /// consumer a deterministic chance to release whatever the reader is
+        /// parked on. Here the reader is parked on a rendezvous `send` that
+        /// nobody will ever receive; the hook drops the receiver, the `send`
+        /// returns `Err`, and the reader can finish.
+        ///
+        /// Timing out (rather than hanging) is deliberate so a regression is a
+        /// red test, not a wedged CI job.
+        #[test]
+        fn close_hook_unblocks_a_reader_parked_inside_on_output() {
+            use std::sync::mpsc::{channel, sync_channel, Receiver};
+            use std::time::Instant;
+
+            // Rendezvous channel: the very first chunk `on_output` hands over
+            // blocks the reader thread until someone receives it. Nobody does.
+            let (tx, rx) = sync_channel::<String>(0);
+            let receiver_slot: Arc<Mutex<Option<Receiver<String>>>> =
+                Arc::new(Mutex::new(Some(rx)));
+            let receiver_for_hook = Arc::clone(&receiver_slot);
+            let parked = Arc::new(AtomicBool::new(false));
+            let parked_for_reader = Arc::clone(&parked);
+
+            let session = PtySession::spawn_with_close_hook(
+                "cmd.exe",
+                &["/D", "/K"],
+                TerminalSize {
+                    columns: 80,
+                    rows: 24,
+                },
+                move |_id, output| {
+                    parked_for_reader.store(true, Ordering::SeqCst);
+                    let _ = tx.send(output);
+                },
+                |_id| {},
+                move || {
+                    // Dropping the receiver makes the parked `send` return Err.
+                    if let Ok(mut slot) = receiver_for_hook.lock() {
+                        drop(slot.take());
+                    }
+                },
+            )
+            .expect("session should spawn");
+
+            // Wait until the reader is genuinely parked inside `on_output`, so
+            // the assertion below proves `close()` unblocked it rather than the
+            // reader never having reached the blocking call.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !parked.load(Ordering::SeqCst) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                parked.load(Ordering::SeqCst),
+                "the shell's first ConPTY output should have reached on_output"
+            );
+
+            let (done_tx, done_rx) = channel::<()>();
+            thread::spawn(move || {
+                session.close();
+                let _ = done_tx.send(());
+            });
+
+            done_rx
+                .recv_timeout(Duration::from_secs(15))
+                .expect("close() must not wedge on a reader parked inside on_output");
         }
 
         #[test]
