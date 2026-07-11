@@ -2,6 +2,10 @@ import { invoke } from "@tauri-apps/api/core";
 
 export const PTY_OUTPUT_EVENT = "pty-output";
 export const PTY_EXIT_EVENT = "pty-exit";
+// Carries a session's flow-control stall state (output backed up, waiting on the
+// renderer). Distinct from `pty-exit`: the session is alive and correctly
+// throttled, not dead — the frontend surfaces it as a "stalled" tab health.
+export const PTY_STALL_EVENT = "pty-stall";
 
 export type PtyLaunchCommand = {
   program: string;
@@ -39,6 +43,23 @@ export function isPtyOutputPayload(payload: unknown): payload is PtyOutputPayloa
 // ignore stale exits from already-superseded sessions.
 export function isPtyExitPayload(payload: unknown): payload is number {
   return typeof payload === "number";
+}
+
+// The backend `pty-stall` event carries the session id whose output has backed
+// up plus whether it is currently stalled (true) or has recovered (false). The
+// frontend demultiplexes by session id, like `pty-output`/`pty-exit`.
+export type PtyStallPayload = {
+  sessionId: number;
+  stalled: boolean;
+};
+
+export function isPtyStallPayload(payload: unknown): payload is PtyStallPayload {
+  return (
+    typeof payload === "object" &&
+    payload !== null &&
+    typeof (payload as { sessionId?: unknown }).sessionId === "number" &&
+    typeof (payload as { stalled?: unknown }).stalled === "boolean"
+  );
 }
 
 // Resolves to the newly spawned session's monotonic id, which the caller

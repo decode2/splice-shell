@@ -3,9 +3,15 @@ import { getWindowChrome, type WindowChrome } from "../window/windowChrome";
 import { TabStrip } from "./TabStrip";
 import type { TabState } from "./useSessions";
 
-// Session health drives each tab's health dot. It is deliberately three-state —
-// the dot speaks ONLY when not "healthy". Kept here as the shared health type.
-export type SessionHealth = "healthy" | "reconnecting" | "failed";
+// Session health drives each tab's health dot. The dot speaks ONLY when not
+// "healthy". Kept here as the shared health type.
+//   - reconnecting: the session died and a restart is in flight.
+//   - failed:       the restart-storm cap gave up.
+//   - stalled:      the session is ALIVE but its output has backed up, waiting
+//                   on the renderer (flow-control backpressure). Distinct from
+//                   reconnecting/failed so a frozen-but-healthy terminal is not
+//                   silent; it returns to healthy the moment output flows again.
+export type SessionHealth = "healthy" | "reconnecting" | "failed" | "stalled";
 
 type TitleBarProps = {
   tabs: TabState[];

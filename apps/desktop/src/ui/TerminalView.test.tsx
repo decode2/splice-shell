@@ -2,7 +2,7 @@
 import React from "react";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { PTY_EXIT_EVENT, PTY_OUTPUT_EVENT } from "../terminal/ptyClient";
+import { PTY_EXIT_EVENT, PTY_OUTPUT_EVENT, PTY_STALL_EVENT } from "../terminal/ptyClient";
 import { TerminalView } from "./TerminalView";
 
 // jsdom does not implement requestAnimationFrame. TerminalView's output scheduler
@@ -156,6 +156,7 @@ vi.mock("@xterm/addon-webgl", () => {
 
 let capturedOutputHandlers: PtyEventHandler[] = [];
 let capturedExitHandlers: PtyEventHandler[] = [];
+let capturedStallHandlers: PtyEventHandler[] = [];
 let nextSpawnId = 0;
 
 function getInvokeCallsFor(command: string) {
@@ -191,6 +192,20 @@ function emitPtyOutput(sessionId: number, data: string) {
   });
 }
 
+// Emits a `pty-stall` event carrying the session's flow-control stall state, as
+// the backend flusher pushes when a session crosses (or clears) the stall
+// threshold.
+function emitPtyStall(sessionId: number, stalled: boolean) {
+  const stallHandler = capturedStallHandlers.at(-1);
+  act(() => {
+    stallHandler?.({
+      event: PTY_STALL_EVENT,
+      id: 0,
+      payload: { sessionId, stalled },
+    });
+  });
+}
+
 // Concatenates every string written to the terminal, so order-sensitive
 // assertions can check that early-output chunks were flushed in arrival order
 // even after the scheduler coalesces adjacent plain-text writes.
@@ -211,6 +226,7 @@ async function flushAsync() {
 beforeEach(() => {
   capturedOutputHandlers = [];
   capturedExitHandlers = [];
+  capturedStallHandlers = [];
   nextSpawnId = 0;
 
   mocks.invoke.mockReset();
@@ -226,6 +242,8 @@ beforeEach(() => {
   mocks.listen.mockImplementation((event, handler) => {
     if (event === PTY_EXIT_EVENT) {
       capturedExitHandlers.push(handler);
+    } else if (event === PTY_STALL_EVENT) {
+      capturedStallHandlers.push(handler);
     } else {
       capturedOutputHandlers.push(handler);
     }
@@ -319,9 +337,9 @@ describe("TerminalView PTY lifecycle", () => {
     expect(getInvokeCallsFor("pty_read")).toHaveLength(0);
 
     expect(getInvokeCallsFor("pty_kill")).toHaveLength(1);
-    // Two listeners are registered (pty-output and pty-exit); both are torn
-    // down on unmount.
-    expect(mocks.unlisten).toHaveBeenCalledTimes(2);
+    // Three listeners are registered (pty-output, pty-exit, pty-stall); all
+    // three are torn down on unmount.
+    expect(mocks.unlisten).toHaveBeenCalledTimes(3);
     expect(mocks.terminalDispose).toHaveBeenCalledTimes(1);
     expect(mocks.fitAddonDispose).toHaveBeenCalledTimes(1);
   });
@@ -340,9 +358,9 @@ describe("TerminalView PTY lifecycle", () => {
       expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
     });
 
-    // Two listeners (pty-output + pty-exit) registered per mount; StrictMode
-    // mounts twice in development, so listen is called four times.
-    expect(mocks.listen).toHaveBeenCalledTimes(4);
+    // Three listeners (pty-output + pty-exit + pty-stall) registered per mount;
+    // StrictMode mounts twice in development, so listen is called six times.
+    expect(mocks.listen).toHaveBeenCalledTimes(6);
 
     act(() => {
       unmount();
@@ -1049,6 +1067,43 @@ describe("TerminalView title bar extraction", () => {
     // A successful startPty settling proves the session booted; the health
     // signal reports "healthy" so the title bar dot stays quiet.
     expect(onSessionHealth.mock.calls.map(([status]) => status)).toContain("healthy");
+  });
+
+  it("reports stalled on a pty-stall event and returns to healthy when it clears", async () => {
+    const onSessionHealth = vi.fn<(status: string) => void>();
+    render(<TerminalView onSessionHealth={onSessionHealth} />);
+
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
+    });
+    await flushAsync();
+
+    // A stall for the live session must surface as a distinct "stalled" health,
+    // so a frozen terminal is never silent.
+    emitPtyStall(1, true);
+    expect(onSessionHealth.mock.calls.map(([status]) => status)).toContain("stalled");
+
+    // When credit flows again the backend clears the stall; the tab returns to
+    // healthy rather than staying stuck on the stalled dot.
+    onSessionHealth.mockClear();
+    emitPtyStall(1, false);
+    expect(onSessionHealth.mock.calls.map(([status]) => status)).toContain("healthy");
+  });
+
+  it("ignores a pty-stall event for a foreign session id", async () => {
+    const onSessionHealth = vi.fn<(status: string) => void>();
+    render(<TerminalView onSessionHealth={onSessionHealth} />);
+
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
+    });
+    await flushAsync();
+    onSessionHealth.mockClear();
+
+    // A sibling tab's stall (id 99, not this view's session 1) must never mark
+    // this tab stalled.
+    emitPtyStall(99, true);
+    expect(onSessionHealth.mock.calls.map(([status]) => status)).not.toContain("stalled");
   });
 });
 

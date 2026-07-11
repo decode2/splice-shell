@@ -288,8 +288,19 @@ body {
   box-shadow: 0 0 6px rgba(244, 63, 94, 0.55);
 }
 
+/* Stalled: the session is ALIVE but its output has backed up waiting on the
+   renderer. A hollow amber ring (not the solid amber of an in-flight restart)
+   with a slow pulse reads as "throttled, not dead" — distinct from
+   reconnecting/failed. */
+.tabstrip-dot--stalled {
+  background: transparent;
+  border: 1.5px solid var(--tb-amber);
+  animation: titlebar-health-pulse 2s ease-in-out infinite;
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .tabstrip-dot--reconnecting {
+  .tabstrip-dot--reconnecting,
+  .tabstrip-dot--stalled {
     animation: none;
   }
 }

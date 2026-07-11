@@ -3,8 +3,10 @@ import {
   ackPty,
   interruptPty,
   isPtyOutputPayload,
+  isPtyStallPayload,
   killPty,
   PTY_OUTPUT_EVENT,
+  PTY_STALL_EVENT,
   resizePty,
   writePty,
 } from "./ptyClient";
@@ -38,6 +40,22 @@ describe("ptyClient", () => {
     expect(isPtyOutputPayload({ sessionId: 1, bytes: "5", data: "hello" })).toBe(false);
     expect(isPtyOutputPayload({ sessionId: 1, bytes: 5, data: 2 })).toBe(false);
     expect(isPtyOutputPayload(null)).toBe(false);
+  });
+
+  it("uses a stable stall event name", () => {
+    expect(PTY_STALL_EVENT).toBe("pty-stall");
+  });
+
+  it("accepts only session-attributed stall payloads carrying a boolean flag", () => {
+    expect(isPtyStallPayload({ sessionId: 1, stalled: true })).toBe(true);
+    expect(isPtyStallPayload({ sessionId: 1, stalled: false })).toBe(true);
+    // A bare number is the `pty-exit` shape, not a stall payload.
+    expect(isPtyStallPayload(3)).toBe(false);
+    expect(isPtyStallPayload({ sessionId: 1 })).toBe(false);
+    expect(isPtyStallPayload({ stalled: true })).toBe(false);
+    expect(isPtyStallPayload({ sessionId: "1", stalled: true })).toBe(false);
+    expect(isPtyStallPayload({ sessionId: 1, stalled: "true" })).toBe(false);
+    expect(isPtyStallPayload(null)).toBe(false);
   });
 
   it("acks consumed bytes back to the owning session", () => {
