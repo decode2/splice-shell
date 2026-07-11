@@ -81,3 +81,38 @@ Coverage analysis skipped — no coverage tool detected.
 
 ## 9. Verdict
 **PASS**
+
+---
+
+## 10. Correction / Superseded Note (appended later)
+
+> **This section corrects Section 9 and the Task 2.2 evidence. The original PASS
+> for the memory-bound / freeze claim was premature. History is preserved above;
+> this note supersedes it rather than rewriting it.**
+
+**What the original report got wrong.** The report credits the freeze/memory-leak
+fix to the 16ms throttled PTY output buffer (Task 2.2, `run_flusher_loop`). A
+16ms throttle only *coalesces* bursts of output into fewer, larger flushes — it
+bounds flush *frequency*, not the amount of buffered data. Under sustained
+high-volume output the buffer (and the downstream queue) can still grow without
+limit, so the throttle alone never bounded memory and never fixed the freeze. The
+report's PASS overstates what the throttle achieved.
+
+**What actually fixed the freeze.** The freeze was fixed later by **credit-based
+backpressure** (commit `d55bf49`, PR #14), which caps in-flight PTY output and
+stops reading until the consumer acknowledges — this is the mechanism that
+actually bounds memory. It was verified in the real GUI, not just unit tests.
+This report predates that work and never mentions credit or backpressure. A
+follow-up hardened the observability gap it exposed — the **silent-hang /
+observability** work (PR #15, surfacing stalled sessions in tab health) — and the
+credit/ack liveness invariant was later enforced at compile time (commit
+`27b0029`, PR #16).
+
+**Corrected status of the freeze/memory-bound claim:** the throttle (Task 2.2) is
+a latency/coalescing optimization and remains valid as such, but it is **not** the
+freeze fix and does **not** bound memory. Treat the memory-bound/freeze guarantee
+as delivered by PR #14 (+ PR #15/#16), not by this report.
+
+**Scope note.** This change directory contains only this `verify-report` file; no
+sibling `apply-progress.md` or other artifacts were present to check for the same
+overclaim.
