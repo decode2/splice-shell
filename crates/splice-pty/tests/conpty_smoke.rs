@@ -178,8 +178,8 @@ fn live_pty_ctrl_c_interrupts_command_without_closing_shell() {
         .expect("long-running command should start");
     std::thread::sleep(Duration::from_millis(500));
     session
-        .write("\x03")
-        .expect("Ctrl+C should be accepted by the PTY");
+        .interrupt()
+        .expect("Ctrl+C interrupt should be accepted by the PTY");
     std::thread::sleep(Duration::from_millis(500));
     session
         .write("echo splice-after-interrupt\r\nexit\r\n")
