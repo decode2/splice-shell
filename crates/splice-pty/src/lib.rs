@@ -217,8 +217,9 @@ mod windows_conpty {
             System::{
                 Console::{
                     AttachConsole, ClosePseudoConsole, CreatePseudoConsole, FreeConsole,
-                    GenerateConsoleCtrlEvent, ResizePseudoConsole, SetConsoleCtrlHandler, COORD,
-                    CTRL_C_EVENT, HPCON,
+                    GenerateConsoleCtrlEvent, GetStdHandle, ResizePseudoConsole,
+                    SetConsoleCtrlHandler, SetStdHandle, COORD, CTRL_C_EVENT, HPCON,
+                    STD_ERROR_HANDLE, STD_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
                 },
                 Diagnostics::ToolHelp::{
                     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
@@ -235,9 +236,8 @@ mod windows_conpty {
                     InitializeProcThreadAttributeList, ResumeThread, TerminateProcess,
                     UpdateProcThreadAttribute, WaitForSingleObject, CREATE_BREAKAWAY_FROM_JOB,
                     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
-                    INFINITE, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
-                    PROCESS_TERMINATE, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTF_USESTDHANDLES,
-                    STARTUPINFOEXW,
+                    INFINITE, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, PROCESS_TERMINATE,
+                    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTF_USESTDHANDLES, STARTUPINFOEXW,
                 },
             },
         },
@@ -426,6 +426,27 @@ mod windows_conpty {
             let input_result = write_all(input_write.raw(), b"\x03");
             let signal_result = send_console_interrupt(root_process_id);
 
+            // Either leg succeeding is still a usable interrupt, and that is
+            // deliberate: a raw-mode TUI (Claude, Codex, ...) reads the `\x03`
+            // byte from stdin itself and never needs a console signal, while a
+            // console application (`cmd.exe` running `ping -t`) only reacts to
+            // CTRL_C_EVENT and ignores the byte entirely. Keep those semantics.
+            //
+            // But the console-signal leg must NEVER fail invisibly. The pipe
+            // write practically always succeeds, so folding a failed signal
+            // into a bare `Ok(())` made `interrupt()` report success while
+            // doing nothing at all -- which is precisely how a broken
+            // `send_console_interrupt` (missing `FreeConsole`, so `AttachConsole`
+            // returned ERROR_ACCESS_DENIED on every call) shipped unnoticed.
+            // Surface it so a persistent console-signal failure is observable.
+            if let Err(ref error) = signal_result {
+                eprintln!(
+                    "splice-pty: console interrupt signal failed for root pid {root_process_id}: \
+                     {error}; only the raw \\x03 byte was delivered, so console applications will \
+                     not be interrupted"
+                );
+            }
+
             match (input_result, signal_result) {
                 (Ok(()), _) | (_, Ok(())) => Ok(()),
                 (Err(error), Err(_)) => Err(error),
@@ -547,34 +568,145 @@ mod windows_conpty {
         }
     }
 
+    /// Serializes every mutation of this process's console state: the whole
+    /// attach -> signal -> detach sequence in `send_console_interrupt`, and the
+    /// `SetConsoleCtrlHandler` + `CreateProcessW` pair in `spawn_process`.
+    ///
+    /// `FreeConsole`, `AttachConsole` and `SetConsoleCtrlHandler` all mutate
+    /// PROCESS-WIDE state: a process is attached to at most one console, and it
+    /// has exactly one Ctrl-handler setting. The app runs several PTY sessions
+    /// at once (tabs), so without this lock:
+    ///
+    /// - Two concurrent `interrupt()` calls interleave destructively: thread A's
+    ///   `ConsoleSignalGuard` detaches the console thread B just attached to (so
+    ///   B signals nothing, or signals the wrong console), or A restores Ctrl+C
+    ///   handling while B's `CTRL_C_EVENT` is still in flight, which delivers B's
+    ///   event to *this* process and kills the app.
+    /// - An `interrupt()` racing a `spawn()` is worse still: `send_console_interrupt`
+    ///   sets "ignore Ctrl+C" for the duration of its signal, and that attribute is
+    ///   INHERITED at `CreateProcess` time -- so a shell spawned inside that window
+    ///   would be permanently un-interruptible.
+    static CONSOLE_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Acquires [`CONSOLE_LOCK`], recovering from poisoning rather than
+    /// propagating it.
+    ///
+    /// The guarded value is `()`: there is no invariant a panicking holder could
+    /// have left half-updated, because every console mutation is undone by an
+    /// RAII guard that also runs during unwind. Propagating the poison would
+    /// instead make Ctrl+C — and, worse, `spawn` — permanently unusable for the
+    /// rest of the process's life after a single unrelated panic.
+    fn lock_console() -> std::sync::MutexGuard<'static, ()> {
+        CONSOLE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn send_console_interrupt(process_id: u32) -> Result<(), PtyError> {
+        let _console_lock = lock_console();
+
+        // `AttachConsole` can rebind this process's STD_INPUT/OUTPUT/ERROR to
+        // the console it attaches to. Those handles die when we detach again a
+        // few lines later, which would silently break the caller's own stdout
+        // and stderr (the Tauri dev console, the cargo test harness, the
+        // `eprintln!` diagnostic in `interrupt()` itself). Snapshot them here
+        // and restore them on the way out, on every path including failure.
+        let _std_handles = StdHandlesGuard::capture();
+
         unsafe {
+            // ROOT CAUSE OF THE Ctrl+C BUG: a process can be attached to at
+            // most one console, and the caller is normally already attached to
+            // its own (the debug/dev Tauri build and the cargo test harness are
+            // console-subsystem binaries; a release GUI build is not, thanks to
+            // the `windows_subsystem = "windows"` attribute in main.rs). Without
+            // detaching first, `AttachConsole` below returns ERROR_ACCESS_DENIED
+            // (0x80070005) every single time and no CTRL_C_EVENT is ever sent.
+            //
+            // `FreeConsole` when no console is attached fails harmlessly with
+            // ERROR_INVALID_HANDLE -- that is the expected result in the release
+            // GUI build -- so its error is deliberately discarded.
+            let _ = FreeConsole();
+
             AttachConsole(process_id)?;
-            let _console_guard = AttachedConsoleGuard;
-            SetConsoleCtrlHandler(None, true)?;
-            let _handler_guard = ConsoleCtrlHandlerGuard;
+
+            // Ignore Ctrl+C in *this* process before generating the event.
+            // `CTRL_C_EVENT` cannot be scoped to a process group (Win32 ignores
+            // a non-zero group id for it), so it necessarily goes to EVERY
+            // process attached to the console -- and we are now one of them.
+            // Without this the app kills itself with the signal it just raised.
+            //
+            // Installed before the guard so that a failure here still runs the
+            // guard's `FreeConsole` (we are already attached at this point);
+            // the guard's handler-restore is a harmless no-op if this failed.
+            let handler_result = SetConsoleCtrlHandler(None, true);
+            let _console_guard = ConsoleSignalGuard;
+            handler_result?;
+
             GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0)?;
         }
 
         Ok(())
     }
 
-    struct AttachedConsoleGuard;
+    /// How long to let an in-flight `CTRL_C_EVENT` land before this process
+    /// stops ignoring Ctrl+C again. See `ConsoleSignalGuard::drop`.
+    const CTRL_EVENT_SETTLE: Duration = Duration::from_millis(50);
 
-    impl Drop for AttachedConsoleGuard {
+    /// Undoes, in the only safe order, the two process-global console mutations
+    /// `send_console_interrupt` makes.
+    ///
+    /// Order is load-bearing and was found the hard way: restoring the Ctrl+C
+    /// handler while still attached to the child's console terminates THIS
+    /// process with STATUS_CONTROL_C_EXIT. `GenerateConsoleCtrlEvent` delivers
+    /// asynchronously (conhost raises the event in each attached client), so
+    /// the event we raised is typically still in flight when the call returns.
+    /// Clearing the ignore flag at that moment hands our own copy of the event
+    /// to the default handler, which kills us.
+    ///
+    /// So: detach from the console first, then let any already-dispatched event
+    /// settle, and only then restore the handler. Detaching alone is not
+    /// enough, because a `CtrlRoutine` thread may already have been created in
+    /// this process before the detach; the ignore flag must still be set when
+    /// that thread runs. The two steps together close the window.
+    struct ConsoleSignalGuard;
+
+    impl Drop for ConsoleSignalGuard {
         fn drop(&mut self) {
             unsafe {
                 let _ = FreeConsole();
             }
+            thread::sleep(CTRL_EVENT_SETTLE);
+            unsafe {
+                let _ = SetConsoleCtrlHandler(None, false);
+            }
         }
     }
 
-    struct ConsoleCtrlHandlerGuard;
+    /// Saves and restores this process's standard handles around the console
+    /// attach/detach dance in `send_console_interrupt`. See the call site for
+    /// why that is necessary.
+    struct StdHandlesGuard([(STD_HANDLE, Option<HANDLE>); 3]);
 
-    impl Drop for ConsoleCtrlHandlerGuard {
+    impl StdHandlesGuard {
+        fn capture() -> Self {
+            let capture_one = |which: STD_HANDLE| (which, unsafe { GetStdHandle(which) }.ok());
+
+            Self([
+                capture_one(STD_INPUT_HANDLE),
+                capture_one(STD_OUTPUT_HANDLE),
+                capture_one(STD_ERROR_HANDLE),
+            ])
+        }
+    }
+
+    impl Drop for StdHandlesGuard {
         fn drop(&mut self) {
-            unsafe {
-                let _ = SetConsoleCtrlHandler(None, false);
+            for (which, handle) in self.0 {
+                if let Some(handle) = handle {
+                    unsafe {
+                        let _ = SetStdHandle(which, handle);
+                    }
+                }
             }
         }
     }
@@ -710,6 +842,29 @@ mod windows_conpty {
         let mut attribute_list = ProcThreadAttributeList::new(conpty.0)?;
         let startup_info = attribute_list.startup_info_mut();
         let mut process_info = PROCESS_INFORMATION::default();
+
+        // Guarantee the child inherits "process Ctrl+C normally".
+        //
+        // The ignore-Ctrl+C attribute toggled by `SetConsoleCtrlHandler(NULL, ...)`
+        // is INHERITED by child processes at `CreateProcess` time. So if this
+        // process was itself started with Ctrl+C disabled -- which is exactly what
+        // `CREATE_NEW_PROCESS_GROUP` does, and what CI runners, task launchers and
+        // "detached" process spawners routinely use -- then every shell this PTY
+        // spawns, and every command that shell runs, silently inherits "ignore
+        // Ctrl+C". Both interrupt legs then *appear* to work (the `\x03` byte is
+        // written, `GenerateConsoleCtrlEvent` returns `Ok`) while no console client
+        // ever reacts. Clearing the flag here makes an interruptible child an
+        // invariant of `spawn`, independent of how the host app was launched.
+        //
+        // Held under `CONSOLE_LOCK` across the `CreateProcessW` calls below because
+        // `send_console_interrupt` flips this same process-global flag to `true` for
+        // the duration of its signal: a spawn racing an interrupt would otherwise
+        // hand a brand-new child the "ignore Ctrl+C" attribute permanently.
+        let console_lock = lock_console();
+        unsafe {
+            let _ = SetConsoleCtrlHandler(None, false);
+        }
+
         let mut create_result = unsafe {
             CreateProcessW(
                 None,
@@ -735,7 +890,8 @@ mod windows_conpty {
         };
 
         if let Err(ref e) = create_result {
-            if e.code().0 == -2147024891 { // 0x80070005 as i32 (Access is denied)
+            if e.code().0 == -2147024891 {
+                // 0x80070005 as i32 (Access is denied)
                 create_result = unsafe {
                     CreateProcessW(
                         None,
@@ -754,8 +910,8 @@ mod windows_conpty {
                 };
             }
         }
+        drop(console_lock);
         create_result?;
-
 
         let process = OwnedHandle::new(process_info.hProcess);
         let process_thread = OwnedHandle::new(process_info.hThread);
@@ -1309,6 +1465,106 @@ mod windows_conpty {
             assert_eq!(CREATE_BREAKAWAY_FROM_JOB.0, 0x01000000);
         }
 
+        /// Root-cause regression guard: the CONSOLE-SIGNAL leg of `interrupt()`,
+        /// exercised in isolation, must actually terminate a running console
+        /// command.
+        ///
+        /// Why this exists and why the end-to-end test in `tests/conpty_smoke.rs`
+        /// is NOT sufficient on its own: `interrupt()` fires two independent legs
+        /// (a raw `\x03` byte into the ConPTY input pipe, and a real
+        /// `CTRL_C_EVENT` raised on the child's console) and deliberately reports
+        /// success if EITHER works. The end-to-end test can only observe the
+        /// combined outcome, so it stays green whenever *some* leg happens to
+        /// work -- which is precisely how a completely dead console-signal leg
+        /// shipped unnoticed. This test calls `send_console_interrupt` and
+        /// NOTHING else: no `\x03` is written, so a regression in the signal path
+        /// cannot be masked by the other leg.
+        ///
+        /// It pins both real defects that were found here:
+        ///   1. Missing `FreeConsole()` before `AttachConsole()`, which made every
+        ///      attach fail with ERROR_ACCESS_DENIED (this binary, like the Tauri
+        ///      dev build, is already attached to its own console).
+        ///   2. The inherited ignore-Ctrl+C attribute: children spawned by a host
+        ///      whose own Ctrl+C is disabled inherit "ignore Ctrl+C", so the event
+        ///      is raised successfully and then discarded by every console client.
+        ///
+        /// Note that (2) is invisible to a mere `result.is_ok()` assertion --
+        /// `GenerateConsoleCtrlEvent` returns `Ok` either way. Only asserting that
+        /// the child process is actually GONE catches it, which is why this test
+        /// checks the effect on a real `ping -t` rather than the return value.
+        #[test]
+        fn console_signal_leg_alone_terminates_a_running_console_command() {
+            let session = PtySession::spawn(
+                "cmd.exe",
+                &["/D", "/K"],
+                TerminalSize {
+                    columns: 80,
+                    rows: 24,
+                },
+                |_id, _output| {},
+                |_id| {},
+            )
+            .expect("should spawn PtySession");
+
+            let root_process_id = {
+                let guard = session.inner.lock().expect("session lock should be held");
+                guard
+                    .as_ref()
+                    .expect("session should still be open")
+                    .root_process_id
+            };
+
+            session
+                .write("ping -t 127.0.0.1\r\n")
+                .expect("long-running console command should start");
+
+            // Wait for the real `ping.exe` grandchild to exist, so the assertion
+            // below proves the signal killed it rather than it never having run.
+            let mut ping_process_id = None;
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while ping_process_id.is_none() && std::time::Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(100));
+                let snapshot = process_snapshot().expect("process snapshot should be readable");
+                ping_process_id = descendants_of(root_process_id, &snapshot)
+                    .iter()
+                    .find(|process| process.name.to_ascii_uppercase().starts_with("PING"))
+                    .map(|process| process.process_id);
+            }
+            let ping_process_id =
+                ping_process_id.expect("`ping -t` should be running before the interrupt is sent");
+
+            // The leg under test, and only it.
+            let signal_result = send_console_interrupt(root_process_id);
+
+            let mut ping_is_alive = true;
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while ping_is_alive && std::time::Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(100));
+                ping_is_alive = process_snapshot()
+                    .expect("process snapshot should be readable")
+                    .iter()
+                    .any(|process| process.process_id == ping_process_id);
+            }
+
+            let shell_survived = session.is_running().unwrap_or(false);
+
+            session.close();
+
+            signal_result.expect("the console-signal leg must not fail");
+            assert!(
+                !ping_is_alive,
+                "the console-signal leg alone must terminate the running command: \
+                 CTRL_C_EVENT was raised successfully on the child's console, yet ping.exe \
+                 (pid {ping_process_id}) is still running. The signal is being ignored -- \
+                 most likely the PTY child inherited the ignore-Ctrl+C attribute from this \
+                 process (see the SetConsoleCtrlHandler call in spawn_process)"
+            );
+            assert!(
+                shell_survived,
+                "Ctrl+C must interrupt only the running command; the shell itself must survive"
+            );
+        }
+
         #[test]
         fn test_fallback_tree_termination_when_job_is_none() {
             use std::sync::mpsc;
@@ -1319,7 +1575,10 @@ mod windows_conpty {
             let session = PtySession::spawn(
                 "cmd.exe",
                 &["/D", "/C", "ping -t 127.0.0.1 >NUL"],
-                TerminalSize { columns: 80, rows: 24 },
+                TerminalSize {
+                    columns: 80,
+                    rows: 24,
+                },
                 move |_id, out| {
                     let _ = tx.send(out);
                 },
@@ -1339,7 +1598,9 @@ mod windows_conpty {
 
             let snapshot = process_snapshot().expect("should take process snapshot");
             let descendants = descendants_of(root_pid, &snapshot);
-            let grandchild = descendants.iter().find(|p| p.name.to_lowercase().contains("ping"));
+            let grandchild = descendants
+                .iter()
+                .find(|p| p.name.to_lowercase().contains("ping"));
 
             assert!(
                 grandchild.is_some(),
@@ -1377,7 +1638,11 @@ mod windows_conpty {
                 thread::sleep(Duration::from_millis(100));
             }
 
-            assert!(!alive_after, "grandchild process {} should be terminated by fallback tree termination", grandchild_pid);
+            assert!(
+                !alive_after,
+                "grandchild process {} should be terminated by fallback tree termination",
+                grandchild_pid
+            );
         }
 
         #[test]
@@ -1475,15 +1740,6 @@ mod windows_conpty {
             assert_eq!(incomplete_utf8_tail_len(&[b'a', 0x80]), 0);
             // An invalid lead byte is left for lossy decoding, not held back.
             assert_eq!(incomplete_utf8_tail_len(&[0xFF]), 0);
-        }
-
-        #[test]
-        fn temp_query_engram() {
-            let status = std::process::Command::new("python")
-                .arg(r"C:\Users\devel\.gemini\antigravity-cli\brain\b7aed5d3-9de4-40f6-a3b5-cb883620dd23\scratch\save_report_to_engram.py")
-                .status()
-                .unwrap();
-            assert!(status.success());
         }
     }
 }
