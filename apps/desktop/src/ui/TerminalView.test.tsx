@@ -171,12 +171,23 @@ function emitPtyExit(sessionId: number) {
   });
 }
 
+// The UTF-8 byte cost the backend charges against a session's credit window for
+// a payload — Rust's `str::len()`, NOT JS's UTF-16 `String.length`.
+function utf8Bytes(data: string) {
+  return new TextEncoder().encode(data).length;
+}
+
 // Emits a `pty-output` event carrying the session-attributed payload the
-// backend now sends: `{ sessionId, data }`.
+// backend now sends: `{ sessionId, bytes, data }`. `bytes` is the credit cost
+// the frontend must ack back once xterm has consumed the data.
 function emitPtyOutput(sessionId: number, data: string) {
   const outputHandler = capturedOutputHandlers.at(-1);
   act(() => {
-    outputHandler?.({ event: PTY_OUTPUT_EVENT, id: 0, payload: { sessionId, data } });
+    outputHandler?.({
+      event: PTY_OUTPUT_EVENT,
+      id: 0,
+      payload: { sessionId, bytes: utf8Bytes(data), data },
+    });
   });
 }
 
@@ -287,7 +298,11 @@ describe("TerminalView PTY lifecycle", () => {
       outputHandler?.({
         event: PTY_OUTPUT_EVENT,
         id: 1,
-        payload: { sessionId: 1, data: "hello from the shell\r\n" },
+        payload: {
+          sessionId: 1,
+          bytes: utf8Bytes("hello from the shell\r\n"),
+          data: "hello from the shell\r\n",
+        },
       });
     });
 
@@ -376,7 +391,11 @@ describe("TerminalView pty-exit driven restart", () => {
       outputHandler?.({
         event: PTY_OUTPUT_EVENT,
         id: 1,
-        payload: { sessionId: 1, data: "\x1b[?25l\x1b[K" },
+        payload: {
+          sessionId: 1,
+          bytes: utf8Bytes("\x1b[?25l\x1b[K"),
+          data: "\x1b[?25l\x1b[K",
+        },
       });
     });
     await flushAsync();
@@ -526,7 +545,11 @@ describe("TerminalView pty-exit driven restart", () => {
           outputHandler?.({
             event: PTY_OUTPUT_EVENT,
             id: lastSpawnCount,
-            payload: { sessionId: lastSpawnCount, data: "boot banner\r\n" },
+            payload: {
+              sessionId: lastSpawnCount,
+              bytes: utf8Bytes("boot banner\r\n"),
+              data: "boot banner\r\n",
+            },
           });
         });
         emitPtyExit(lastSpawnCount);
@@ -666,7 +689,11 @@ describe("TerminalView pty-exit driven restart", () => {
       outputHandler?.({
         event: PTY_OUTPUT_EVENT,
         id: 1,
-        payload: { sessionId: 1, data: "\x1b[?25l frame \x1b[?25h" },
+        payload: {
+          sessionId: 1,
+          bytes: utf8Bytes("\x1b[?25l frame \x1b[?25h"),
+          data: "\x1b[?25l frame \x1b[?25h",
+        },
       });
     });
     await flushAsync();
@@ -691,6 +718,56 @@ describe("TerminalView pty-exit driven restart", () => {
     // NOT fire a second, stranded deferred emission after the component is gone.
     await new Promise((resolve) => setTimeout(resolve, 250));
     expect(showWrites()).toBe(releasedAtTeardown);
+  });
+});
+
+describe("TerminalView credit acking", () => {
+  // End-to-end guard on the ACK half of the flow-control loop: payload ->
+  // filter -> scheduler -> xterm.write -> consumption callback -> pty_ack.
+  // If this wiring breaks, the backend's credit window drains, its flusher
+  // stops emitting, the bounded channel fills and the CHILD PROCESS BLOCKS
+  // forever — a hang, not a visible error. So it gets its own test.
+  it("acks consumed bytes back to the owning session once the threshold is crossed", async () => {
+    render(<TerminalView />);
+
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
+    });
+    await waitFor(() => {
+      expect(capturedOutputHandlers.length).toBeGreaterThan(0);
+    });
+
+    // One payload past the 256 KiB ack threshold, so exactly one ack is due.
+    const flood = "x".repeat(300_000);
+    emitPtyOutput(1, flood);
+
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_ack")).toHaveLength(1);
+    });
+    expect(getInvokeCallsFor("pty_ack")[0][1]).toEqual({
+      sessionId: 1,
+      bytes: 300_000,
+    });
+  });
+
+  it("does not ack a small burst one chunk at a time", async () => {
+    render(<TerminalView />);
+
+    await waitFor(() => {
+      expect(getInvokeCallsFor("pty_spawn")).toHaveLength(1);
+    });
+    await waitFor(() => {
+      expect(capturedOutputHandlers.length).toBeGreaterThan(0);
+    });
+
+    // Ten ordinary chunks, nowhere near the threshold. Acking per chunk would
+    // trade an unbounded buffer for an IPC storm, which is not a fix.
+    for (let index = 0; index < 10; index += 1) {
+      emitPtyOutput(1, `line ${index}\r\n`);
+    }
+    await flushAsync();
+
+    expect(getInvokeCallsFor("pty_ack")).toHaveLength(0);
   });
 });
 

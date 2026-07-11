@@ -5,13 +5,162 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     process::Command,
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
 };
 use tauri::{Emitter, Manager, State};
 
 const PTY_OUTPUT_EVENT: &str = "pty-output";
 const PTY_EXIT_EVENT: &str = "pty-exit";
 
+/// Bytes of PTY output a session may have "in flight" — emitted to the webview
+/// but not yet acknowledged as consumed by xterm — before the flusher stops
+/// emitting and backpressure engages.
+///
+/// Why 1 MiB:
+///   * The flusher coalesces on a ~16 ms cadence, so a 1 MiB window lets a
+///     session sustain ~60 MB/s before the brake can ever engage. Real ConPTY
+///     output tops out well below that, so the window is invisible to normal
+///     work (a `cargo build`'s few hundred KB of output never touches it) and
+///     only bites when xterm genuinely cannot keep up — which is exactly when
+///     slowing the child is the correct behavior.
+///   * It bounds the previously UNBOUNDED backlog hiding in the webview's
+///     message queue after a fire-and-forget `emit`. Worst case in-flight
+///     memory is now ~1 MiB of unacked output plus the bounded channel below,
+///     instead of "however much the child produced while minimized".
+///   * It is large enough that the JS-side ack threshold (1/4 window = 256 KiB)
+///     keeps IPC chatter to a handful of `pty_ack` calls per megabyte.
+///
+/// LIVENESS INVARIANT: the JS ack threshold MUST stay strictly below this
+/// window. Unacked bytes are then bounded by (threshold + one flush batch), so
+/// available credit can never reach zero while the webview is healthy — no idle
+/// ack timer is needed to unstick a quiet session.
+const PTY_CREDIT_WINDOW_BYTES: usize = 1 << 20;
+
+/// Capacity, in reader chunks, of the bounded output channel between the ConPTY
+/// reader thread and the session's flusher. The reader emits at most 4 KiB per
+/// `ReadFile`, so 256 slots bound the channel at ~1 MiB.
+///
+/// This is the *second* half of the backpressure chain: when the flusher stops
+/// draining (no credit), this channel fills, the reader parks in `send`, it
+/// stops calling `ReadFile`, the ConPTY pipe fills, and the child finally
+/// blocks on write. That is correct terminal behavior — and it is why
+/// `PtySession::spawn_with_close_hook` (not `spawn`) is used below: a parked
+/// reader must be released on teardown or `close()` deadlocks joining it.
+const PTY_OUTPUT_CHANNEL_CAPACITY: usize = 256;
+
+/// Per-session credit window: the bytes of output the frontend has confirmed
+/// xterm actually consumed. The flusher may only emit while credit remains;
+/// `pty_ack` replenishes it.
+///
+/// One window per session (never shared), so a tab whose webview has stalled
+/// can never hold back another tab's output.
+struct CreditWindow {
+    capacity: usize,
+    state: Mutex<CreditState>,
+    replenished: Condvar,
+}
+
+#[derive(Debug)]
+struct CreditState {
+    available: usize,
+    /// Set by the session's close hook. Releases any flusher parked in
+    /// `acquire` so it can drop the channel receiver and, in turn, release a
+    /// ConPTY reader parked in `send`. Without this, `close()` would wedge.
+    closed: bool,
+}
+
+impl CreditWindow {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            state: Mutex::new(CreditState {
+                available: capacity,
+                closed: false,
+            }),
+            replenished: Condvar::new(),
+        }
+    }
+
+    /// Block until at least one byte of credit is available, returning the
+    /// current allowance. `None` means the window was closed and the caller
+    /// must stop emitting and release the channel.
+    ///
+    /// Lock poisoning is recovered from rather than propagated: a poisoned
+    /// credit window would otherwise permanently wedge the reader for a
+    /// session, which is precisely the failure this whole mechanism exists to
+    /// prevent.
+    fn acquire(&self) -> Option<usize> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        loop {
+            if state.closed {
+                return None;
+            }
+            if state.available > 0 {
+                return Some(state.available);
+            }
+
+            state = self
+                .replenished
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    /// Charge `bytes` against the window. Saturates at zero: a flush batch may
+    /// slightly overshoot the allowance (the first message of a batch is always
+    /// taken whole, so bytes are never dropped), and overshoot must not wrap.
+    fn consume(&self, bytes: usize) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.available = state.available.saturating_sub(bytes);
+    }
+
+    /// Return `bytes` of credit that the webview confirmed xterm consumed, and
+    /// wake a flusher parked in `acquire`.
+    ///
+    /// Capped at `capacity` so a duplicated, replayed or stale ack (e.g. an
+    /// xterm write callback that lands after a session restart) can never
+    /// inflate a session's window beyond its configured size.
+    fn replenish(&self, bytes: usize) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.available = state.available.saturating_add(bytes).min(self.capacity);
+        drop(state);
+        self.replenished.notify_all();
+    }
+
+    /// Permanently close the window. Idempotent.
+    fn close(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.closed = true;
+        drop(state);
+        self.replenished.notify_all();
+    }
+
+    /// Remaining credit, for assertions. The production path never needs to
+    /// read this: `acquire` is the only correct way to observe the window,
+    /// because anything else would be a torn read the moment it returned.
+    #[cfg(test)]
+    fn available(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .available
+    }
+}
+
+#[derive(Default)]
 struct PtyState {
     // Keyed by each session's monotonic id (`PtySession::id()`), so multiple
     // concurrent sessions coexist without collision. Commands must lock this
@@ -29,6 +178,12 @@ struct PtyState {
     // handles never linger. Removal is id-scoped and idempotent: a second
     // removal of the same id is a harmless no-op.
     sessions: Mutex<HashMap<u64, Arc<PtySession>>>,
+    // Per-session credit windows, keyed identically to `sessions`. `pty_ack`
+    // looks a session's window up here to replenish it. Registered by
+    // `pty_spawn` and removed alongside the session; the window itself is
+    // *closed* by the session's close hook, which covers every teardown path
+    // (kill, natural exit, write failure, and `Drop` at app shutdown).
+    credits: Mutex<HashMap<u64, Arc<CreditWindow>>>,
 }
 
 /// Payload for the global `pty-output` event. Every emission carries the
@@ -38,6 +193,15 @@ struct PtyState {
 #[serde(rename_all = "camelCase")]
 struct PtyOutputPayload {
     session_id: u64,
+    /// UTF-8 byte cost this emission charged against the session's credit
+    /// window. The frontend echoes it back through `pty_ack` once xterm has
+    /// actually consumed the data.
+    ///
+    /// Carried explicitly instead of being recomputed in JS on purpose:
+    /// `String.length` there counts UTF-16 code units, which diverges from
+    /// Rust's UTF-8 `str::len()` for any non-ASCII output. Recomputing would
+    /// silently desynchronise the credit ledger and eventually stall a session.
+    bytes: usize,
     data: String,
 }
 
@@ -112,21 +276,46 @@ async fn pty_spawn(
     // Each session is torn down explicitly by its own id (frontend `killPty`,
     // the detached natural-exit cleanup, or the instant-exit re-check below),
     // so a new spawn never reaps an existing session.
-    let (tx, rx) = std::sync::mpsc::channel::<(u64, String)>();
+    //
+    // BACKPRESSURE CHAIN (child -> ConPTY pipe -> reader -> channel -> flusher
+    // -> emit -> xterm -> pty_ack -> credit):
+    //   * `credit` gates the flusher: it emits only while the webview has
+    //     confirmed consumption. No credit => it stops draining `rx`.
+    //   * `sync_channel` is BOUNDED: once the flusher stops draining, it fills
+    //     and the reader thread parks in `send`, stops calling `ReadFile`, the
+    //     ConPTY pipe fills, and the child blocks on write.
+    //   * the close hook closes `credit`, which releases the flusher, which
+    //     drops `rx`, which makes the parked `send` fail — so `close()` can
+    //     join the reader instead of deadlocking on it.
+    let credit = Arc::new(CreditWindow::new(PTY_CREDIT_WINDOW_BYTES));
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(u64, String)>(PTY_OUTPUT_CHANNEL_CAPACITY);
     let flusher_app = app.clone();
+    let flusher_credit = Arc::clone(&credit);
     std::thread::spawn(move || {
-        run_flusher_loop(rx, move |session_id, data| {
-            let _ = flusher_app.emit(PTY_OUTPUT_EVENT, PtyOutputPayload { session_id, data });
+        run_flusher_loop(rx, flusher_credit, move |session_id, data| {
+            let bytes = data.len();
+            let _ = flusher_app.emit(
+                PTY_OUTPUT_EVENT,
+                PtyOutputPayload {
+                    session_id,
+                    bytes,
+                    data,
+                },
+            );
         });
     });
 
     let cleanup_app = app.clone();
     let exit_app = app;
-    let session = PtySession::spawn(
+    let closing_credit = Arc::clone(&credit);
+    let session = PtySession::spawn_with_close_hook(
         &command.program,
         &command_args,
         size,
         move |id, output| {
+            // Deliberately BLOCKING when the channel is full: this is the brake.
+            // `Err` means the flusher dropped the receiver (session closing), in
+            // which case the reader is on its way out anyway.
             let _ = tx.send((id, output));
         },
         move |id| {
@@ -147,6 +336,12 @@ async fn pty_spawn(
                 clear_and_close_session_by_id(&cleanup_app, id);
             });
         },
+        // Teardown hook. Runs at the top of EVERY `close()` — kill, natural
+        // exit, write failure, and `Drop` at app shutdown — before the reader
+        // thread is joined. Closing the credit window is what guarantees a
+        // reader parked in the blocking `send` above is always released, so a
+        // never-acking (crashed/closed) webview can never wedge teardown.
+        move || closing_credit.close(),
     )
     .map_err(|error| error.to_string())?;
 
@@ -158,6 +353,13 @@ async fn pty_spawn(
             .lock()
             .map_err(|_| "PTY state lock poisoned".to_owned())?;
         guard.insert(id, Arc::new(session));
+    }
+    {
+        let mut guard = state
+            .credits
+            .lock()
+            .map_err(|_| "PTY credit lock poisoned".to_owned())?;
+        guard.insert(id, credit);
     }
 
     // Instant-exit race: if the child died before we stored it, its detached
@@ -188,8 +390,52 @@ async fn pty_spawn(
 /// (not `&AppHandle`) so registry mutation is unit-testable without a Tauri
 /// runtime.
 fn remove_pty_session_by_id(state: &PtyState, id: u64) -> Option<Arc<PtySession>> {
+    // Drop the session's credit-window registration alongside it so the map
+    // cannot grow without bound across spawn/kill cycles. This only unregisters
+    // it; the window is *closed* (releasing any parked flusher/reader) by the
+    // session's close hook, which also covers paths that never reach here.
+    forget_credit_window_by_id(state, id);
+
     let mut guard = state.sessions.lock().ok()?;
     guard.remove(&id)
+}
+
+/// Unregister a session's credit window. Idempotent; best-effort on poisoning.
+fn forget_credit_window_by_id(state: &PtyState, id: u64) {
+    if let Ok(mut guard) = state.credits.lock() {
+        guard.remove(&id);
+    }
+}
+
+/// Replenish a session's credit window with `bytes` the frontend confirmed
+/// xterm has consumed, waking its flusher if it was parked.
+///
+/// An unknown id is a harmless `Ok(())`, never an error: acks are fire-and-
+/// forget from the frontend and legitimately race session teardown (an xterm
+/// write callback can land after `pty_kill`). Erroring would make a benign race
+/// look like a failure.
+fn pty_ack_impl(state: &PtyState, session_id: u64, bytes: usize) -> Result<(), String> {
+    let window = {
+        let guard = state
+            .credits
+            .lock()
+            .map_err(|_| "PTY credit lock poisoned".to_owned())?;
+        guard.get(&session_id).map(Arc::clone)
+    };
+
+    // Replenish with the registry lock RELEASED: `replenish` notifies a condvar
+    // that a flusher thread is parked on, and must not run under a lock that
+    // other PTY commands need.
+    if let Some(window) = window {
+        window.replenish(bytes);
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn pty_ack(state: State<'_, PtyState>, session_id: u64, bytes: usize) -> Result<(), String> {
+    pty_ack_impl(state.inner(), session_id, bytes)
 }
 
 /// Remove and close the session with `id` that just exited. Runs on a detached
@@ -361,6 +607,7 @@ fn clone_pty_session_by_id(state: &PtyState, id: u64) -> Result<Option<Arc<PtySe
 /// is never torn down by a stale error path. Best-effort on lock poisoning:
 /// the caller's "session closed" error is the useful one.
 fn clear_pty_session_if_current(state: &PtyState, session: &Arc<PtySession>) {
+    let mut removed = false;
     if let Ok(mut guard) = state.sessions.lock() {
         let id = session.id();
         if guard
@@ -368,7 +615,16 @@ fn clear_pty_session_if_current(state: &PtyState, session: &Arc<PtySession>) {
             .is_some_and(|current| Arc::ptr_eq(current, session))
         {
             guard.remove(&id);
+            removed = true;
         }
+    }
+
+    // Keep the credit registry in lockstep with the session registry, but only
+    // when THIS session was the one removed — otherwise a stale error path could
+    // unregister a different, live session's window. Done outside the sessions
+    // lock to preserve the "never hold two PTY locks at once" rule.
+    if removed {
+        forget_credit_window_by_id(state, session.id());
     }
 }
 
@@ -472,37 +728,95 @@ fn select_process_for_adapter<'a>(
         .map(String::as_str)
 }
 
-fn run_flusher_loop<F>(rx: std::sync::mpsc::Receiver<(u64, String)>, mut flush_callback: F)
-where
+/// Drain immediately-available messages into `buffer`, but stop once the batch
+/// has reached the credit `allowance`.
+///
+/// Stopping at the allowance is what makes the channel fill (and therefore the
+/// reader park) instead of the flusher hoovering the whole backlog into one
+/// giant unbounded `String` — which is exactly the old behavior. Bytes are
+/// never dropped; whatever is left simply stays in the channel.
+fn drain_available_into(
+    rx: &std::sync::mpsc::Receiver<(u64, String)>,
+    buffer: &mut String,
+    allowance: usize,
+) {
+    while buffer.len() < allowance {
+        match rx.try_recv() {
+            Ok((_, extra)) => buffer.push_str(&extra),
+            Err(_) => break,
+        }
+    }
+}
+
+/// Per-session output flusher: coalesces reader chunks on a ~16 ms cadence and
+/// emits them to the webview, but ONLY while the session's credit window says
+/// the webview is keeping up.
+///
+/// The credit gate is checked BEFORE the channel is touched. That ordering is
+/// the whole mechanism: with no credit the flusher parks in `acquire` and never
+/// calls `recv`, so the bounded channel fills, the ConPTY reader parks in
+/// `send`, and the child blocks on write. Reversing the order (recv first, then
+/// gate) would keep draining the channel into memory and defeat backpressure.
+///
+/// Returns — dropping `rx` — when the window is closed (session teardown) or the
+/// sender is gone. Dropping `rx` is what releases a reader parked in `send`, so
+/// `PtySession::close()` can join it instead of deadlocking.
+fn run_flusher_loop<F>(
+    rx: std::sync::mpsc::Receiver<(u64, String)>,
+    credit: Arc<CreditWindow>,
+    mut flush_callback: F,
+) where
     F: FnMut(u64, String),
 {
     let mut buffer = String::new();
     let mut last_flush = std::time::Instant::now();
     let limit = std::time::Duration::from_millis(16);
 
-    while let Ok((id, msg)) = rx.recv() {
-        let current_session_id = id;
+    loop {
+        // 1. Credit gate. Parks here while the webview is behind. Deliberately
+        //    does NOT drain the channel in the meantime.
+        let Some(allowance) = credit.acquire() else {
+            // Session closing. Emit whatever is already buffered (never drop
+            // bytes we were handed) and return, dropping `rx`.
+            let mut tail = String::new();
+            let mut tail_id = None;
+            while let Ok((id, extra)) = rx.try_recv() {
+                tail_id = Some(id);
+                tail.push_str(&extra);
+            }
+            if let Some(id) = tail_id {
+                if !tail.is_empty() {
+                    flush_callback(id, tail);
+                }
+            }
+            return;
+        };
+
+        // 2. Block for the next chunk. Errors only when the reader thread is
+        //    gone (its `tx` dropped), i.e. the session is over.
+        let Ok((current_session_id, msg)) = rx.recv() else {
+            return;
+        };
         buffer.push_str(&msg);
 
-        // Drain any other immediately available messages in the channel
-        while let Ok((_, extra)) = rx.try_recv() {
-            buffer.push_str(&extra);
-        }
+        // The first message of a batch is ALWAYS taken whole, even if it alone
+        // overshoots the allowance. Splitting it could cut a UTF-8 character or
+        // an escape sequence in half; `CreditWindow::consume` saturates, so an
+        // overshoot simply means the next `acquire` parks.
+        drain_available_into(&rx, &mut buffer, allowance);
 
-        // Check if we can flush immediately or need to wait
         let elapsed = last_flush.elapsed();
         if elapsed < limit {
-            let delay = limit - elapsed;
-            std::thread::sleep(delay);
-            // After sleeping, drain any messages that arrived during the sleep
-            while let Ok((_, extra)) = rx.try_recv() {
-                buffer.push_str(&extra);
-            }
+            std::thread::sleep(limit - elapsed);
+            drain_available_into(&rx, &mut buffer, allowance);
         }
 
-        // Flush the buffer
         if !buffer.is_empty() {
+            let bytes = buffer.len();
             flush_callback(current_session_id, std::mem::take(&mut buffer));
+            // Charge AFTER emitting: the credit represents bytes in flight to
+            // the webview, and they are only in flight once emitted.
+            credit.consume(bytes);
             last_flush = std::time::Instant::now();
         }
     }
@@ -528,9 +842,7 @@ fn close_paste_session_impl(path: Option<String>) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
-        .manage(PtyState {
-            sessions: Mutex::new(HashMap::new()),
-        })
+        .manage(PtyState::default())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
@@ -574,6 +886,7 @@ pub fn run() {
             pty_interrupt,
             pty_resize,
             pty_kill,
+            pty_ack,
             clipboard_write_text,
             clipboard_read_text,
             open_path,
@@ -635,9 +948,7 @@ mod tests {
 
     #[test]
     fn pty_state_starts_empty() {
-        let state = PtyState {
-            sessions: Mutex::new(HashMap::new()),
-        };
+        let state = PtyState::default();
 
         assert!(state
             .sessions
@@ -648,9 +959,7 @@ mod tests {
 
     #[test]
     fn clone_pty_session_by_id_unknown_returns_none() {
-        let state = PtyState {
-            sessions: Mutex::new(HashMap::new()),
-        };
+        let state = PtyState::default();
 
         assert!(clone_pty_session_by_id(&state, 42)
             .expect("lookup should not error on an empty registry")
@@ -659,9 +968,7 @@ mod tests {
 
     #[test]
     fn with_pty_session_unknown_id_returns_not_running_string() {
-        let state = PtyState {
-            sessions: Mutex::new(HashMap::new()),
-        };
+        let state = PtyState::default();
 
         // `pty_interrupt`/`pty_resize` route through `with_pty_session`; a miss
         // must error cleanly with the shared "not running" message rather than
@@ -673,9 +980,7 @@ mod tests {
 
     #[test]
     fn pty_write_impl_unknown_id_returns_exact_closed_input_error_string() {
-        let state = PtyState {
-            sessions: Mutex::new(HashMap::new()),
-        };
+        let state = PtyState::default();
 
         // `isClosedPtyInputError` on the frontend matches this EXACT string;
         // changing it is a regression (spec: Missing-id write preserves the
@@ -687,9 +992,7 @@ mod tests {
 
     #[test]
     fn pty_kill_impl_unknown_id_is_idempotent_ok() {
-        let state = PtyState {
-            sessions: Mutex::new(HashMap::new()),
-        };
+        let state = PtyState::default();
 
         // Kill on a missing id must be a harmless `Ok(())` so the frontend's
         // fire-and-forget `void killPty()` never rejects (spec: Idempotent Kill).
@@ -700,9 +1003,7 @@ mod tests {
 
     #[test]
     fn active_pty_process_name_falls_back_when_no_session_matches() {
-        let state = PtyState {
-            sessions: Mutex::new(HashMap::new()),
-        };
+        let state = PtyState::default();
 
         // Mount-time call before any session exists: `None` must fall back to
         // the cmd.exe process name, never error (spec: Paste-Target Fallback
@@ -720,24 +1021,35 @@ mod tests {
     }
 
     #[test]
-    fn pty_output_payload_serializes_with_camel_case_session_id() {
+    fn pty_output_payload_serializes_with_camel_case_session_id_and_byte_cost() {
+        // `bytes` is the UTF-8 byte cost charged against the session's credit
+        // window. It is carried explicitly rather than recomputed in JS, where
+        // `String.length` counts UTF-16 code units and would drift from Rust's
+        // byte accounting on any non-ASCII output — silently corrupting the
+        // credit ledger.
         let payload = PtyOutputPayload {
             session_id: 7,
-            data: "hi".to_owned(),
+            bytes: "hé".len(),
+            data: "hé".to_owned(),
         };
 
         assert_eq!(
             serde_json::to_string(&payload).expect("payload should serialize"),
-            r#"{"sessionId":7,"data":"hi"}"#
+            r#"{"sessionId":7,"bytes":3,"data":"hé"}"#
         );
+    }
+
+    #[test]
+    fn pty_output_payload_byte_cost_is_utf8_not_utf16() {
+        // "hé" is 3 UTF-8 bytes but 2 UTF-16 code units. Pinning this is what
+        // stops the JS side from acking the wrong number.
+        assert_eq!("hé".len(), 3);
     }
 
     #[cfg(windows)]
     #[test]
     fn pty_state_registry_inserts_and_looks_up_by_id() {
-        let state = PtyState {
-            sessions: Mutex::new(HashMap::new()),
-        };
+        let state = PtyState::default();
         let session = Arc::new(
             PtySession::spawn(
                 "cmd.exe",
@@ -767,9 +1079,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn pty_state_registry_remove_is_id_scoped_and_idempotent() {
-        let state = PtyState {
-            sessions: Mutex::new(HashMap::new()),
-        };
+        let state = PtyState::default();
         let session_a = Arc::new(
             PtySession::spawn(
                 "cmd.exe",
@@ -899,17 +1209,449 @@ mod tests {
         assert!(error.contains("Path does not exist"));
     }
 
+    /// A window big enough that credit never gates: for tests that are about
+    /// aggregation/latency, not about backpressure.
+    fn unlimited_credit() -> Arc<CreditWindow> {
+        Arc::new(CreditWindow::new(PTY_CREDIT_WINDOW_BYTES))
+    }
+
+    #[test]
+    fn credit_window_starts_full_and_consume_saturates_at_zero() {
+        let credit = CreditWindow::new(16);
+        assert_eq!(credit.available(), 16);
+
+        // A flush batch always takes its first message whole (bytes are NEVER
+        // dropped), so it may overshoot the allowance. Overshoot must saturate,
+        // not wrap.
+        credit.consume(100);
+        assert_eq!(credit.available(), 0);
+    }
+
+    #[test]
+    fn credit_window_replenish_is_capped_at_capacity() {
+        let credit = CreditWindow::new(16);
+        credit.consume(16);
+        assert_eq!(credit.available(), 0);
+
+        // A stale/duplicated ack (e.g. an xterm write callback landing after a
+        // session restart) must never inflate the window past its capacity.
+        credit.replenish(1_000);
+        assert_eq!(credit.available(), 16);
+    }
+
+    #[test]
+    fn credit_window_acquire_returns_none_once_closed() {
+        let credit = CreditWindow::new(0);
+        credit.close();
+
+        // The exhausted-and-closed case: `acquire` must NOT park forever, or
+        // the flusher never drops the channel receiver and `close()` wedges.
+        assert_eq!(credit.acquire(), None);
+    }
+
+    #[test]
+    fn credit_window_close_releases_a_parked_acquire() {
+        use std::time::Duration;
+
+        let credit = Arc::new(CreditWindow::new(0));
+        let parked_credit = Arc::clone(&credit);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done_tx.send(parked_credit.acquire());
+        });
+
+        // Still parked: no credit, not closed.
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_millis(150)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
+
+        credit.close();
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(2)),
+            Ok(None),
+            "close() must release a flusher parked on an exhausted window"
+        );
+    }
+
+    #[test]
+    fn flusher_stops_emitting_when_credit_is_exhausted_and_resumes_after_ack() {
+        use std::sync::mpsc::{channel, sync_channel, RecvTimeoutError};
+        use std::time::Duration;
+
+        let (tx, rx) = sync_channel::<(u64, String)>(8);
+        let (emitted_tx, emitted_rx) = channel::<(u64, String)>();
+        // An 8-byte window, so one 8-byte chunk consumes it exactly.
+        let credit = Arc::new(CreditWindow::new(8));
+        let flusher_credit = Arc::clone(&credit);
+        std::thread::spawn(move || {
+            run_flusher_loop(rx, flusher_credit, move |id, data| {
+                let _ = emitted_tx.send((id, data));
+            });
+        });
+
+        tx.send((7, "12345678".to_owned()))
+            .expect("the first chunk fits in the window");
+        assert_eq!(
+            emitted_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("output within the window must be emitted"),
+            (7, "12345678".to_owned())
+        );
+        assert_eq!(
+            credit.available(),
+            0,
+            "emitting 8 bytes must charge the whole 8-byte window"
+        );
+
+        // Credit is exhausted: the flusher must now STOP emitting — and, just
+        // as importantly, stop draining the channel, so backpressure propagates
+        // to the reader and on to the child.
+        tx.send((7, "blocked".to_owned()))
+            .expect("the channel still has room");
+        assert_eq!(
+            emitted_rx.recv_timeout(Duration::from_millis(300)),
+            Err(RecvTimeoutError::Timeout),
+            "the flusher must not emit while the credit window is exhausted"
+        );
+
+        // The webview acks what xterm consumed: the flusher wakes and resumes.
+        credit.replenish(8);
+        assert_eq!(
+            emitted_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("an ack must resume the flusher"),
+            (7, "blocked".to_owned())
+        );
+    }
+
+    #[test]
+    fn bounded_output_channel_parks_the_reader_when_the_flusher_has_no_credit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::mpsc::sync_channel;
+        use std::time::Duration;
+
+        const CAPACITY: usize = 4;
+        const ATTEMPTS: usize = 5_000;
+
+        let (tx, rx) = sync_channel::<(u64, String)>(CAPACITY);
+        // A window that is exhausted from the start: the flusher can never
+        // emit, therefore it must never drain the channel either.
+        let credit = Arc::new(CreditWindow::new(0));
+        let flusher_credit = Arc::clone(&credit);
+        std::thread::spawn(move || {
+            run_flusher_loop(rx, flusher_credit, |_id, _data| {
+                panic!("the flusher must not emit a single byte without credit");
+            });
+        });
+
+        // Stands in for the ConPTY reader thread: it pushes chunks as fast as it
+        // can and parks in `send` once the channel is full.
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_for_reader = Arc::clone(&accepted);
+        let reader = std::thread::spawn(move || {
+            for index in 0..ATTEMPTS {
+                if tx.send((1, format!("chunk{index}"))).is_err() {
+                    break;
+                }
+                accepted_for_reader.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        std::thread::sleep(Duration::from_millis(250));
+
+        // THE BOUND HOLDS. Memory cannot grow: the reader is parked in `send`,
+        // so it has stopped calling `ReadFile`, so the ConPTY pipe fills and the
+        // child blocks. With the old unbounded `channel()` this would be 5000.
+        let parked_at = accepted.load(Ordering::SeqCst);
+        assert!(
+            parked_at <= CAPACITY + 1,
+            "the reader must park once the bounded channel is full, but it accepted \
+             {parked_at} of {ATTEMPTS} chunks — the channel is not bounding memory"
+        );
+
+        // And a parked reader is never wedged: closing the window releases it.
+        credit.close();
+        reader
+            .join()
+            .expect("closing the credit window must release the parked reader");
+    }
+
+    #[test]
+    fn a_stalled_session_does_not_starve_another_session() {
+        use std::sync::mpsc::{channel, sync_channel};
+        use std::time::Duration;
+
+        // Each session owns its channel, flusher thread and credit window, so a
+        // tab whose webview stopped acking cannot hold back a sibling tab.
+        let (flood_tx, flood_rx) = sync_channel::<(u64, String)>(4);
+        let (flood_emitted_tx, flood_emitted_rx) = channel::<(u64, String)>();
+        let flood_credit = Arc::new(CreditWindow::new(0));
+        let flood_flusher_credit = Arc::clone(&flood_credit);
+        std::thread::spawn(move || {
+            run_flusher_loop(flood_rx, flood_flusher_credit, move |id, data| {
+                let _ = flood_emitted_tx.send((id, data));
+            });
+        });
+
+        let (calm_tx, calm_rx) = sync_channel::<(u64, String)>(4);
+        let (calm_emitted_tx, calm_emitted_rx) = channel::<(u64, String)>();
+        let calm_credit = unlimited_credit();
+        let calm_flusher_credit = Arc::clone(&calm_credit);
+        std::thread::spawn(move || {
+            run_flusher_loop(calm_rx, calm_flusher_credit, move |id, data| {
+                let _ = calm_emitted_tx.send((id, data));
+            });
+        });
+
+        // Session 1 floods until its reader parks on the full channel.
+        std::thread::spawn(move || {
+            for index in 0..5_000 {
+                if flood_tx.send((1, format!("flood{index}"))).is_err() {
+                    break;
+                }
+            }
+        });
+        std::thread::sleep(Duration::from_millis(150));
+
+        // Session 2 is idle and still gets its output through, promptly.
+        calm_tx.send((2, "prompt> ".to_owned())).expect("send");
+        assert_eq!(
+            calm_emitted_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("an idle session must keep emitting while a sibling is stalled"),
+            (2, "prompt> ".to_owned())
+        );
+        assert!(
+            flood_emitted_rx.try_recv().is_err(),
+            "the stalled session must not have emitted anything"
+        );
+
+        flood_credit.close();
+        calm_credit.close();
+    }
+
+    #[test]
+    fn pty_ack_impl_replenishes_only_the_named_session() {
+        let state = PtyState::default();
+        let first = Arc::new(CreditWindow::new(64));
+        let second = Arc::new(CreditWindow::new(64));
+        first.consume(64);
+        second.consume(64);
+        {
+            let mut credits = state.credits.lock().expect("credits lock");
+            credits.insert(1, Arc::clone(&first));
+            credits.insert(2, Arc::clone(&second));
+        }
+
+        assert_eq!(pty_ack_impl(&state, 1, 32), Ok(()));
+
+        assert_eq!(first.available(), 32);
+        assert_eq!(
+            second.available(),
+            0,
+            "an ack must not leak across sessions"
+        );
+    }
+
+    #[test]
+    fn pty_ack_impl_unknown_id_is_a_harmless_no_op() {
+        let state = PtyState::default();
+
+        // The frontend acks fire-and-forget and can race a session teardown, so
+        // an ack for a dead/unknown id must never error.
+        assert_eq!(pty_ack_impl(&state, 999, 4_096), Ok(()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn backpressure_never_drops_a_byte_from_a_real_conpty_child() {
+        use std::sync::mpsc::{channel, sync_channel};
+
+        // THE HARD INVARIANT, end to end against a real ConPTY child.
+        //
+        // Flow control is not sampling: dropping output would corrupt escape
+        // sequences and desynchronise terminal state. This runs a child that
+        // prints 200 numbered lines through a DELIBERATELY tiny credit window
+        // (512 B) and a DELIBERATELY tiny channel (2 slots), so the brake
+        // engages over and over — the reader really parks, the ConPTY pipe
+        // really fills, the child really blocks on write — and then asserts
+        // every single line still arrives, in order.
+        const LINES: usize = 200;
+        let credit = Arc::new(CreditWindow::new(512));
+        let (tx, rx) = sync_channel::<(u64, String)>(2);
+        let (emitted_tx, emitted_rx) = channel::<(u64, String)>();
+        let flusher_credit = Arc::clone(&credit);
+        std::thread::spawn(move || {
+            run_flusher_loop(rx, flusher_credit, move |id, data| {
+                let _ = emitted_tx.send((id, data));
+            });
+        });
+
+        let hook_credit = Arc::clone(&credit);
+        let session = PtySession::spawn_with_close_hook(
+            "cmd.exe",
+            &["/D", "/C", "for /L %i in (1,1,200) do @echo LINE%i"],
+            TerminalSize::new(80, 24).expect("valid terminal size"),
+            move |id, output| {
+                let _ = tx.send((id, output));
+            },
+            |_id| {},
+            move || hook_credit.close(),
+        )
+        .expect("session should spawn");
+
+        // Stands in for the webview: consume, then ack exactly what was
+        // consumed. This MUST run concurrently with the child, on its own
+        // thread — if the test consumed only after waiting for the child to
+        // exit, the credit window would run dry, the reader would park, the
+        // ConPTY pipe would fill and the child would block on write and NEVER
+        // exit. (Which is the mechanism working correctly, and is exactly how
+        // the first draft of this test deadlocked itself.)
+        let consumer_credit = Arc::clone(&credit);
+        let consumer = std::thread::spawn(move || {
+            let mut received = String::new();
+            for (_id, data) in emitted_rx {
+                consumer_credit.replenish(data.len());
+                received.push_str(&data);
+            }
+            received
+        });
+
+        // Wait for the child to finish printing. Note the reader does NOT see
+        // EOF here: the pseudoconsole still owns the output pipe's write end,
+        // so only `close()` below ends the reader.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while session.is_running().unwrap_or(false) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            !session.is_running().unwrap_or(false),
+            "the child must run to completion — if it is still alive, backpressure has WEDGED it \
+             rather than merely throttled it"
+        );
+        // Let the reader drain whatever the child left in the ConPTY pipe and
+        // the flusher emit it, before `close()` tears the pipeline down.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // `close()` fires the hook -> closes the window -> releases the flusher
+        // -> drops the receiver -> the reader ends -> the emit channel closes ->
+        // the consumer thread finishes.
+        session.close();
+        let received = consumer.join().expect("the consumer thread must not panic");
+
+        // Guard against a vacuous pass: the child must genuinely have produced
+        // several windows' worth of output, so the 512-byte window really was
+        // exhausted and replenished many times over rather than never engaging.
+        assert!(
+            received.len() > 512 * 3,
+            "the child produced only {} bytes — too little to have exercised the credit gate, \
+             so this test would prove nothing",
+            received.len()
+        );
+
+        // Every line, in order. An ordered scan (rather than a plain `contains`)
+        // is what makes this prefix-safe: LINE1 is a prefix of LINE10, so only a
+        // forward-advancing cursor proves both are present AND correctly ordered.
+        let mut cursor = 0;
+        for line in 1..=LINES {
+            let needle = format!("LINE{line}");
+            let found = received[cursor..].find(&needle).unwrap_or_else(|| {
+                panic!(
+                    "backpressure dropped output: {needle} is missing from the {} bytes received. \
+                     Flow control must never be lossy.",
+                    received.len()
+                )
+            });
+            cursor += found + needle.len();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn kill_completes_while_the_reader_is_parked_and_the_webview_never_acks() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc::{channel, sync_channel};
+        use std::time::{Duration, Instant};
+
+        // The crashed/closed-renderer case: the webview never acks, so credit is
+        // never replenished, the flusher stops draining, the channel fills and
+        // the ConPTY reader parks in `send`. `close()` JOINS that reader, so a
+        // parked reader that is never released wedges kill and app shutdown.
+        let state = Arc::new(PtyState::default());
+        let credit = Arc::new(CreditWindow::new(0));
+        // Rendezvous channel: the reader parks on its very first chunk, which
+        // makes this deterministic instead of timing-dependent.
+        let (tx, rx) = sync_channel::<(u64, String)>(0);
+        let flusher_credit = Arc::clone(&credit);
+        std::thread::spawn(move || {
+            run_flusher_loop(rx, flusher_credit, |_id, _data| {});
+        });
+
+        let parked = Arc::new(AtomicBool::new(false));
+        let parked_for_reader = Arc::clone(&parked);
+        let hook_credit = Arc::clone(&credit);
+        let session = PtySession::spawn_with_close_hook(
+            "cmd.exe",
+            &["/D", "/K"],
+            TerminalSize::new(80, 24).expect("valid terminal size"),
+            move |id, output| {
+                parked_for_reader.store(true, Ordering::SeqCst);
+                let _ = tx.send((id, output));
+            },
+            |_id| {},
+            move || hook_credit.close(),
+        )
+        .expect("session should spawn");
+        let id = session.id();
+        state
+            .sessions
+            .lock()
+            .expect("sessions lock")
+            .insert(id, Arc::new(session));
+        state
+            .credits
+            .lock()
+            .expect("credits lock")
+            .insert(id, Arc::clone(&credit));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !parked.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            parked.load(Ordering::SeqCst),
+            "the reader should have reached the blocking send"
+        );
+
+        let (done_tx, done_rx) = channel::<()>();
+        let killer_state = Arc::clone(&state);
+        let killer = std::thread::spawn(move || {
+            let _ = pty_kill_impl(&killer_state, id);
+            let _ = done_tx.send(());
+        });
+
+        done_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("pty_kill must not wedge on a reader parked behind a never-acking webview");
+        killer.join().expect("killer thread");
+        assert!(
+            state.credits.lock().expect("credits lock").is_empty(),
+            "teardown must not leak the session's credit window"
+        );
+    }
+
     #[test]
     fn test_flusher_aggregates_high_frequency_output() {
         use std::sync::mpsc;
         use std::thread;
 
-        let (tx, rx) = mpsc::channel::<(u64, String)>();
+        let (tx, rx) = mpsc::sync_channel::<(u64, String)>(PTY_OUTPUT_CHANNEL_CAPACITY);
         let (done_tx, done_rx) = mpsc::channel::<(u64, String)>();
 
         // Spawn the flusher loop in a background thread
         thread::spawn(move || {
-            run_flusher_loop(rx, move |id, data| {
+            run_flusher_loop(rx, unlimited_credit(), move |id, data| {
                 let _ = done_tx.send((id, data));
             });
         });
@@ -950,12 +1692,12 @@ mod tests {
         use std::thread;
         use std::time::{Duration, Instant};
 
-        let (tx, rx) = mpsc::channel::<(u64, String)>();
+        let (tx, rx) = mpsc::sync_channel::<(u64, String)>(PTY_OUTPUT_CHANNEL_CAPACITY);
         let (done_tx, done_rx) = mpsc::channel::<(u64, String)>();
 
         // Spawn flusher
         thread::spawn(move || {
-            run_flusher_loop(rx, move |id, data| {
+            run_flusher_loop(rx, unlimited_credit(), move |id, data| {
                 let _ = done_tx.send((id, data));
             });
         });
@@ -995,9 +1737,7 @@ mod tests {
     fn test_concurrent_commands_no_deadlock() {
         use std::thread;
 
-        let state = Arc::new(PtyState {
-            sessions: Mutex::new(HashMap::new()),
-        });
+        let state = Arc::new(PtyState::default());
 
         let session = Arc::new(
             PtySession::spawn(

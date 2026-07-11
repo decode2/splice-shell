@@ -9,6 +9,7 @@ import { shouldRefreshTargetAfterInput } from "../terminal/inputActivity";
 import { resolveTerminalKeyAction } from "../terminal/keyboardShortcuts";
 import { readClipboardText, writeClipboardText } from "../terminal/clipboardClient";
 import {
+  ackPty,
   interruptPty,
   killPty,
   isPtyExitPayload,
@@ -182,7 +183,7 @@ export function TerminalView({
     // synchronously the moment `startPty` records `currentSessionId` (see
     // `flushEarlyOutputQueue`). Inherently bounded: it only grows during one
     // spawn IPC round-trip, is cleared on record, and is dropped on unmount.
-    const earlyOutputQueue: { sessionId: number; data: string }[] = [];
+    const earlyOutputQueue: { sessionId: number; bytes: number; data: string }[] = [];
     // Restart-storm guard. The removed 500ms liveness poll was an implicit
     // throttle; without it, a shell that exits instantly on every launch would
     // spin `restartPty` forever. Cap consecutive restarts and reset the counter
@@ -231,16 +232,53 @@ export function TerminalView({
       handlersRef.current.onSessionHealth?.(status);
     };
 
-    const writeTerminalChunk = (chunk: string) => {
-      terminal.write(chunk);
+    // `terminal.write`'s callback fires once xterm's parser has actually
+    // consumed the chunk. That — not the moment we hand it over — is when the
+    // bytes are genuinely gone from the pipeline, so that is when the scheduler
+    // is allowed to ack them back to Rust.
+    const writeTerminalChunk = (chunk: string, consumed: () => void) => {
+      terminal.write(chunk, consumed);
     };
+    // The session that produced the bytes currently in the scheduler. Tracked
+    // separately from `currentSessionId` because xterm's write callback is
+    // asynchronous: it can land AFTER a restart has already advanced
+    // `currentSessionId`, and crediting a fresh session for a dead one's bytes
+    // would be wrong. Acking the dead id instead is a harmless backend no-op.
+    let ackSessionId: number | undefined;
     const outputScheduler = createTerminalOutputScheduler({
       write: writeTerminalChunk,
+      // Returns credit to the emitting session's window so its flusher can
+      // resume. Fire-and-forget: an ack that races session teardown is expected
+      // and is a no-op on an unknown id in the backend.
+      ack: (bytes) => {
+        const sessionId = ackSessionId;
+        if (sessionId === undefined) {
+          return;
+        }
+
+        void ackPty(sessionId, bytes).catch(() => {
+          // A failed ack must never surface as terminal output: the session is
+          // gone, and its credit window went with it.
+        });
+      },
     });
-    const writeTerminalActions = (actions: TerminalOutputAction[]) => {
-      for (const action of coalesceTerminalOutputActions(actions)) {
-        outputScheduler.write(action.data);
+    // `bytes` is the credit cost of the PTY payload these actions were derived
+    // from. It is charged ONCE per payload (to the first emitted action), never
+    // per action: the filter can split, merge or swallow actions, but flow
+    // control accounts for bytes RECEIVED, not bytes rendered.
+    const writeTerminalActions = (actions: TerminalOutputAction[], bytes = 0) => {
+      const coalesced = coalesceTerminalOutputActions(actions);
+      if (coalesced.length === 0) {
+        // The filter held the whole payload back (a partial escape sequence).
+        // Those bytes were still received and still charged, so they must still
+        // be acked — otherwise the window bleeds away and the session stalls.
+        outputScheduler.write("", bytes);
+        return;
       }
+
+      coalesced.forEach((action, index) => {
+        outputScheduler.write(action.data, index === 0 ? bytes : 0);
+      });
     };
     // Created here (after `writeTerminalActions`) so the cursor-show holdback's
     // deferred emissions can route through the exact same actions → scheduler →
@@ -260,7 +298,11 @@ export function TerminalView({
         clear: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
       },
     });
-    const writePtyOutput = (chunk: string) => {
+    const writePtyOutput = (chunk: string, bytes: number) => {
+      // Bind the credit these bytes owe to the session that actually produced
+      // them, before they enter the scheduler.
+      ackSessionId = currentSessionId;
+
       // A session that has stayed up past the min-uptime threshold and is now
       // producing output is genuinely healthy, so clear the restart-storm
       // counter: a later, legitimate one-off restart should not be counted
@@ -274,7 +316,7 @@ export function TerminalView({
         reportSessionHealth("healthy");
       }
 
-      writeTerminalActions(outputFilter.write(chunk));
+      writeTerminalActions(outputFilter.write(chunk), bytes);
     };
     // Default input/resize writers thread the live `currentSessionId` into the
     // id-scoped Tauri commands. When the parent supplies its own handler (e.g.
@@ -303,7 +345,7 @@ export function TerminalView({
     const flushEarlyOutputQueue = (sessionId: number) => {
       for (const chunk of earlyOutputQueue) {
         if (chunk.sessionId === sessionId) {
-          writePtyOutput(chunk.data);
+          writePtyOutput(chunk.data, chunk.bytes);
         }
       }
       earlyOutputQueue.length = 0;
@@ -423,6 +465,11 @@ export function TerminalView({
         // synthetic span. flush() emits any held bytes plus the closing 2026l
         // and returns the filter to a clean, reusable state.
         writeTerminalActions(outputFilter.flush());
+        // Drain the scheduler too, while `ackSessionId` still points at the
+        // DYING session. Anything left pending here belongs to it, not to the
+        // session about to be spawned, and flushing now keeps the credit ledger
+        // attributed to the right window.
+        outputScheduler.flush();
         await startPty();
         terminal.write("\r\nNew shell session started.\r\n");
       } catch (error) {
@@ -644,7 +691,7 @@ export function TerminalView({
           return;
         }
 
-        const { sessionId, data } = event.payload;
+        const { sessionId, bytes, data } = event.payload;
         // Demultiplex by the live session id:
         //   - equal to current   → this view's output; write it.
         //   - otherwise, and this instance is SPAWNING → it may be this
@@ -655,12 +702,12 @@ export function TerminalView({
         //     superseded session); DROP it. Never enqueue, so a sibling's output
         //     can never accumulate here unbounded.
         if (sessionId === currentSessionId) {
-          writePtyOutput(data);
+          writePtyOutput(data, bytes);
           return;
         }
 
         if (spawnInFlight) {
-          earlyOutputQueue.push({ sessionId, data });
+          earlyOutputQueue.push({ sessionId, bytes, data });
         }
       }),
       listen(PTY_EXIT_EVENT, (event) => {
