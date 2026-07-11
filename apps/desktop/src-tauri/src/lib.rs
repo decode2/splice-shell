@@ -58,6 +58,23 @@ const CREDIT_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// ack timer is needed to unstick a quiet session.
 const PTY_CREDIT_WINDOW_BYTES: usize = 1 << 20;
 
+/// Mirror of `DEFAULT_ACK_THRESHOLD_BYTES` in apps/desktop/src/terminal/
+/// terminalOutputScheduler.ts. The credit window and that ack threshold are a
+/// contract split across two languages, and nothing else links them. If the
+/// window is ever lowered at or below the threshold, the flusher can park out of
+/// credit while the frontend never accumulates enough unacked bytes to send an
+/// ack — a permanent stall, the exact freeze this backpressure work prevents.
+/// This compile-time assertion fails the build if that invariant is broken here;
+/// the TS suite guards the other direction (raising the threshold above the
+/// mirrored window). Keep this value in sync with the TS constant.
+const JS_ACK_THRESHOLD_BYTES: usize = 256 * 1024;
+const _: () = assert!(
+    PTY_CREDIT_WINDOW_BYTES > JS_ACK_THRESHOLD_BYTES,
+    "PTY_CREDIT_WINDOW_BYTES must stay strictly above the JS ack threshold \
+     mirrored from terminalOutputScheduler.ts, or a healthy session can stall \
+     permanently"
+);
+
 /// Capacity, in reader chunks, of the bounded output channel between the ConPTY
 /// reader thread and the session's flusher. The reader emits at most 4 KiB per
 /// `ReadFile`, so 256 slots bound the channel at ~1 MiB.
