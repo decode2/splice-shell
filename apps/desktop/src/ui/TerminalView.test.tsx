@@ -1017,6 +1017,7 @@ describe("TerminalView copy / interrupt key handling", () => {
     expect(getInvokeCallsFor("clipboard_write_text")).toHaveLength(1);
     expect(getInvokeCallsFor("clipboard_write_text")[0]?.[1]).toEqual({ text: "selected text" });
     expect(mocks.terminalClearSelection).toHaveBeenCalledTimes(1);
+    expect(getInvokeCallsFor("pty_interrupt")).toHaveLength(0);
     expect(
       getInvokeCallsFor("pty_write").some(([, args]) => (args as { data: string }).data === "\x03"),
     ).toBe(false);
@@ -1029,9 +1030,14 @@ describe("TerminalView copy / interrupt key handling", () => {
     dispatchKeyDown(host, { key: "c", ctrlKey: true });
     await flushAsync();
 
+    // Ctrl+C MUST route through `pty_interrupt` (raw \x03 write + native
+    // CTRL_C_EVENT), not a bare `pty_write` of the C0 byte, which does not
+    // reliably interrupt a Windows console child.
+    expect(getInvokeCallsFor("pty_interrupt")).toHaveLength(1);
+    expect(getInvokeCallsFor("pty_interrupt")[0]?.[1]).toEqual({ sessionId: 1 });
     expect(
       getInvokeCallsFor("pty_write").some(([, args]) => (args as { data: string }).data === "\x03"),
-    ).toBe(true);
+    ).toBe(false);
     expect(getInvokeCallsFor("clipboard_write_text")).toHaveLength(0);
   });
 
@@ -1045,6 +1051,7 @@ describe("TerminalView copy / interrupt key handling", () => {
 
     expect(getInvokeCallsFor("clipboard_write_text")).toHaveLength(1);
     expect(getInvokeCallsFor("clipboard_write_text")[0]?.[1]).toEqual({ text: "shift copy" });
+    expect(getInvokeCallsFor("pty_interrupt")).toHaveLength(0);
     expect(
       getInvokeCallsFor("pty_write").some(([, args]) => (args as { data: string }).data === "\x03"),
     ).toBe(false);
@@ -1062,6 +1069,7 @@ describe("TerminalView copy / interrupt key handling", () => {
 
     expect(getInvokeCallsFor("clipboard_write_text")).toHaveLength(0);
     expect(mocks.terminalClearSelection).not.toHaveBeenCalled();
+    expect(getInvokeCallsFor("pty_interrupt")).toHaveLength(0);
     expect(
       getInvokeCallsFor("pty_write").some(([, args]) => (args as { data: string }).data === "\x03"),
     ).toBe(false);

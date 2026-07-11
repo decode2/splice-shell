@@ -9,6 +9,7 @@ import { shouldRefreshTargetAfterInput } from "../terminal/inputActivity";
 import { resolveTerminalKeyAction } from "../terminal/keyboardShortcuts";
 import { readClipboardText, writeClipboardText } from "../terminal/clipboardClient";
 import {
+  interruptPty,
   killPty,
   isPtyExitPayload,
   isPtyOutputPayload,
@@ -435,6 +436,29 @@ export function TerminalView({
       }
     };
 
+    // Shared failure path for every id-scoped input call (write and interrupt).
+    // A closed-PTY error on a superseded generation is stale and dropped; on the
+    // live generation it closes input once and triggers exactly one restart.
+    const handleInputFailure = (error: unknown, inputGeneration: number) => {
+      if (isClosedPtyInputError(error)) {
+        if (
+          !shouldRecoverClosedPtyInput({
+            currentGeneration: ptyGeneration,
+            failedGeneration: inputGeneration,
+            inputClosed,
+          })
+        ) {
+          return;
+        }
+
+        inputClosed = true;
+        void restartPty();
+        return;
+      }
+
+      terminal.write(`\r\nPTY input failed: ${String(error)}\r\n`);
+    };
+
     const sendTerminalInput = (data: string) => {
       if (inputClosed) {
         return;
@@ -445,23 +469,23 @@ export function TerminalView({
         handlersRef.current.onInputActivity?.();
       }
       void Promise.resolve(writeInput(data)).catch((error) => {
-        if (isClosedPtyInputError(error)) {
-          if (
-            !shouldRecoverClosedPtyInput({
-              currentGeneration: ptyGeneration,
-              failedGeneration: inputGeneration,
-              inputClosed,
-            })
-          ) {
-            return;
-          }
+        handleInputFailure(error, inputGeneration);
+      });
+    };
 
-          inputClosed = true;
-          void restartPty();
-          return;
-        }
+    // Ctrl+C must go through `pty_interrupt`, not a raw \x03 write: the backend
+    // both writes the C0 byte AND raises a native CTRL_C_EVENT on the console
+    // group, which is what actually interrupts a Windows console child. Errors
+    // follow the same generation guard / closed-input recovery as `writeInput`.
+    const sendTerminalInterrupt = () => {
+      if (inputClosed) {
+        return;
+      }
 
-        terminal.write(`\r\nPTY input failed: ${String(error)}\r\n`);
+      const inputGeneration = ptyGeneration;
+      handlersRef.current.onInputActivity?.();
+      void Promise.resolve(interruptPty(currentSessionId ?? 0)).catch((error) => {
+        handleInputFailure(error, inputGeneration);
       });
     };
     const bridge = createTerminalBridge({
@@ -604,7 +628,7 @@ export function TerminalView({
       if (action === "interrupt") {
         event.preventDefault();
         event.stopPropagation();
-        sendTerminalInput("\x03");
+        sendTerminalInterrupt();
       }
     };
 
