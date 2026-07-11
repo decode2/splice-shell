@@ -14,8 +14,10 @@ import {
   killPty,
   isPtyExitPayload,
   isPtyOutputPayload,
+  isPtyStallPayload,
   PTY_EXIT_EVENT,
   PTY_OUTPUT_EVENT,
+  PTY_STALL_EVENT,
   resizePty,
   spawnPty,
   writePty,
@@ -213,6 +215,7 @@ export function TerminalView({
     let pendingExit = false;
     let unlistenPtyOutput: UnlistenFn | undefined;
     let unlistenPtyExit: UnlistenFn | undefined;
+    let unlistenPtyStall: UnlistenFn | undefined;
     const MAX_CONSECUTIVE_RESTARTS = 5;
     // A session must stay up at least this long before its output is taken as
     // proof of health. Output before this window is likely a dying shell's
@@ -256,9 +259,17 @@ export function TerminalView({
           return;
         }
 
-        void ackPty(sessionId, bytes).catch(() => {
+        void ackPty(sessionId, bytes).catch((error) => {
           // A failed ack must never surface as terminal output: the session is
-          // gone, and its credit window went with it.
+          // usually just gone (its credit window went with it), which is benign.
+          // But a PERSISTENT ack failure would silently drain the credit window
+          // and stall the session, so log it with the session id and byte count
+          // for post-mortem diagnosis instead of swallowing it blind.
+          console.error(
+            `pty ack failed for session ${sessionId} (${bytes} bytes); ` +
+              `if this repeats the session's credit window may drain and stall`,
+            error,
+          );
         });
       },
     });
@@ -596,6 +607,22 @@ export function TerminalView({
       }
     };
 
+    // A `pty-stall` event reports that the live session's output has backed up
+    // (stalled=true) or recovered (stalled=false). Only the CURRENT session's
+    // stall matters — a foreign tab's (or a superseded session's) stall must
+    // never mark this view. `reportSessionHealth` dedupes, so a repeated stall
+    // is a no-op. Recovery goes straight back to "healthy": a session that
+    // stalled and recovered is, by definition, alive and keeping up again.
+    const handlePtyStall = (payload: unknown) => {
+      if (disposed || !isPtyStallPayload(payload)) {
+        return;
+      }
+      if (payload.sessionId !== currentSessionId) {
+        return;
+      }
+      reportSessionHealth(payload.stalled ? "stalled" : "healthy");
+    };
+
     const handlePaste = (event: ClipboardEvent) => {
       event.preventDefault();
       const text = event.clipboardData?.getData("text/plain");
@@ -713,16 +740,21 @@ export function TerminalView({
       listen(PTY_EXIT_EVENT, (event) => {
         handlePtyExit(event.payload);
       }),
+      listen(PTY_STALL_EVENT, (event) => {
+        handlePtyStall(event.payload);
+      }),
     ])
-      .then(([outputUnlisten, exitUnlisten]) => {
+      .then(([outputUnlisten, exitUnlisten, stallUnlisten]) => {
         if (disposed) {
           outputUnlisten();
           exitUnlisten();
+          stallUnlisten();
           return;
         }
 
         unlistenPtyOutput = outputUnlisten;
         unlistenPtyExit = exitUnlisten;
+        unlistenPtyStall = stallUnlisten;
         void startPty().catch((error) => {
           terminal.write(`\r\nFailed to start ConPTY session: ${String(error)}\r\n`);
         });
@@ -741,6 +773,7 @@ export function TerminalView({
       terminalElement.removeEventListener("keydown", handleTerminalKeyDown, { capture: true });
       unlistenPtyOutput?.();
       unlistenPtyExit?.();
+      unlistenPtyStall?.();
       // Only kill a session that was actually recorded. A spawn still in flight
       // at teardown is handled by `startPty`'s post-await disposed check, which
       // kills the orphan by its resolved id.

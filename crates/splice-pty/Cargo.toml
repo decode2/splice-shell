@@ -7,6 +7,10 @@ repository.workspace = true
 edition.workspace = true
 
 [dependencies]
+# Logging facade only (no backend): the host application registers the backend
+# (tauri-plugin-log). Used to surface the console-interrupt-signal failure that
+# previously went to a stderr the windowed release build does not have.
+log = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61.3", features = [

@@ -55,6 +55,20 @@ describe("TabStrip rendering", () => {
     expect(dots[1].getAttribute("data-health")).toBe("reconnecting");
   });
 
+  it("renders a stalled tab with its own distinct health dot", () => {
+    // A stalled session (output backed up, waiting on the renderer) must read
+    // distinctly from healthy/reconnecting/failed so a frozen terminal is not
+    // silent — the dot exposes the state via its class and data-health.
+    const { container } = renderStrip({
+      tabs: [makeTab({ tabId: "tab-0", health: "stalled" })],
+      activeId: "tab-0",
+    });
+
+    const dot = container.querySelector(".tabstrip-dot");
+    expect(dot?.getAttribute("data-health")).toBe("stalled");
+    expect(dot?.classList.contains("tabstrip-dot--stalled")).toBe(true);
+  });
+
   it("labels an unsupported process in amber semantics with the .exe stripped", () => {
     const { getByText, container } = renderStrip({
       tabs: [makeTab({ adapterState: { kind: "unsupported", processName: "notepad.exe" } })],

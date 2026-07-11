@@ -11,6 +11,28 @@ use tauri::{Emitter, Manager, State};
 
 const PTY_OUTPUT_EVENT: &str = "pty-output";
 const PTY_EXIT_EVENT: &str = "pty-exit";
+/// Global event carrying a session's flow-control stall state to the frontend so
+/// a frozen tab gets a visible "stalled" signal instead of silently hanging.
+const PTY_STALL_EVENT: &str = "pty-stall";
+
+/// How long the flusher parks in `acquire` waiting for the renderer to ack
+/// before it treats the session as *stalled* and surfaces it — WITHOUT dropping
+/// bytes or emitting without credit.
+///
+/// Why 5s:
+///   * The flusher coalesces on a ~16 ms cadence and a healthy window replenishes
+///     within milliseconds, so 5s is ~300× the flush period — far beyond any
+///     legitimate renderer pause. Even a full-window `xterm.write` parses in well
+///     under a second, so a 5s silence unambiguously means the renderer has
+///     stopped consuming (a WebView2-suspended background tab, a wedged main
+///     thread, or a gone webview), never a momentary hitch.
+///   * It is purely a *reporting* threshold. On timeout the flusher keeps the
+///     bytes and keeps waiting (the child stays correctly throttled), so an
+///     over-conservative value only delays the stall signal — it can NEVER drop
+///     output or corrupt the credit ledger. That safety is what lets us pick a
+///     value tuned for "a human notices a frozen terminal" rather than for flow
+///     control correctness.
+const CREDIT_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Bytes of PTY output a session may have "in flight" — emitted to the webview
 /// but not yet acknowledged as consumed by xterm — before the flusher stops
@@ -89,24 +111,71 @@ impl CreditWindow {
     /// credit window would otherwise permanently wedge the reader for a
     /// session, which is precisely the failure this whole mechanism exists to
     /// prevent.
+    // Test-only convenience: the default production timeout with no stall
+    // reporting. Production takes the observable path (`acquire_with`); the
+    // existing backpressure tests keep calling this unchanged.
+    #[cfg(test)]
     fn acquire(&self) -> Option<usize> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.acquire_with(CREDIT_STALL_TIMEOUT, &mut |_stalled| {})
+    }
 
+    /// Like `acquire`, but bounds each wait to `timeout` and reports a stall
+    /// across `on_stall` so a stuck session becomes OBSERVABLE without ever
+    /// becoming lossy.
+    ///
+    /// Semantics (deliberately non-lossy): on a wait timeout it does NOT return
+    /// and does NOT drop bytes — it keeps the child throttled by looping. The
+    /// FIRST timeout that finds the window still exhausted crosses the stall
+    /// threshold and calls `on_stall(true)` exactly once; further timeouts stay
+    /// silent. When credit returns (or the window closes) it calls
+    /// `on_stall(false)` if it had stalled, then returns the allowance / `None`.
+    fn acquire_with(
+        &self,
+        timeout: std::time::Duration,
+        on_stall: &mut dyn FnMut(bool),
+    ) -> Option<usize> {
+        // Whether this call has already reported a stall, so the report fires at
+        // most once per stall episode and is cleared exactly once on recovery.
+        let mut stalled = false;
         loop {
+            // Re-lock each iteration so `on_stall` (which may emit a Tauri event
+            // in production) is NEVER invoked while holding the credit lock —
+            // that would let a stall report block a concurrent `pty_ack`.
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+
             if state.closed {
+                drop(state);
+                // Do not clear the stall here: the session is being torn down and
+                // the frontend resets health on kill/restart. Emitting "recovered"
+                // for a dead session would be misleading.
                 return None;
             }
             if state.available > 0 {
-                return Some(state.available);
+                let available = state.available;
+                drop(state);
+                if stalled {
+                    on_stall(false);
+                }
+                return Some(available);
             }
 
-            state = self
+            let (state, timeout_result) = self
                 .replenished
-                .wait(state)
+                .wait_timeout(state, timeout)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Only a genuine timeout that still finds the window exhausted (and
+            // open) is a stall — a spurious wakeup or a racing close/replenish is
+            // resolved by the next loop iteration, never mis-signalled here.
+            let genuine_stall = timeout_result.timed_out() && !state.closed && state.available == 0;
+            drop(state);
+
+            if genuine_stall && !stalled {
+                stalled = true;
+                on_stall(true);
+            }
         }
     }
 
@@ -205,6 +274,30 @@ struct PtyOutputPayload {
     data: String,
 }
 
+/// Payload for the global `pty-stall` event. Carries the session id and whether
+/// it is currently stalled, so the frontend can drive that tab to a distinct
+/// "stalled" health state (output backed up, waiting on the renderer) and back
+/// to healthy when it recovers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PtyStallPayload {
+    session_id: u64,
+    stalled: bool,
+}
+
+/// Outcome of a flush emit, returned by the flusher's flush callback so the loop
+/// knows whether to charge the credit window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlushControl {
+    /// The emit reached the webview: charge the bytes and keep flushing.
+    Charge,
+    /// The emit failed (the webview is gone): do NOT charge — those bytes can
+    /// never be acked, and charging them would subtract credit forever and
+    /// permanently stall the session. Stop the loop; the session is being torn
+    /// down.
+    StopWithoutCharge,
+}
+
 #[tauri::command]
 fn app_status() -> String {
     "Splice Shell scaffold ready".to_owned()
@@ -290,19 +383,58 @@ async fn pty_spawn(
     let credit = Arc::new(CreditWindow::new(PTY_CREDIT_WINDOW_BYTES));
     let (tx, rx) = std::sync::mpsc::sync_channel::<(u64, String)>(PTY_OUTPUT_CHANNEL_CAPACITY);
     let flusher_app = app.clone();
+    let stall_app = app.clone();
     let flusher_credit = Arc::clone(&credit);
+    // The flusher/stall closures need the session id, but it is only known after
+    // `spawn_with_close_hook` returns. Publish it through this cell once stored;
+    // a stall can only fire after the 1 MiB window has been drained, which is
+    // long after the id lands here, so the reporter never reads the `0` sentinel.
+    let stall_session_id = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let stall_id = Arc::clone(&stall_session_id);
     std::thread::spawn(move || {
-        run_flusher_loop(rx, flusher_credit, move |session_id, data| {
-            let bytes = data.len();
-            let _ = flusher_app.emit(
-                PTY_OUTPUT_EVENT,
-                PtyOutputPayload {
+        run_flusher_loop_with_stall(
+            rx,
+            flusher_credit,
+            CREDIT_STALL_TIMEOUT,
+            move |session_id, data| {
+                // Emit to the webview; if it fails the webview is gone, so tear
+                // the session down (on a DETACHED thread — an inline
+                // `session.close()` would join the ConPTY reader, which is parked
+                // in `send` waiting on THIS flusher, and deadlock). Returning
+                // `StopWithoutCharge` makes the loop return and drop `rx`, which
+                // releases that reader so the detached teardown can join it.
+                let teardown_app = flusher_app.clone();
+                flush_output_decision(
                     session_id,
-                    bytes,
                     data,
-                },
-            );
-        });
+                    |payload| flusher_app.emit(PTY_OUTPUT_EVENT, payload).is_ok(),
+                    move |id| {
+                        std::thread::spawn(move || {
+                            clear_and_close_session_by_id(&teardown_app, id);
+                        });
+                    },
+                )
+            },
+            move |stalled| {
+                let session_id = stall_id.load(std::sync::atomic::Ordering::SeqCst);
+                if stalled {
+                    log::warn!(
+                        "pty session {session_id}: flow-control stall — output backed up, renderer not acking; child throttled (not hung, not crashed)"
+                    );
+                } else {
+                    log::info!(
+                        "pty session {session_id}: flow-control stall cleared; renderer acking again"
+                    );
+                }
+                let _ = stall_app.emit(
+                    PTY_STALL_EVENT,
+                    PtyStallPayload {
+                        session_id,
+                        stalled,
+                    },
+                );
+            },
+        );
     });
 
     let cleanup_app = app.clone();
@@ -346,6 +478,9 @@ async fn pty_spawn(
     .map_err(|error| error.to_string())?;
 
     let id = session.id();
+    // Publish the id so the flusher's stall reporter can attribute a stall event
+    // to this session (see the flusher thread above).
+    stall_session_id.store(id, std::sync::atomic::Ordering::SeqCst);
 
     {
         let mut guard = state
@@ -748,36 +883,131 @@ fn drain_available_into(
     }
 }
 
+/// Decide what to do with one coalesced flush batch: emit it, and if the emit
+/// fails treat the webview as gone — log it, tear the session down, and tell the
+/// loop NOT to charge credit for bytes that can never be acked.
+///
+/// Split out from the production closure so the emit-failure → teardown path is
+/// unit-testable without a live webview: tests pass a synthetic `emit` that
+/// returns `false` and a `teardown` that records the id.
+fn flush_output_decision<E, T>(session_id: u64, data: String, emit: E, teardown: T) -> FlushControl
+where
+    E: FnOnce(PtyOutputPayload) -> bool,
+    T: FnOnce(u64),
+{
+    let bytes = data.len();
+    let payload = PtyOutputPayload {
+        session_id,
+        bytes,
+        data,
+    };
+
+    if emit(payload) {
+        FlushControl::Charge
+    } else {
+        // The webview is gone: its message queue no longer exists, so this
+        // output — and everything after it — can never be acked. Charging credit
+        // would subtract it forever and permanently stall the session. Tear the
+        // session down instead (kill the child, free its credit window) and tell
+        // the loop to stop without charging.
+        log::error!(
+            "pty session {session_id}: flush emit failed (webview gone); tearing down session and freeing its credit window"
+        );
+        teardown(session_id);
+        FlushControl::StopWithoutCharge
+    }
+}
+
+/// Kill every live PTY session and clear every credit window. This is the
+/// backend-side defense the JS runtime cannot provide: when the WebView2 process
+/// dies (crash, hard reload, window close), the React cleanup that calls
+/// `killPty` never runs, leaking corked children, their reader/waiter threads,
+/// and ConPTY/pipe/job handles. Wired to `WindowEvent::CloseRequested` /
+/// `Destroyed` and to app exit (see `run`). Idempotent and best-effort on lock
+/// poisoning.
+fn reap_all_sessions(state: &PtyState) {
+    // Drain and close the credit windows FIRST: closing releases any flusher
+    // parked in `acquire`, which drops its channel receiver and frees a ConPTY
+    // reader parked in `send`, so the subsequent `session.close()` can join that
+    // reader instead of deadlocking on it.
+    let windows: Vec<Arc<CreditWindow>> = match state.credits.lock() {
+        Ok(mut guard) => guard.drain().map(|(_, window)| window).collect(),
+        Err(poisoned) => poisoned
+            .into_inner()
+            .drain()
+            .map(|(_, window)| window)
+            .collect(),
+    };
+    for window in &windows {
+        window.close();
+    }
+
+    // Then drain the sessions and close each OUTSIDE the lock (close() blocks on
+    // process shutdown and reader/waiter joins, and must not stall other PTY
+    // commands racing this teardown).
+    let sessions: Vec<Arc<PtySession>> = match state.sessions.lock() {
+        Ok(mut guard) => guard.drain().map(|(_, session)| session).collect(),
+        Err(poisoned) => poisoned
+            .into_inner()
+            .drain()
+            .map(|(_, session)| session)
+            .collect(),
+    };
+    let reaped = sessions.len();
+    for session in sessions {
+        session.close();
+    }
+    if reaped > 0 {
+        log::warn!("reaped {reaped} orphaned PTY session(s) on webview teardown/app exit");
+    }
+}
+
 /// Per-session output flusher: coalesces reader chunks on a ~16 ms cadence and
 /// emits them to the webview, but ONLY while the session's credit window says
 /// the webview is keeping up.
 ///
 /// The credit gate is checked BEFORE the channel is touched. That ordering is
-/// the whole mechanism: with no credit the flusher parks in `acquire` and never
-/// calls `recv`, so the bounded channel fills, the ConPTY reader parks in
+/// the whole mechanism: with no credit the flusher parks in `acquire_with` and
+/// never calls `recv`, so the bounded channel fills, the ConPTY reader parks in
 /// `send`, and the child blocks on write. Reversing the order (recv first, then
 /// gate) would keep draining the channel into memory and defeat backpressure.
 ///
-/// Returns — dropping `rx` — when the window is closed (session teardown) or the
-/// sender is gone. Dropping `rx` is what releases a reader parked in `send`, so
-/// `PtySession::close()` can join it instead of deadlocking.
-fn run_flusher_loop<F>(
+/// `stall_timeout` bounds each park so a session stuck behind an unresponsive
+/// renderer becomes OBSERVABLE: `on_stall_change(true)` fires once when the park
+/// first exceeds the timeout and `on_stall_change(false)` once when credit flows
+/// again. The park itself is non-lossy — a timeout keeps the bytes and keeps
+/// waiting, so the child stays correctly throttled.
+///
+/// `flush_callback` returns a `FlushControl`: `Charge` to charge the batch and
+/// keep going, or `StopWithoutCharge` (emit failed → webview gone) to stop the
+/// loop WITHOUT charging, so the credit ledger is never corrupted by bytes that
+/// can never be acked.
+///
+/// Returns — dropping `rx` — when the window is closed (session teardown), the
+/// sender is gone, or a flush reports the webview is gone. Dropping `rx` is what
+/// releases a reader parked in `send`, so `PtySession::close()` can join it
+/// instead of deadlocking.
+fn run_flusher_loop_with_stall<F, S>(
     rx: std::sync::mpsc::Receiver<(u64, String)>,
     credit: Arc<CreditWindow>,
+    stall_timeout: std::time::Duration,
     mut flush_callback: F,
+    mut on_stall_change: S,
 ) where
-    F: FnMut(u64, String),
+    F: FnMut(u64, String) -> FlushControl,
+    S: FnMut(bool),
 {
     let mut buffer = String::new();
     let mut last_flush = std::time::Instant::now();
     let limit = std::time::Duration::from_millis(16);
 
     loop {
-        // 1. Credit gate. Parks here while the webview is behind. Deliberately
-        //    does NOT drain the channel in the meantime.
-        let Some(allowance) = credit.acquire() else {
+        // 1. Credit gate. Parks here while the webview is behind (surfacing a
+        //    stall on timeout). Deliberately does NOT drain the channel meanwhile.
+        let Some(allowance) = credit.acquire_with(stall_timeout, &mut on_stall_change) else {
             // Session closing. Emit whatever is already buffered (never drop
-            // bytes we were handed) and return, dropping `rx`.
+            // bytes we were handed) and return, dropping `rx`. A `StopWithoutCharge`
+            // here is irrelevant — we are already returning.
             let mut tail = String::new();
             let mut tail_id = None;
             while let Ok((id, extra)) = rx.try_recv() {
@@ -786,7 +1016,7 @@ fn run_flusher_loop<F>(
             }
             if let Some(id) = tail_id {
                 if !tail.is_empty() {
-                    flush_callback(id, tail);
+                    let _ = flush_callback(id, tail);
                 }
             }
             return;
@@ -813,13 +1043,46 @@ fn run_flusher_loop<F>(
 
         if !buffer.is_empty() {
             let bytes = buffer.len();
-            flush_callback(current_session_id, std::mem::take(&mut buffer));
-            // Charge AFTER emitting: the credit represents bytes in flight to
-            // the webview, and they are only in flight once emitted.
-            credit.consume(bytes);
-            last_flush = std::time::Instant::now();
+            match flush_callback(current_session_id, std::mem::take(&mut buffer)) {
+                FlushControl::Charge => {
+                    // Charge AFTER emitting: the credit represents bytes in flight
+                    // to the webview, and they are only in flight once emitted.
+                    credit.consume(bytes);
+                    last_flush = std::time::Instant::now();
+                }
+                FlushControl::StopWithoutCharge => {
+                    // Emit failed: the webview is gone. Do NOT charge (those bytes
+                    // can never be acked). Return so `rx` drops and a parked reader
+                    // is released; the session is being torn down separately.
+                    return;
+                }
+            }
         }
     }
+}
+
+/// Non-stall flusher wrapper: the default 5 s stall timeout, no stall reporting,
+/// and an infallible flush callback (always charges). Test-only — production
+/// runs the observable `run_flusher_loop_with_stall` directly; the existing
+/// flusher tests keep calling this unchanged.
+#[cfg(test)]
+fn run_flusher_loop<F>(
+    rx: std::sync::mpsc::Receiver<(u64, String)>,
+    credit: Arc<CreditWindow>,
+    mut flush_callback: F,
+) where
+    F: FnMut(u64, String),
+{
+    run_flusher_loop_with_stall(
+        rx,
+        credit,
+        CREDIT_STALL_TIMEOUT,
+        move |id, data| {
+            flush_callback(id, data);
+            FlushControl::Charge
+        },
+        |_stalled| {},
+    );
 }
 
 #[tauri::command]
@@ -839,10 +1102,43 @@ fn close_paste_session_impl(path: Option<String>) {
     let _ = splice_clipboard::sweep_temp_images(&temp_dir);
 }
 
+/// Build the logging backend. Without a registered backend every `log::*` call
+/// is a silent no-op, so the diagnostics at the stall/teardown/reap failure
+/// points would go nowhere in a windowed release build (which has no stderr).
+/// Writes to a rotating file in the OS log dir always, plus stdout in debug.
+fn build_log_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
+    let mut targets = vec![tauri_plugin_log::Target::new(
+        tauri_plugin_log::TargetKind::LogDir { file_name: None },
+    )];
+    // stdout is only useful in the console-subsystem debug build; the release GUI
+    // build (`windows_subsystem = "windows"`) has no stdout to write to.
+    if cfg!(debug_assertions) {
+        targets.push(tauri_plugin_log::Target::new(
+            tauri_plugin_log::TargetKind::Stdout,
+        ));
+    }
+
+    tauri_plugin_log::Builder::new()
+        .targets(targets)
+        // Bound disk use: roll to a fresh file past ~5 MB and keep only the
+        // previous one, so a chatty session cannot fill the log dir unbounded.
+        .max_file_size(5_000_000)
+        .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepOne)
+        .level(if cfg!(debug_assertions) {
+            log::LevelFilter::Debug
+        } else {
+            log::LevelFilter::Info
+        })
+        .build()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
         .manage(PtyState::default())
+        // Register the log backend FIRST so diagnostics during setup and every
+        // later failure point are actually recorded.
+        .plugin(build_log_plugin())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
@@ -850,6 +1146,29 @@ pub fn run() {
             // Startup Cleanup (CLIP-2)
             let _ = std::fs::remove_dir_all(&temp_dir);
             let _ = splice_clipboard::sweep_temp_images(&temp_dir);
+
+            // Webview-teardown reaping. When the WebView2 process dies (window
+            // close, hard reload, or a renderer crash that also tears the window
+            // down), the JS cleanup that calls `killPty` never runs, leaking
+            // corked children + threads + handles. Tauri 2 exposes window
+            // lifecycle events (`CloseRequested`/`Destroyed`) but NOT a distinct
+            // "webview process crashed" hook, so this covers every teardown that
+            // reaches the window layer; a pure renderer crash that leaves the
+            // window alive is instead caught by the emit-failure teardown in the
+            // flusher (FIX 2). Both, plus app exit below, are defenses the JS
+            // side structurally cannot provide.
+            #[cfg(desktop)]
+            if let Some(window) = app.get_webview_window("main") {
+                let reap_handle = app.handle().clone();
+                window.on_window_event(move |event| {
+                    if matches!(
+                        event,
+                        tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed
+                    ) {
+                        reap_all_sessions(reap_handle.state::<PtyState>().inner());
+                    }
+                });
+            }
 
             #[cfg(desktop)]
             {
@@ -895,8 +1214,12 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("failed to build Splice Shell desktop app");
 
-    app.run(|_app_handle, event| {
+    app.run(|app_handle, event| {
         if let tauri::RunEvent::Exit = event {
+            // Reap any still-live sessions on the way out so a shutdown that did
+            // not route through the webview teardown (e.g. the process ending
+            // while a session is corked) never leaks a child or its handles.
+            reap_all_sessions(app_handle.state::<PtyState>().inner());
             let temp_dir = std::env::temp_dir().join("splice-shell").join("clipboard");
             // Shutdown Cleanup (CLIP-4)
             let _ = std::fs::remove_dir_all(&temp_dir);
@@ -1837,5 +2160,234 @@ mod tests {
 
         // THEN the system MUST delete the temporary image file from disk immediately
         assert!(!file.exists());
+    }
+
+    // ---- FIX 1: acquire must not block forever; a stall must be OBSERVABLE ----
+
+    #[test]
+    fn acquire_with_times_out_without_dropping_and_signals_stall_exactly_once() {
+        use std::sync::mpsc::{channel, TryRecvError};
+        use std::time::Duration;
+
+        // Exhausted window: `acquire_with` must PARK — never returning a lossy
+        // "0 credit" allowance and never emitting — but the FIRST wait timeout
+        // must surface the stall exactly once. Later timeouts stay silent; a
+        // replenish clears the stall and finally returns the allowance.
+        // Capacity 8 (then fully consumed) so the later `replenish(8)` actually
+        // restores credit — `replenish` caps at capacity, so a capacity-0 window
+        // could never be un-stalled.
+        let credit = Arc::new(CreditWindow::new(8));
+        credit.consume(8);
+        let (signal_tx, signal_rx) = channel::<bool>();
+        let parked_credit = Arc::clone(&credit);
+        let handle = std::thread::spawn(move || {
+            let mut on_stall = move |stalled: bool| {
+                let _ = signal_tx.send(stalled);
+            };
+            parked_credit.acquire_with(Duration::from_millis(40), &mut on_stall)
+        });
+
+        // First timeout crosses the stall threshold → exactly one `true`.
+        assert_eq!(
+            signal_rx.recv_timeout(Duration::from_secs(2)),
+            Ok(true),
+            "the first wait timeout must surface a stall"
+        );
+        // It must NOT return on timeout (bytes kept, child stays blocked): still
+        // parked after several more timeout intervals, and no second signal.
+        std::thread::sleep(Duration::from_millis(160));
+        assert!(
+            !handle.is_finished(),
+            "a timed-out acquire must keep waiting, never return a lossy allowance"
+        );
+        assert_eq!(
+            signal_rx.try_recv(),
+            Err(TryRecvError::Empty),
+            "stall must be signalled exactly once, not on every timeout"
+        );
+
+        // Credit flows again: acquire returns the allowance and the stall clears.
+        credit.replenish(8);
+        assert_eq!(
+            handle.join().expect("acquire thread must not panic"),
+            Some(8),
+            "a replenished window must unblock acquire with its allowance"
+        );
+        assert_eq!(
+            signal_rx.recv_timeout(Duration::from_secs(2)),
+            Ok(false),
+            "credit returning must clear the stall exactly once"
+        );
+    }
+
+    #[test]
+    fn acquire_with_returns_immediately_without_stall_when_credit_is_available() {
+        use std::time::Duration;
+
+        let credit = CreditWindow::new(16);
+        let mut signalled = Vec::new();
+        let allowance = {
+            let mut on_stall = |stalled: bool| signalled.push(stalled);
+            credit.acquire_with(Duration::from_millis(50), &mut on_stall)
+        };
+
+        assert_eq!(allowance, Some(16));
+        assert!(
+            signalled.is_empty(),
+            "an available window must never report a stall"
+        );
+    }
+
+    // ---- FIX 2: emit failure tears down the session, never charges credit ----
+
+    #[test]
+    fn flusher_stops_without_charging_credit_when_emit_fails() {
+        use std::sync::mpsc::{channel, sync_channel};
+        use std::time::Duration;
+
+        // Emit failure (dead webview) must NOT charge credit: charging bytes that
+        // can never be acked would subtract credit forever → permanent stall. The
+        // flusher must stop instead, leaving the ledger intact.
+        let (tx, rx) = sync_channel::<(u64, String)>(8);
+        let (done_tx, done_rx) = channel::<()>();
+        let credit = Arc::new(CreditWindow::new(64));
+        let flusher_credit = Arc::clone(&credit);
+        std::thread::spawn(move || {
+            run_flusher_loop_with_stall(
+                rx,
+                flusher_credit,
+                Duration::from_secs(5),
+                // Every emit "fails", standing in for a gone webview.
+                |_id, _data| FlushControl::StopWithoutCharge,
+                |_stalled| {},
+            );
+            let _ = done_tx.send(());
+        });
+
+        tx.send((7, "12345678".to_owned()))
+            .expect("send first chunk");
+
+        // The loop must return (teardown path), dropping rx so a parked reader is
+        // released.
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(2)),
+            Ok(()),
+            "a failed emit must end the flusher loop so rx is dropped"
+        );
+        // And the ledger must be intact: nothing charged for the unackable bytes.
+        assert_eq!(
+            credit.available(),
+            64,
+            "a failed emit must not charge the credit window"
+        );
+    }
+
+    #[test]
+    fn flush_output_decision_tears_down_on_emit_failure_and_charges_on_success() {
+        use std::cell::Cell;
+
+        // Success: charge credit, never tear the session down.
+        let torn: Cell<Option<u64>> = Cell::new(None);
+        let ok =
+            flush_output_decision(7, "hi".to_owned(), |_payload| true, |id| torn.set(Some(id)));
+        assert_eq!(ok, FlushControl::Charge);
+        assert_eq!(torn.get(), None, "a successful emit must never tear down");
+
+        // Failure: stop without charging AND tear down exactly that session.
+        let torn2: Cell<Option<u64>> = Cell::new(None);
+        let failed = flush_output_decision(
+            7,
+            "hi".to_owned(),
+            |_payload| false,
+            |id| torn2.set(Some(id)),
+        );
+        assert_eq!(failed, FlushControl::StopWithoutCharge);
+        assert_eq!(
+            torn2.get(),
+            Some(7),
+            "a failed emit must tear down exactly that session"
+        );
+    }
+
+    // ---- FIX 3: orphaned sessions on webview teardown must be reaped ----
+
+    #[test]
+    fn reap_all_sessions_closes_and_clears_every_credit_window() {
+        use std::time::Duration;
+
+        // Platform-independent: only credit windows (no real sessions) so this
+        // runs everywhere. Reaping must close every window (releasing any parked
+        // flusher) and clear the registry so nothing leaks on webview teardown.
+        let state = PtyState::default();
+        let first = Arc::new(CreditWindow::new(64));
+        let second = Arc::new(CreditWindow::new(64));
+        {
+            let mut credits = state.credits.lock().expect("credits lock");
+            credits.insert(1, Arc::clone(&first));
+            credits.insert(2, Arc::clone(&second));
+        }
+
+        reap_all_sessions(&state);
+
+        assert!(
+            state.credits.lock().expect("credits lock").is_empty(),
+            "reap must clear every credit-window registration"
+        );
+        // A closed window's acquire returns `None` regardless of any remaining
+        // credit, proving every window was actually closed.
+        let mut noop = |_stalled: bool| {};
+        assert_eq!(
+            first.acquire_with(Duration::from_millis(10), &mut noop),
+            None
+        );
+        assert_eq!(
+            second.acquire_with(Duration::from_millis(10), &mut noop),
+            None
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reap_all_sessions_kills_every_live_session_and_clears_both_registries() {
+        // The webview-teardown defense the JS side cannot provide: kill ALL live
+        // sessions and clear ALL credit windows in one sweep.
+        let state = PtyState::default();
+        for _ in 0..2 {
+            let credit = Arc::new(CreditWindow::new(PTY_CREDIT_WINDOW_BYTES));
+            let closing_credit = Arc::clone(&credit);
+            let session = Arc::new(
+                PtySession::spawn_with_close_hook(
+                    "cmd.exe",
+                    &["/D", "/K"],
+                    TerminalSize::new(80, 24).expect("valid terminal size"),
+                    |_id, _output| {},
+                    |_id| {},
+                    move || closing_credit.close(),
+                )
+                .expect("session should spawn"),
+            );
+            let id = session.id();
+            state
+                .sessions
+                .lock()
+                .expect("sessions lock")
+                .insert(id, session);
+            state
+                .credits
+                .lock()
+                .expect("credits lock")
+                .insert(id, credit);
+        }
+
+        reap_all_sessions(&state);
+
+        assert!(
+            state.sessions.lock().expect("sessions lock").is_empty(),
+            "reap must kill every session"
+        );
+        assert!(
+            state.credits.lock().expect("credits lock").is_empty(),
+            "reap must clear every credit window"
+        );
     }
 }

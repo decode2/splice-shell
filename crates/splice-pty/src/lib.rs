@@ -497,8 +497,11 @@ mod windows_conpty {
             // `send_console_interrupt` (missing `FreeConsole`, so `AttachConsole`
             // returned ERROR_ACCESS_DENIED on every call) shipped unnoticed.
             // Surface it so a persistent console-signal failure is observable.
+            // `log::warn!` (not `eprintln!`): the windowed release build has no
+            // stderr, so the previous print went nowhere in production. The host
+            // app registers a real log backend that writes this to a file.
             if let Err(ref error) = signal_result {
-                eprintln!(
+                log::warn!(
                     "splice-pty: console interrupt signal failed for root pid {root_process_id}: \
                      {error}; only the raw \\x03 byte was delivered, so console applications will \
                      not be interrupted"
