@@ -344,7 +344,8 @@ pub fn sweep_temp_images(temp_dir: &Path) -> Result<(), ClipboardError> {
         if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
             if file_name.starts_with("splice-clipboard-") && file_name.ends_with(".png") {
                 if let Ok(metadata) = entry.metadata() {
-                    let file_time = metadata.modified()
+                    let file_time = metadata
+                        .modified()
                         .or_else(|_| metadata.created())
                         .unwrap_or(now);
 
@@ -1124,14 +1125,26 @@ mod tests {
 
         // Assertions:
         // Old matching file should be deleted
-        assert!(!old_matching_path.exists(), "Old matching file should be deleted");
+        assert!(
+            !old_matching_path.exists(),
+            "Old matching file should be deleted"
+        );
 
         // New matching file should still exist
-        assert!(new_matching_path.exists(), "New matching file should be preserved");
+        assert!(
+            new_matching_path.exists(),
+            "New matching file should be preserved"
+        );
 
         // Old non-matching files should still exist
-        assert!(old_non_matching_path.exists(), "Old non-matching file should be preserved");
-        assert!(old_wrong_ext_path.exists(), "Old file with wrong extension should be preserved");
+        assert!(
+            old_non_matching_path.exists(),
+            "Old non-matching file should be preserved"
+        );
+        assert!(
+            old_wrong_ext_path.exists(),
+            "Old file with wrong extension should be preserved"
+        );
 
         // Cleanup
         let _ = fs::remove_dir_all(&temp_dir);
@@ -1142,6 +1155,9 @@ mod tests {
         let temp_dir = fresh_temp_dir("non-existent");
         // Do not create the directory
         let result = sweep_temp_images(&temp_dir);
-        assert!(result.is_ok(), "Sweeping a non-existent directory should succeed with Ok(())");
+        assert!(
+            result.is_ok(),
+            "Sweeping a non-existent directory should succeed with Ok(())"
+        );
     }
 }

@@ -116,13 +116,7 @@ async fn pty_spawn(
     let flusher_app = app.clone();
     std::thread::spawn(move || {
         run_flusher_loop(rx, move |session_id, data| {
-            let _ = flusher_app.emit(
-                PTY_OUTPUT_EVENT,
-                PtyOutputPayload {
-                    session_id,
-                    data,
-                },
-            );
+            let _ = flusher_app.emit(PTY_OUTPUT_EVENT, PtyOutputPayload { session_id, data });
         });
     });
 
@@ -285,7 +279,11 @@ fn pty_write_impl(state: &PtyState, session_id: u64, data: &str) -> Result<(), S
 }
 
 #[tauri::command]
-async fn pty_write(state: State<'_, PtyState>, session_id: u64, data: String) -> Result<(), String> {
+async fn pty_write(
+    state: State<'_, PtyState>,
+    session_id: u64,
+    data: String,
+) -> Result<(), String> {
     pty_write_impl(state.inner(), session_id, &data)
 }
 
@@ -906,7 +904,6 @@ mod tests {
         use std::sync::mpsc;
         use std::thread;
 
-
         let (tx, rx) = mpsc::channel::<(u64, String)>();
         let (done_tx, done_rx) = mpsc::channel::<(u64, String)>();
 
@@ -940,7 +937,11 @@ mod tests {
         assert_eq!(combined, "hello part1 part2 part3 part4 part5 ");
 
         // Assert that the aggregation actually occurred (number of events < number of sent messages)
-        assert!(results.len() < 6, "flusher should have aggregated events, got {}", results.len());
+        assert!(
+            results.len() < 6,
+            "flusher should have aggregated events, got {}",
+            results.len()
+        );
     }
 
     #[test]
@@ -967,7 +968,11 @@ mod tests {
 
         assert_eq!(val1, "first");
         // Should be almost instant (idle flush) - well below 16ms
-        assert!(elapsed1 < Duration::from_millis(30), "idle flush should be immediate, took {:?}", elapsed1);
+        assert!(
+            elapsed1 < Duration::from_millis(30),
+            "idle flush should be immediate, took {:?}",
+            elapsed1
+        );
 
         // Wait 20ms to ensure flusher is idle again
         thread::sleep(Duration::from_millis(20));
@@ -979,7 +984,11 @@ mod tests {
         let elapsed2 = start2.elapsed();
 
         assert_eq!(val2, "second");
-        assert!(elapsed2 < Duration::from_millis(30), "second idle flush should also be immediate, took {:?}", elapsed2);
+        assert!(
+            elapsed2 < Duration::from_millis(30),
+            "second idle flush should also be immediate, took {:?}",
+            elapsed2
+        );
     }
 
     #[test]
@@ -1001,7 +1010,11 @@ mod tests {
             .unwrap(),
         );
         let id = session.id();
-        state.sessions.lock().unwrap().insert(id, Arc::clone(&session));
+        state
+            .sessions
+            .lock()
+            .unwrap()
+            .insert(id, Arc::clone(&session));
 
         let mut threads = Vec::new();
         for _ in 0..10 {
@@ -1024,7 +1037,9 @@ mod tests {
 
     #[test]
     fn test_startup_cleanup_deletes_all_temp_files() {
-        let temp_dir = std::env::temp_dir().join("splice-shell-test-startup").join("clipboard");
+        let temp_dir = std::env::temp_dir()
+            .join("splice-shell-test-startup")
+            .join("clipboard");
         let _ = std::fs::remove_dir_all(&temp_dir);
         std::fs::create_dir_all(&temp_dir).unwrap();
 
@@ -1047,7 +1062,9 @@ mod tests {
 
     #[test]
     fn test_shutdown_cleanup_deletes_temp_directory() {
-        let temp_dir = std::env::temp_dir().join("splice-shell-test-shutdown").join("clipboard");
+        let temp_dir = std::env::temp_dir()
+            .join("splice-shell-test-shutdown")
+            .join("clipboard");
         let _ = std::fs::remove_dir_all(&temp_dir);
         std::fs::create_dir_all(&temp_dir).unwrap();
 
@@ -1065,7 +1082,9 @@ mod tests {
 
     #[test]
     fn test_session_close_deletes_specific_image_immediately() {
-        let temp_dir = std::env::temp_dir().join("splice-shell-test-session-close").join("clipboard");
+        let temp_dir = std::env::temp_dir()
+            .join("splice-shell-test-session-close")
+            .join("clipboard");
         let _ = std::fs::remove_dir_all(&temp_dir);
         std::fs::create_dir_all(&temp_dir).unwrap();
 
