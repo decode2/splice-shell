@@ -5,9 +5,23 @@ on:
     tags:
       - 'v*'
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  # A tag used to go straight to build-sign-publish with no checks at all: a
+  # broken commit could be signed and shipped to users. The release now gates on
+  # the CI workflow itself, so the bar for publishing is the same bar as for
+  # merging, and it cannot silently drift out of sync with it.
+  verify:
+    name: Verify
+    uses: ./.github/workflows/ci.yml
+
   release:
+    needs: verify
     runs-on: windows-latest
+    timeout-minutes: 45
     permissions:
       contents: write
 
@@ -17,7 +31,10 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: lts/*
+          # Pinned to the same major the CI workflow and package.json engines
+          # require. `lts/*` floats, and a release must not build on a runtime
+          # the test suite never ran on.
+          node-version: 22
           cache: npm
 
       - name: Setup Rust toolchain

@@ -5,6 +5,9 @@ on:
     branches: [master]
   pull_request:
     branches: [master]
+  # Callable so the release pipeline gates on this exact workflow instead of a
+  # copy of it. There is only one definition of "green", and it cannot drift.
+  workflow_call:
 
 # Cancel superseded runs on the same ref to save runner minutes.
 concurrency:
@@ -15,6 +18,7 @@ jobs:
   frontend:
     name: Frontend (typecheck, test, build)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -27,16 +31,22 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # Each check below runs even when an earlier one failed, so one run
+      # reports every problem at once.
       - name: Lint
+        if: ${{ !cancelled() }}
         run: npm run lint
 
       - name: Typecheck
+        if: ${{ !cancelled() }}
         run: npm run typecheck
 
       - name: Test
+        if: ${{ !cancelled() }}
         run: npm test
 
       - name: Build
+        if: ${{ !cancelled() }}
         run: npm run build
 
   rust:
@@ -44,6 +54,7 @@ jobs:
     # The native core (ConPTY, clipboard) is Windows-only, so it must be
     # built and tested on Windows.
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -55,11 +66,17 @@ jobs:
       - name: Cache Cargo build
         uses: Swatinem/rust-cache@v2
 
+      # A `cargo fmt` failure used to abort this job at its first step, which
+      # hid the clippy and test results behind a formatting diff. Every check
+      # now runs regardless, so one run reports every problem.
       - name: Check formatting
+        if: ${{ !cancelled() }}
         run: cargo fmt --all -- --check
 
       - name: Clippy
+        if: ${{ !cancelled() }}
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
+        if: ${{ !cancelled() }}
         run: cargo test --workspace
