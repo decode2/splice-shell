@@ -437,7 +437,17 @@ mod windows_clipboard {
     }
 
     pub fn read_dib_bytes() -> Result<Vec<u8>, ClipboardError> {
-        let _clipboard = ClipboardGuard::open()?;
+        read_dib_bytes_with(|| unsafe { OpenClipboard(None) })
+    }
+
+    // The clipboard open is injected so the retry behavior can be exercised in a
+    // unit test without a real Win32 clipboard: a test passes an opener that
+    // always fails and asserts the open is retried, never a single attempt.
+    fn read_dib_bytes_with<F>(open: F) -> Result<Vec<u8>, ClipboardError>
+    where
+        F: FnMut() -> windows::core::Result<()>,
+    {
+        let _clipboard = ClipboardGuard::open_with_retry_using(open)?;
         let format = available_image_format()?;
         let handle = unsafe { GetClipboardData(format)? };
         let global = HGLOBAL(handle.0);
@@ -484,18 +494,21 @@ mod windows_clipboard {
     struct ClipboardGuard;
 
     impl ClipboardGuard {
-        fn open() -> Result<Self, ClipboardError> {
-            unsafe {
-                OpenClipboard(None)?;
-            }
-
-            Ok(Self)
+        fn open_with_retry() -> Result<Self, ClipboardError> {
+            Self::open_with_retry_using(|| unsafe { OpenClipboard(None) })
         }
 
-        fn open_with_retry() -> Result<Self, ClipboardError> {
+        // The clipboard open is injected so the retry loop (and its backoff) can be
+        // exercised in a unit test without a real Win32 clipboard. Production callers
+        // pass the real OpenClipboard; the retry semantics are identical regardless
+        // of the opener.
+        fn open_with_retry_using<F>(mut open: F) -> Result<Self, ClipboardError>
+        where
+            F: FnMut() -> windows::core::Result<()>,
+        {
             let mut last_error: Option<windows::core::Error> = None;
             for attempt in 0..OPEN_RETRY_ATTEMPTS {
-                match unsafe { OpenClipboard(None) } {
+                match open() {
                     Ok(()) => return Ok(Self),
                     Err(error) => {
                         last_error = Some(error);
@@ -561,6 +574,70 @@ mod windows_clipboard {
             unsafe {
                 let _ = GlobalUnlock(self.handle);
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::cell::Cell;
+        use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
+
+        // The real contention error: OpenClipboard fails with ERROR_ACCESS_DENIED
+        // while another process owns the clipboard.
+        fn access_denied() -> windows::core::Error {
+            windows::core::Error::from_hresult(ERROR_ACCESS_DENIED.to_hresult())
+        }
+
+        #[test]
+        fn read_dib_bytes_retries_open_until_attempts_are_exhausted() {
+            // Inject an opener that models a clipboard held by another process for
+            // the whole window: it always fails. read_dib_bytes must retry the open
+            // OPEN_RETRY_ATTEMPTS times (like the text paths) rather than giving up
+            // after a single attempt. Because every attempt fails, no clipboard is
+            // ever actually opened, so no real Win32 read is reached.
+            let calls = Cell::new(0u32);
+            let result = read_dib_bytes_with(|| {
+                calls.set(calls.get() + 1);
+                Err(access_denied())
+            });
+
+            assert!(
+                result.is_err(),
+                "a clipboard owned for the whole retry window must surface an error"
+            );
+            assert_eq!(
+                calls.get(),
+                OPEN_RETRY_ATTEMPTS,
+                "the DIB/image open must retry on contention, not fail on the first attempt"
+            );
+        }
+
+        #[test]
+        fn open_with_retry_stops_after_a_transient_failure_recovers() {
+            // Model a clipboard briefly held then released: the open fails twice and
+            // then succeeds. The retry loop must keep trying, succeed on the third
+            // attempt, and stop there rather than exhausting all attempts.
+            let calls = Cell::new(0u32);
+            let guard = ClipboardGuard::open_with_retry_using(|| {
+                let attempt = calls.get() + 1;
+                calls.set(attempt);
+                if attempt < 3 {
+                    Err(access_denied())
+                } else {
+                    Ok(())
+                }
+            });
+
+            assert!(
+                guard.is_ok(),
+                "a transient contention failure must be absorbed by the retry"
+            );
+            assert_eq!(
+                calls.get(),
+                3,
+                "the retry must stop on the first success, not keep opening"
+            );
         }
     }
 }
