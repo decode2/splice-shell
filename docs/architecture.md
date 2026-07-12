@@ -42,6 +42,7 @@ crates/splice-core
 crates/splice-pty
   Windows ConPTY lifecycle
   process input/output bridge
+  output flow control (credit-based backpressure)
   terminal resize handling
 
 crates/splice-clipboard
@@ -60,6 +61,36 @@ User presses Ctrl+V
   -> active CLI adapter formats a usable reference
   -> PTY layer writes the adapted input into the running process
 ```
+
+## PTY output flow
+
+Terminal output is the highest-volume path in the app, so it is flow-controlled
+end to end. Without a bound, a high-output process (a build log, `yes`, a verbose
+AI CLI) can outrun the render pipeline and grow memory without limit — worse when
+the window is minimized, because WebView2 suspends `requestAnimationFrame` and
+the accumulated output lands as one main-thread-freezing write on refocus.
+
+```txt
+ConPTY child
+  -> reader thread reads output in chunks
+  -> bounded channel (parks the reader when full)
+  -> flusher coalesces and emits, but only while it has credit
+  -> Tauri event -> xterm.write()
+  -> frontend acks consumed bytes back to the backend
+  -> credit is replenished, the flusher resumes
+```
+
+The flusher holds a per-session **credit window** (`crates/splice-pty/src/flow.rs`).
+When credit is exhausted it stops draining the channel; the channel fills, the
+reader parks, the ConPTY pipe fills, and the child finally blocks on write — real
+backpressure, the same as a physical terminal. The frontend keeps draining and
+acking even when hidden (a timer fallback covers a suspended `requestAnimationFrame`),
+so a minimized window slows the child rather than buffering without bound. A
+session that stays out of credit past a timeout is surfaced as a stalled state in
+the UI rather than hanging silently. The credit window and the frontend ack
+threshold are a cross-language contract; a compile-time assertion in `flow.rs`
+keeps the window strictly above the mirrored threshold so the two cannot drift
+into a permanent stall.
 
 ## Adapter boundary
 
