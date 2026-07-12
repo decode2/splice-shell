@@ -231,9 +231,13 @@ impl CreditWindow {
         self.replenished.notify_all();
     }
 
-    /// Remaining credit, for assertions. The production path never needs to
-    /// read this: `acquire` is the only correct way to observe the window,
-    /// because anything else would be a torn read the moment it returned.
+    /// Remaining credit, for cross-crate test assertions only. Not part of the
+    /// public API — `#[doc(hidden)]` because it is `pub` solely so the desktop
+    /// crate's tests can reach it (`#[cfg(test)]` does not cross the crate
+    /// boundary). Production code must never read this: `acquire` is the only
+    /// correct way to observe the window, since anything else is a torn read the
+    /// moment it returns.
+    #[doc(hidden)]
     pub fn available(&self) -> usize {
         self.state
             .lock()
@@ -375,9 +379,16 @@ pub fn run_flusher_loop_with_stall<F, S>(
 }
 
 /// Non-stall flusher wrapper: the default 5 s stall timeout, no stall reporting,
-/// and an infallible flush callback (always charges). Test-only — production
-/// runs the observable `run_flusher_loop_with_stall` directly; the existing
-/// flusher tests keep calling this unchanged.
+/// and an infallible flush callback (always charges).
+///
+/// NOT part of the public API and must not be used in production — it silently
+/// drops the stall observability and emit-failure teardown that
+/// `run_flusher_loop_with_stall` provides, which would reintroduce the
+/// silent-hang class this pipeline was built to prevent. It is `pub` (and
+/// `#[doc(hidden)]`) solely so the desktop crate's tests can call it across the
+/// crate boundary, where `#[cfg(test)]` does not reach. Production wires
+/// `run_flusher_loop_with_stall` directly.
+#[doc(hidden)]
 pub fn run_flusher_loop<F>(
     rx: std::sync::mpsc::Receiver<(u64, String)>,
     credit: Arc<CreditWindow>,
