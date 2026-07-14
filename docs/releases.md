@@ -34,6 +34,20 @@ release-please reads your commit history and picks the correct bump automaticall
 
 No manual version edits, no manual tagging.
 
+## Retry a release build
+
+GitHub does not start a second workflow when `release-please` creates a tag
+with the repository `GITHUB_TOKEN`. If a release exists without installer
+assets, dispatch the release workflow explicitly for that existing tag:
+
+```powershell
+gh workflow run release.yml --ref master -f tag=v0.2.0
+```
+
+The workflow checks out and verifies the requested tag, then uploads the
+signed installer and updater artifacts to its GitHub Release. Replace
+`v0.2.0` with the release tag that needs to be rebuilt.
+
 ## Auto-updater
 
 Installed copies of Splice Shell check for updates silently every time they start.
