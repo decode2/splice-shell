@@ -1,5 +1,86 @@
 pub mod flow;
 
+/// A backend-independent event emitted by a PTY session.
+///
+/// Output always carries the originating session id, including output that
+/// arrives before a frontend listener is ready. A natural exit is distinct
+/// from an explicit close so callers do not restart a deliberately closed tab.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PtySessionEvent {
+    Output { session_id: u64, data: String },
+    NaturalExit { session_id: u64 },
+}
+
+impl PtySessionEvent {
+    pub fn from_output(session_id: u64, data: String) -> Self {
+        Self::Output { session_id, data }
+    }
+
+    pub fn natural_exit(session_id: u64) -> Self {
+        Self::NaturalExit { session_id }
+    }
+
+    pub fn session_id(&self) -> u64 {
+        match self {
+            Self::Output { session_id, .. } | Self::NaturalExit { session_id } => *session_id,
+        }
+    }
+
+    pub fn output(&self) -> Option<&str> {
+        match self {
+            Self::Output { data, .. } => Some(data),
+            Self::NaturalExit { .. } => None,
+        }
+    }
+}
+
+/// Shared lifecycle state for target-specific PTY sessions.
+///
+/// `begin_close` returns true only for the first close, which gives every
+/// backend an exactly-once teardown boundary and suppresses natural-exit
+/// notifications caused by an explicit close.
+pub struct PtySessionLifecycle {
+    id: u64,
+    closing: std::sync::atomic::AtomicBool,
+}
+
+impl PtySessionLifecycle {
+    pub fn new(id: u64) -> Self {
+        Self {
+            id,
+            closing: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn begin_close(&self) -> bool {
+        !self.closing.swap(true, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn should_emit_natural_exit(&self) -> bool {
+        !self.closing.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Observable methods every target-specific PTY session must provide.
+///
+/// Spawning takes output and natural-exit callbacks; implementations must
+/// attribute both callbacks with `id`, preserve the shared credit-window ACK
+/// semantics, and make `close` idempotent.
+pub trait PtySessionContract {
+    fn id(&self) -> u64;
+    fn write(&self, data: &str) -> Result<(), PtyError>;
+    fn interrupt(&self) -> Result<(), PtyError>;
+    fn resize(&self, size: TerminalSize) -> Result<(), PtyError>;
+    fn is_running(&self) -> Result<bool, PtyError>;
+    fn active_process_name(&self) -> Result<String, PtyError>;
+    fn active_process_candidates(&self) -> Result<Vec<String>, PtyError>;
+    fn close(&self);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerminalSize {
     pub columns: u16,
@@ -176,6 +257,43 @@ impl PtySession {
     pub fn active_process_candidates(&self) -> Result<Vec<String>, PtyError> {
         Err(PtyError::UnsupportedPlatform)
     }
+
+    pub fn close(&self) {}
+}
+
+#[cfg(not(windows))]
+impl PtySessionContract for PtySession {
+    fn id(&self) -> u64 {
+        self.id()
+    }
+
+    fn write(&self, data: &str) -> Result<(), PtyError> {
+        self.write(data)
+    }
+
+    fn interrupt(&self) -> Result<(), PtyError> {
+        self.interrupt()
+    }
+
+    fn resize(&self, size: TerminalSize) -> Result<(), PtyError> {
+        self.resize(size)
+    }
+
+    fn is_running(&self) -> Result<bool, PtyError> {
+        self.is_running()
+    }
+
+    fn active_process_name(&self) -> Result<String, PtyError> {
+        self.active_process_name()
+    }
+
+    fn active_process_candidates(&self) -> Result<Vec<String>, PtyError> {
+        self.active_process_candidates()
+    }
+
+    fn close(&self) {
+        self.close();
+    }
 }
 
 #[cfg(windows)]
@@ -212,14 +330,49 @@ pub fn run_conpty_command_with_resize(
 pub use windows_conpty::PtySession;
 
 #[cfg(windows)]
+impl PtySessionContract for PtySession {
+    fn id(&self) -> u64 {
+        self.id()
+    }
+
+    fn write(&self, data: &str) -> Result<(), PtyError> {
+        self.write(data)
+    }
+
+    fn interrupt(&self) -> Result<(), PtyError> {
+        self.interrupt()
+    }
+
+    fn resize(&self, size: TerminalSize) -> Result<(), PtyError> {
+        self.resize(size)
+    }
+
+    fn is_running(&self) -> Result<bool, PtyError> {
+        self.is_running()
+    }
+
+    fn active_process_name(&self) -> Result<String, PtyError> {
+        self.active_process_name()
+    }
+
+    fn active_process_candidates(&self) -> Result<Vec<String>, PtyError> {
+        self.active_process_candidates()
+    }
+
+    fn close(&self) {
+        self.close();
+    }
+}
+
+#[cfg(windows)]
 mod windows_conpty {
-    use super::{PtyError, TerminalSize};
+    use super::{PtyError, PtySessionLifecycle, TerminalSize};
     use std::{
         ffi::c_void,
         mem::size_of,
         ptr::null_mut,
         sync::{
-            atomic::{AtomicBool, AtomicU64, Ordering},
+            atomic::{AtomicU64, Ordering},
             Arc, Mutex,
         },
         thread::{self, JoinHandle},
@@ -278,15 +431,13 @@ mod windows_conpty {
         // purpose: the waiter must be able to read it without ever locking the
         // session mutex, which keeps the waiter off `inner` entirely and makes
         // a lock cycle with `close()` impossible.
-        closing: Arc<AtomicBool>,
+        lifecycle: Arc<PtySessionLifecycle>,
         // Join handle for this session's waiter thread. `close()` joins it (via
         // `Option::take`, so it is idempotent across `close()`/`Drop`) so
         // neither the thread nor the process handle it waits on outlives the
         // session. Kept outside `inner` so the join never runs while the
         // session lock is held.
         waiter: Mutex<Option<JoinHandle<()>>>,
-        // Monotonic id assigned at spawn (see `SESSION_COUNTER`).
-        id: u64,
         // Invoked exactly once, at the very top of `close()`, BEFORE the child
         // is terminated and long before the reader thread is joined.
         //
@@ -301,7 +452,7 @@ mod windows_conpty {
         // which makes the flusher exit and drop the channel receiver, which in
         // turn makes the reader's `send` return `Err`).
         //
-        // Fired from `close()` only, guarded by the `closing` flag's
+        // Fired from `close()` only, guarded by the lifecycle's
         // false->true transition, so it runs exactly once even though `close()`
         // is idempotent and also runs from `Drop`.
         on_closing: Box<dyn Fn() + Send + Sync>,
@@ -377,14 +528,14 @@ mod windows_conpty {
             // waiter thread: the waiter is its sole owner and closes it when it
             // ends, so this handle is deliberately NOT stored in
             // `PtySessionInner` (exactly one owner).
-            let closing = Arc::new(AtomicBool::new(false));
-            let closing_for_waiter = Arc::clone(&closing);
+            let lifecycle = Arc::new(PtySessionLifecycle::new(id));
+            let lifecycle_for_waiter = Arc::clone(&lifecycle);
             let waiter_process = duplicate_process_handle(handles.process.raw())?;
             let waiter_handle = SendHandle(waiter_process.into_raw());
             let waiter = thread::spawn(move || {
                 // Sole owner of the duplicated process handle; dropped (and
                 // thus `CloseHandle`d) when this thread ends. This closure
-                // captures only lightweight data (`id`, an `Arc<AtomicBool>`,
+                // captures only lightweight data (`id`, an `Arc<PtySessionLifecycle>`,
                 // the duplicated handle, and `on_exit`) — never `inner` and
                 // never an `Arc<PtySession>` — so it can never form a lock
                 // cycle with `close()`.
@@ -393,11 +544,11 @@ mod windows_conpty {
                     WaitForSingleObject(process.raw(), INFINITE);
                 }
                 // Only a NATURAL exit fires the callback. If `close()`
-                // published `closing` before terminating the child, this wait
+                // began close before terminating the child, this wait
                 // was released by that intentional teardown, so suppress
-                // `on_exit` (no spurious frontend restart). SeqCst pairs with
-                // the SeqCst store in `close()`.
-                if !closing_for_waiter.load(Ordering::SeqCst) {
+                // `on_exit` (no spurious frontend restart). The lifecycle's
+                // SeqCst load pairs with its SeqCst close transition.
+                if lifecycle_for_waiter.should_emit_natural_exit() {
                     on_exit(id);
                 }
             });
@@ -434,9 +585,8 @@ mod windows_conpty {
                     root_process_name: program.to_owned(),
                     job: handles.job,
                 })),
-                closing,
+                lifecycle,
                 waiter: Mutex::new(Some(waiter)),
-                id,
                 on_closing: Box::new(on_closing),
             })
         }
@@ -444,7 +594,7 @@ mod windows_conpty {
         /// Monotonic id assigned to this session at spawn. Stable for the
         /// session's lifetime and carried in the `pty-exit` event payload.
         pub fn id(&self) -> u64 {
-            self.id
+            self.lifecycle.id()
         }
 
         pub fn write(&self, data: &str) -> Result<(), PtyError> {
@@ -574,7 +724,7 @@ mod windows_conpty {
             // `swap` (not `store`) so the false->true transition also fires the
             // teardown hook EXACTLY once, even though `close()` is idempotent
             // and runs again from `Drop`.
-            if !self.closing.swap(true, Ordering::SeqCst) {
+            if self.lifecycle.begin_close() {
                 // MUST run before the reader join below: with credit-based flow
                 // control the reader can be parked inside a blocking
                 // `on_output`, and this hook is what releases it. Running it
@@ -1533,6 +1683,7 @@ mod windows_conpty {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::sync::atomic::AtomicBool;
 
         #[test]
         fn test_create_breakaway_from_job_constant_value() {
