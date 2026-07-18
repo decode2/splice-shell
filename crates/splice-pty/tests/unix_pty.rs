@@ -61,4 +61,51 @@ fn pid(output: &str) -> String { output.split("pid=").nth(1).unwrap().trim().to_
     assert!(receive_until(&receiver, "24 80").contains("24 80"));
     session.resize(TerminalSize::new(132, 43).unwrap()).unwrap();
     assert!(receive_until(&receiver, "43 132").contains("43 132")); session.close(); }
+#[test] fn unix_pty_close_escalates_for_resistant_descendants() {
+    let (session, receiver) = spawn("trap '' HUP TERM; sh -c 'trap \"\" HUP TERM; echo grandchild=$$; while :; do sleep 1; done' & echo root=$$; wait");
+    let deadline = Instant::now() + Duration::from_secs(5); let mut output = String::new();
+    while Instant::now() < deadline && (!output.contains("root=") || !output.contains("grandchild=")) {
+        if let Ok(chunk) = receiver.recv_timeout(Duration::from_millis(250)) { output.push_str(&chunk); }
+    }
+    let root = output.split("root=").nth(1).unwrap().lines().next().unwrap().trim().to_owned();
+    let grandchild = output.split("grandchild=").nth(1).unwrap().lines().next().unwrap().trim().to_owned();
+    let started = Instant::now(); session.close();
+    assert!(started.elapsed() < Duration::from_secs(2) && !is_alive(&root) && !is_alive(&grandchild)); }
+#[test] fn unix_pty_close_escalates_after_the_leader_exits_on_hup() {
+    let (session, receiver) = spawn("trap 'exit 0' HUP; sh -c 'trap \"\" HUP TERM; echo grandchild=$$; while :; do sleep 1; done' & echo leader=$$; wait");
+    let deadline = Instant::now() + Duration::from_secs(5); let mut output = String::new();
+    while Instant::now() < deadline && (!output.contains("leader=") || !output.contains("grandchild=")) {
+        if let Ok(chunk) = receiver.recv_timeout(Duration::from_millis(250)) { output.push_str(&chunk); }
+    }
+    let leader = output.split("leader=").nth(1).unwrap().lines().next().unwrap().trim().to_owned();
+    let grandchild = output.split("grandchild=").nth(1).unwrap().lines().next().unwrap().trim().to_owned();
+    let started = Instant::now(); session.close();
+    assert!(started.elapsed() < Duration::from_secs(2) && !is_alive(&leader) && !is_alive(&grandchild)); }
+#[test] fn unix_pty_flushes_partial_utf8_before_natural_exit() {
+    let (output_sender, output_receiver) = mpsc::channel(); let (exit_sender, exit_receiver) = mpsc::channel();
+    let session = PtySession::spawn("/bin/sh", &["-c", "printf final; printf '\\303'"], size(),
+        move |_, output| { let _ = output_sender.send(output); }, move |_| { let _ = exit_sender.send(()); }).unwrap();
+    assert!(exit_receiver.recv_timeout(Duration::from_secs(1)).is_ok()); let mut output = String::new();
+    while let Ok(chunk) = output_receiver.recv_timeout(Duration::from_millis(100)) { output.push_str(&chunk); }
+    assert!(output.contains("final�")); session.close(); }
+#[test] fn unix_pty_delivers_final_output_before_natural_exit() {
+    enum Event { Output(String), Exit }
+    let (sender, receiver) = mpsc::channel(); let output_sender = sender.clone();
+    let session = PtySession::spawn("/bin/sh", &["-c", "printf final-output"], size(),
+        move |_, output| { std::thread::sleep(Duration::from_millis(100)); let _ = output_sender.send(Event::Output(output)); }, move |_| { let _ = sender.send(Event::Exit); }).unwrap();
+    let first = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(matches!(first, Event::Output(output) if output.contains("final-output")));
+    assert!(matches!(receiver.recv_timeout(Duration::from_secs(1)).unwrap(), Event::Exit)); session.close(); }
+#[test] fn unix_pty_bounds_natural_exit_drain_when_descendant_retains_slave() {
+    enum Event { Output(String), Exit }
+    let (sender, receiver) = mpsc::channel(); let output_sender = sender.clone();
+    let session = PtySession::spawn("/bin/sh", &["-c", "sh -c 'trap \"\" HUP TERM; echo descendant=$$; while :; do sleep 1; done' & sleep 0.1; printf final-output"], size(),
+        move |_, output| { let _ = output_sender.send(Event::Output(output)); }, move |_| { let _ = sender.send(Event::Exit); }).unwrap();
+    let mut output = String::new();
+    while !output.contains("final-output") { match receiver.recv_timeout(Duration::from_secs(1)).unwrap() {
+        Event::Output(chunk) => output.push_str(&chunk), Event::Exit => panic!("final output must precede exit"),
+    }}
+    let descendant = pid(&output.replace("descendant", "pid").replace("final-output", ""));
+    assert!(matches!(receiver.recv_timeout(Duration::from_secs(1)).unwrap(), Event::Exit));
+    session.close(); assert!(!is_alive(&descendant)); }
 }
