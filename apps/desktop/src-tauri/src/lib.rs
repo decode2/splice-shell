@@ -7,11 +7,11 @@ use splice_pty::flow::{
 use splice_pty::{PtySession, TerminalSize};
 use std::{
     collections::HashMap,
-    path::PathBuf,
-    process::Command,
     sync::{Arc, Mutex},
 };
 use tauri::{Emitter, Manager, State};
+
+pub mod platform;
 
 const PTY_OUTPUT_EVENT: &str = "pty-output";
 const PTY_EXIT_EVENT: &str = "pty-exit";
@@ -481,23 +481,8 @@ async fn pty_kill(state: State<'_, PtyState>, session_id: u64) -> Result<(), Str
 }
 
 #[tauri::command]
-async fn open_path(path: String) -> Result<(), String> {
-    let path = PathBuf::from(path);
-    if !path.exists() {
-        return Err(format!("Path does not exist: {}", path.display()));
-    }
-
-    // Reveal the file in Explorer (`/select,`) instead of launching it.
-    // These paths are extracted from untrusted terminal output (including AI
-    // CLI output), and launching a path with the default handler would run
-    // shell-associated files (.exe/.bat/.ps1/.lnk) on a single click. Revealing
-    // keeps the "locate what the CLI mentioned" affordance without ever
-    // executing the target.
-    Command::new("explorer.exe")
-        .arg(format!("/select,{}", path.display()))
-        .spawn()
-        .map(|_| ())
-        .map_err(|error| format!("Failed to reveal path: {error}"))
+async fn open_path(path: String) -> Result<(), platform::PlatformError> {
+    platform::PlatformServices::detect()?.reveal(path)
 }
 
 /// Clone the session handle for `id` while holding the state lock only for the
@@ -1160,10 +1145,21 @@ mod tests {
         let missing_path = std::env::temp_dir().join("splice-shell-missing-open-path-file.png");
         let _ = std::fs::remove_file(&missing_path);
 
-        let error = tauri::async_runtime::block_on(open_path(missing_path.display().to_string()))
+        let platform = platform::PlatformServices::from_facts(platform::PlatformFacts {
+            os: "windows".into(),
+            ubuntu: None,
+            wsl: None,
+            wslg: false,
+            path: Some(r"C:\\Windows\\System32".into()),
+        })
+        .expect("Windows authority fixture");
+        let error = platform
+            .reveal_command(&missing_path)
             .expect_err("missing paths should not be opened");
 
-        assert!(error.contains("Path does not exist"));
+        assert_eq!(error.code, platform::PlatformErrorCode::MissingPath);
+        assert_eq!(error.platform, Some(platform::PlatformTarget::Windows));
+        assert!(!error.retryable);
     }
 
     #[test]
