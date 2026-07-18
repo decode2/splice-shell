@@ -110,9 +110,9 @@ fn command_exists(directory: &std::path::Path, command: &str) -> bool {
         }
         let extensions =
             std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned());
-        return extensions
+        extensions
             .split(';')
-            .any(|extension| directory.join(format!("{command}{extension}")).is_file());
+            .any(|extension| directory.join(format!("{command}{extension}")).is_file())
     }
     #[cfg(unix)]
     {
