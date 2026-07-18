@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "apps/desktop/src-tauri",
   "crates/splice-core",
+  "crates/splice-compat",
   "crates/splice-pty",
   "crates/splice-clipboard"
 ]

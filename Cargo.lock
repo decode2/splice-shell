@@ -3365,6 +3365,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "splice-compat"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "splice-core"
 version = "0.1.0"
 
@@ -3378,7 +3386,7 @@ dependencies = [
 
 [[package]]
 name = "splice-shell-desktop"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "log",
  "serde",
