@@ -215,7 +215,6 @@ pub struct PtySession {
     writer: std::sync::Mutex<Option<Box<dyn std::io::Write + Send>>>,
     killer: std::sync::Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
     pid: Option<u32>,
-    completed: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
     reader: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
     waiter: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
     running: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -344,16 +343,20 @@ impl PtySession {
         let id = lifecycle.id();
         let reader_lifecycle = std::sync::Arc::clone(&lifecycle);
 
-        let reader =
-            std::thread::spawn(move || read_output(reader, id, reader_lifecycle, on_output));
+        let (reader_completed_tx, reader_completed) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            read_output(reader, id, reader_lifecycle, on_output);
+            let _ = reader_completed_tx.send(());
+        });
 
         let waiter_lifecycle = std::sync::Arc::clone(&lifecycle);
         let waiter_running = std::sync::Arc::clone(&running);
-        let (completed_tx, completed) = std::sync::mpsc::channel();
         let waiter = std::thread::spawn(move || {
             let exited = child.wait().is_ok();
             waiter_running.store(false, std::sync::atomic::Ordering::SeqCst);
-            let _ = completed_tx.send(());
+            // A Unix PTY returns EOF/EIO only after the child releases its slave
+            // side. Drain that final output before observers see natural exit.
+            let _ = reader_completed.recv_timeout(std::time::Duration::from_millis(250));
             if exited && waiter_lifecycle.should_emit_natural_exit() {
                 on_exit(waiter_lifecycle.id());
             }
@@ -365,7 +368,6 @@ impl PtySession {
             writer: std::sync::Mutex::new(Some(writer)),
             killer: std::sync::Mutex::new(killer),
             pid,
-            completed: std::sync::Mutex::new(completed),
             reader: std::sync::Mutex::new(Some(reader)),
             waiter: std::sync::Mutex::new(Some(waiter)),
             running,
@@ -395,11 +397,28 @@ impl PtySession {
     }
 
     pub fn interrupt(&self) -> Result<(), PtyError> {
-        self.write("\u{3}")
+        if !self.lifecycle.should_emit_natural_exit() {
+            return Err(PtyError::SessionClosed);
+        }
+        match self.writer.try_lock() {
+            Ok(mut writer) => {
+                let writer = writer.as_mut().ok_or(PtyError::SessionClosed)?;
+                writer.write_all(b"\x03")?;
+                writer.flush()?;
+                Ok(())
+            }
+            Err(std::sync::TryLockError::WouldBlock) if self.signal_process_group(libc::SIGINT) => {
+                Ok(())
+            }
+            Err(_) => Err(PtyError::SessionClosed),
+        }
     }
 
     pub fn resize(&self, size: TerminalSize) -> Result<(), PtyError> {
         use portable_pty::PtySize;
+        if !self.lifecycle.should_emit_natural_exit() {
+            return Err(PtyError::SessionClosed);
+        }
         self.master
             .lock()
             .map_err(|_| PtyError::SessionClosed)?
@@ -427,19 +446,17 @@ impl PtySession {
     pub fn close(&self) {
         if self.lifecycle.begin_close() {
             (self.on_closing)();
-            if let Ok(mut killer) = self.killer.lock() {
-                let _ = killer.kill();
-            }
-            let completed = self.completed.lock().is_ok_and(|completed| {
-                completed
-                    .recv_timeout(std::time::Duration::from_millis(250))
-                    .is_ok()
-            });
-            if !completed {
-                if let Some(pid) = self.pid {
-                    // Root-only escalation; process-group teardown belongs to PR4.
-                    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            for signal in [libc::SIGHUP, libc::SIGTERM, libc::SIGKILL] {
+                let _ = self.signal_process_group(signal);
+                if self.wait_for_teardown(std::time::Duration::from_millis(100)) {
+                    break;
                 }
+            }
+            if !self.teardown_complete() {
+                if let Ok(mut killer) = self.killer.lock() {
+                    let _ = killer.kill();
+                }
+                let _ = self.wait_for_teardown(std::time::Duration::from_millis(250));
             }
             if let Ok(mut writer) = self.writer.lock() {
                 writer.take();
@@ -452,6 +469,33 @@ impl PtySession {
                 }
             }
         }
+    }
+
+    fn signal_process_group(&self, signal: libc::c_int) -> bool {
+        self.pid.is_some_and(|pid| unsafe {
+            libc::kill(-(pid as libc::pid_t), signal) == 0
+                || (self.running.load(std::sync::atomic::Ordering::SeqCst)
+                    && libc::kill(pid as libc::pid_t, signal) == 0)
+        })
+    }
+
+    fn teardown_complete(&self) -> bool {
+        !self.process_group_exists() && !self.running.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn process_group_exists(&self) -> bool {
+        self.pid.is_some_and(|pid| unsafe {
+            libc::kill(-(pid as libc::pid_t), 0) == 0
+                || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        })
+    }
+
+    fn wait_for_teardown(&self, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while !self.teardown_complete() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        self.teardown_complete()
     }
 }
 
@@ -543,8 +587,12 @@ fn read_output<F>(
     let mut bytes = [0; 4096];
     let mut pending = Vec::new();
     while lifecycle.should_emit_natural_exit() {
-        let Ok(count) = reader.read(&mut bytes) else {
-            break;
+        let count = match reader.read(&mut bytes) {
+            Ok(count) => count,
+            // Linux PTYs report EIO once their slave side closes. It is EOF,
+            // not a session error, and still needs the buffered UTF-8 flush.
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+            Err(_) => break,
         };
         if count == 0 {
             break;
@@ -571,6 +619,9 @@ fn read_output<F>(
                 }
             }
         }
+    }
+    if lifecycle.should_emit_natural_exit() && !pending.is_empty() {
+        on_output(id, String::from_utf8_lossy(&pending).into_owned());
     }
 }
 
@@ -2341,5 +2392,52 @@ mod tests {
                 rows: 24
             })
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_interrupt_uses_process_group_fallback_while_writer_lock_is_held() {
+        use std::{
+            sync::mpsc,
+            time::{Duration, Instant},
+        };
+
+        let (sender, receiver) = mpsc::channel();
+        let session = PtySession::spawn(
+            "/bin/sh",
+            &[
+                "-c",
+                "trap 'printf interrupted; exit' INT; printf ready; while :; do :; done",
+            ],
+            TerminalSize::new(80, 24).unwrap(),
+            move |_, output| {
+                let _ = sender.send(output);
+            },
+            |_| {},
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut output = String::new();
+        while Instant::now() < deadline && !output.contains("ready") {
+            if let Ok(chunk) = receiver.recv_timeout(Duration::from_millis(50)) {
+                output.push_str(&chunk);
+            }
+        }
+        assert!(output.contains("ready"));
+        assert_eq!(
+            unsafe { libc::getpgid(session.pid.unwrap() as libc::pid_t) },
+            session.pid.unwrap() as libc::pid_t
+        );
+
+        let writer = session.writer.lock().unwrap();
+        let started = Instant::now();
+        session.interrupt().unwrap();
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .contains("interrupted"));
+        drop(writer);
+        session.close();
     }
 }
