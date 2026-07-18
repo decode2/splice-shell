@@ -34,39 +34,50 @@ const TERMINAL_PERMISSIONS: &[&str] = &[
     "allow-close-paste-session",
 ];
 
+fn handler_commands(source: &str) -> Vec<&str> {
+    source
+        .split("tauri::generate_handler![")
+        .nth(1)
+        .expect("application must register a finite command handler")
+        .lines()
+        .take_while(|line| line.trim() != "])")
+        .map(str::trim)
+        .map(|command| command.trim_end_matches(','))
+        .filter(|command| !command.is_empty())
+        .collect()
+}
+
+fn manifest_commands(source: &str) -> Vec<&str> {
+    source
+        .split("const TERMINAL_COMMANDS: &[&str] = &[")
+        .nth(1)
+        .expect("build must declare a finite command manifest")
+        .lines()
+        .take_while(|line| line.trim() != "];")
+        .map(str::trim)
+        .map(|command| command.trim_matches(',').trim_matches('"'))
+        .filter(|command| !command.is_empty())
+        .collect()
+}
+
+#[test]
+fn authority_manifest_parsing_accepts_crlf_source() {
+    let handler_source = include_str!("../src/lib.rs").replace('\n', "\r\n");
+    let build_source = include_str!("../build.rs").replace('\n', "\r\n");
+
+    assert_eq!(handler_commands(&handler_source), APP_COMMANDS);
+    assert_eq!(manifest_commands(&build_source), APP_COMMANDS);
+}
+
 #[test]
 fn authority_manifest_matches_registered_handlers_and_target_capabilities() {
     let handler_source = include_str!("../src/lib.rs");
     let build_source = include_str!("../build.rs");
     let permissions = include_str!("../permissions/terminal.toml");
 
-    let handler_commands = handler_source
-        .split("tauri::generate_handler![")
-        .nth(1)
-        .expect("application must register a finite command handler")
-        .split("])\n")
-        .next()
-        .expect("application command handler must close")
-        .lines()
-        .map(str::trim)
-        .map(|command| command.trim_end_matches(','))
-        .filter(|command| !command.is_empty())
-        .collect::<Vec<_>>();
-    assert_eq!(handler_commands, APP_COMMANDS);
+    assert_eq!(handler_commands(handler_source), APP_COMMANDS);
 
-    let manifest_commands = build_source
-        .split("const TERMINAL_COMMANDS: &[&str] = &[")
-        .nth(1)
-        .expect("build must declare a finite command manifest")
-        .split("];\n")
-        .next()
-        .expect("finite command manifest must close")
-        .lines()
-        .map(str::trim)
-        .map(|command| command.trim_matches(',').trim_matches('"'))
-        .filter(|command| !command.is_empty())
-        .collect::<Vec<_>>();
-    assert_eq!(manifest_commands, APP_COMMANDS);
+    assert_eq!(manifest_commands(build_source), APP_COMMANDS);
     assert!(build_source
         .contains(".app_manifest(tauri_build::AppManifest::new().commands(TERMINAL_COMMANDS))"));
     assert_eq!(
