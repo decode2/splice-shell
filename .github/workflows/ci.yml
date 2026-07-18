@@ -86,6 +86,9 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Test compatibility harness
+        run: cargo test -p splice-compat
+
       - name: Test
         if: ${{ !cancelled() }}
         run: cargo test --workspace
