@@ -113,6 +113,8 @@ pub enum PtyError {
     Windows(windows::core::Error),
     Io(std::io::Error),
     CommandContainsNul,
+    InvalidWorkingDirectory,
+    InvalidEnvironment,
     InvalidOutput,
     SessionClosed,
     UnsupportedPlatform,
@@ -125,6 +127,10 @@ impl std::fmt::Display for PtyError {
             Self::Windows(error) => write!(f, "Windows API error: {error}"),
             Self::Io(error) => write!(f, "I/O error: {error}"),
             Self::CommandContainsNul => write!(f, "command contains a NUL byte"),
+            Self::InvalidWorkingDirectory => {
+                write!(f, "working directory must be an absolute directory")
+            }
+            Self::InvalidEnvironment => write!(f, "environment override is invalid"),
             Self::InvalidOutput => write!(f, "PTY output was not valid UTF-8"),
             Self::SessionClosed => write!(f, "PTY session is closed"),
             Self::UnsupportedPlatform => write!(f, "ConPTY is only supported on Windows"),
@@ -195,73 +201,261 @@ pub fn run_conpty_command_with_resize(
     Err(PtyError::UnsupportedPlatform)
 }
 
-#[cfg(not(windows))]
-pub struct PtySession;
+#[cfg(unix)]
+#[derive(Debug, Default)]
+pub struct PtySpawnOptions {
+    pub cwd: Option<std::path::PathBuf>,
+    pub env: Vec<(String, String)>,
+}
 
-#[cfg(not(windows))]
+#[cfg(unix)]
+pub struct PtySession {
+    lifecycle: std::sync::Arc<PtySessionLifecycle>,
+    master: std::sync::Mutex<Box<dyn portable_pty::MasterPty + Send>>,
+    writer: std::sync::Mutex<Option<Box<dyn std::io::Write + Send>>>,
+    killer: std::sync::Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
+    pid: Option<u32>,
+    completed: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    reader: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    waiter: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    process_name: String,
+    on_closing: std::sync::Arc<dyn Fn() + Send + Sync>,
+}
+
+#[cfg(unix)]
 impl PtySession {
     pub fn spawn<F, G>(
-        _program: &str,
-        _args: &[&str],
-        _size: TerminalSize,
-        _on_output: F,
-        _on_exit: G,
+        program: &str,
+        args: &[&str],
+        size: TerminalSize,
+        on_output: F,
+        on_exit: G,
     ) -> Result<Self, PtyError>
     where
         F: FnMut(u64, String) + Send + 'static,
         G: FnOnce(u64) + Send + 'static,
     {
-        Err(PtyError::UnsupportedPlatform)
+        Self::spawn_with_close_hook(program, args, size, on_output, on_exit, || {})
     }
 
     pub fn spawn_with_close_hook<F, G, H>(
-        _program: &str,
-        _args: &[&str],
-        _size: TerminalSize,
-        _on_output: F,
-        _on_exit: G,
-        _on_closing: H,
+        program: &str,
+        args: &[&str],
+        size: TerminalSize,
+        on_output: F,
+        on_exit: G,
+        on_closing: H,
     ) -> Result<Self, PtyError>
     where
         F: FnMut(u64, String) + Send + 'static,
         G: FnOnce(u64) + Send + 'static,
         H: Fn() + Send + Sync + 'static,
     {
-        Err(PtyError::UnsupportedPlatform)
+        Self::spawn_with_options_and_close_hook(
+            program,
+            args,
+            PtySpawnOptions::default(),
+            size,
+            on_output,
+            on_exit,
+            on_closing,
+        )
+    }
+
+    pub fn spawn_with_options<F, G>(
+        program: &str,
+        args: &[&str],
+        options: PtySpawnOptions,
+        size: TerminalSize,
+        on_output: F,
+        on_exit: G,
+    ) -> Result<Self, PtyError>
+    where
+        F: FnMut(u64, String) + Send + 'static,
+        G: FnOnce(u64) + Send + 'static,
+    {
+        Self::spawn_with_options_and_close_hook(
+            program,
+            args,
+            options,
+            size,
+            on_output,
+            on_exit,
+            || {},
+        )
+    }
+
+    fn spawn_with_options_and_close_hook<F, G, H>(
+        program: &str,
+        args: &[&str],
+        options: PtySpawnOptions,
+        size: TerminalSize,
+        on_output: F,
+        on_exit: G,
+        on_closing: H,
+    ) -> Result<Self, PtyError>
+    where
+        F: FnMut(u64, String) + Send + 'static,
+        G: FnOnce(u64) + Send + 'static,
+        H: Fn() + Send + Sync + 'static,
+    {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+
+        if program == "cmd.exe" {
+            return Err(PtyError::UnsupportedPlatform);
+        }
+        validate_spawn_inputs(program, args, &options)?;
+
+        let lifecycle = std::sync::Arc::new(PtySessionLifecycle::new(next_pty_session_id()));
+        let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: size.rows,
+                cols: size.columns,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|error| PtyError::Io(std::io::Error::other(error)))?;
+        let mut command = CommandBuilder::new(program);
+        command.args(args);
+        if let Some(cwd) = &options.cwd {
+            command.cwd(cwd);
+        }
+        for (key, value) in &options.env {
+            command.env(key, value);
+        }
+
+        let mut child = pair
+            .slave
+            .spawn_command(command)
+            .map_err(|error| PtyError::Io(std::io::Error::other(error)))?;
+        let pid = child.process_id();
+        let killer = child.clone_killer();
+        drop(pair.slave);
+        let reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(|error| PtyError::Io(std::io::Error::other(error)))?;
+        let writer = pair
+            .master
+            .take_writer()
+            .map_err(|error| PtyError::Io(std::io::Error::other(error)))?;
+        let id = lifecycle.id();
+        let reader_lifecycle = std::sync::Arc::clone(&lifecycle);
+
+        let reader =
+            std::thread::spawn(move || read_output(reader, id, reader_lifecycle, on_output));
+
+        let waiter_lifecycle = std::sync::Arc::clone(&lifecycle);
+        let waiter_running = std::sync::Arc::clone(&running);
+        let (completed_tx, completed) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let exited = child.wait().is_ok();
+            waiter_running.store(false, std::sync::atomic::Ordering::SeqCst);
+            let _ = completed_tx.send(());
+            if exited && waiter_lifecycle.should_emit_natural_exit() {
+                on_exit(waiter_lifecycle.id());
+            }
+        });
+
+        Ok(Self {
+            lifecycle,
+            master: std::sync::Mutex::new(pair.master),
+            writer: std::sync::Mutex::new(Some(writer)),
+            killer: std::sync::Mutex::new(killer),
+            pid,
+            completed: std::sync::Mutex::new(completed),
+            reader: std::sync::Mutex::new(Some(reader)),
+            waiter: std::sync::Mutex::new(Some(waiter)),
+            running,
+            process_name: std::path::Path::new(program)
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            on_closing: std::sync::Arc::new(on_closing),
+        })
     }
 
     pub fn id(&self) -> u64 {
-        0
+        self.lifecycle.id()
     }
 
-    pub fn write(&self, _data: &str) -> Result<(), PtyError> {
-        Err(PtyError::UnsupportedPlatform)
+    pub fn write(&self, data: &str) -> Result<(), PtyError> {
+        if !self.lifecycle.should_emit_natural_exit() {
+            return Err(PtyError::SessionClosed);
+        }
+
+        let mut writer = self.writer.lock().map_err(|_| PtyError::SessionClosed)?;
+        let writer = writer.as_mut().ok_or(PtyError::SessionClosed)?;
+        writer.write_all(data.as_bytes())?;
+        writer.flush()?;
+        Ok(())
     }
 
     pub fn interrupt(&self) -> Result<(), PtyError> {
-        Err(PtyError::UnsupportedPlatform)
+        self.write("\u{3}")
     }
 
-    pub fn resize(&self, _size: TerminalSize) -> Result<(), PtyError> {
-        Err(PtyError::UnsupportedPlatform)
+    pub fn resize(&self, size: TerminalSize) -> Result<(), PtyError> {
+        use portable_pty::PtySize;
+        self.master
+            .lock()
+            .map_err(|_| PtyError::SessionClosed)?
+            .resize(PtySize {
+                rows: size.rows,
+                cols: size.columns,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|error| PtyError::Io(std::io::Error::other(error)))
     }
 
     pub fn is_running(&self) -> Result<bool, PtyError> {
-        Err(PtyError::UnsupportedPlatform)
+        Ok(self.running.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     pub fn active_process_name(&self) -> Result<String, PtyError> {
-        Err(PtyError::UnsupportedPlatform)
+        Ok(self.process_name.clone())
     }
 
     pub fn active_process_candidates(&self) -> Result<Vec<String>, PtyError> {
-        Err(PtyError::UnsupportedPlatform)
+        Ok(vec![self.active_process_name()?])
     }
 
-    pub fn close(&self) {}
+    pub fn close(&self) {
+        if self.lifecycle.begin_close() {
+            (self.on_closing)();
+            if let Ok(mut killer) = self.killer.lock() {
+                let _ = killer.kill();
+            }
+            let completed = self.completed.lock().is_ok_and(|completed| {
+                completed
+                    .recv_timeout(std::time::Duration::from_millis(250))
+                    .is_ok()
+            });
+            if !completed {
+                if let Some(pid) = self.pid {
+                    // Root-only escalation; process-group teardown belongs to PR4.
+                    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                }
+            }
+            if let Ok(mut writer) = self.writer.lock() {
+                writer.take();
+            }
+            for thread in [&self.waiter, &self.reader] {
+                if let Ok(mut thread) = thread.lock() {
+                    if let Some(thread) = thread.take() {
+                        let _ = thread.join();
+                    }
+                }
+            }
+        }
+    }
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
 impl PtySessionContract for PtySession {
     fn id(&self) -> u64 {
         self.id()
@@ -293,6 +487,90 @@ impl PtySessionContract for PtySession {
 
     fn close(&self) {
         self.close();
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PtySession {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+#[cfg(unix)]
+fn next_pty_session_id() -> u64 {
+    static NEXT_PTY_SESSION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT_PTY_SESSION_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(unix)]
+fn validate_spawn_inputs(
+    program: &str,
+    args: &[&str],
+    options: &PtySpawnOptions,
+) -> Result<(), PtyError> {
+    if program.contains('\0') || args.iter().any(|arg| arg.contains('\0')) {
+        return Err(PtyError::CommandContainsNul);
+    }
+    if options
+        .cwd
+        .as_ref()
+        .is_some_and(|cwd| !cwd.is_absolute() || !cwd.is_dir())
+    {
+        return Err(PtyError::InvalidWorkingDirectory);
+    }
+    if options
+        .env
+        .iter()
+        .any(|(key, value)| key.is_empty() || key.contains('\0') || value.contains('\0'))
+    {
+        return Err(PtyError::InvalidEnvironment);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_output<F>(
+    mut reader: Box<dyn std::io::Read + Send>,
+    id: u64,
+    lifecycle: std::sync::Arc<PtySessionLifecycle>,
+    mut on_output: F,
+) where
+    F: FnMut(u64, String),
+{
+    use std::io::Read;
+
+    let mut bytes = [0; 4096];
+    let mut pending = Vec::new();
+    while lifecycle.should_emit_natural_exit() {
+        let Ok(count) = reader.read(&mut bytes) else {
+            break;
+        };
+        if count == 0 {
+            break;
+        }
+        pending.extend_from_slice(&bytes[..count]);
+
+        while !pending.is_empty() {
+            match std::str::from_utf8(&pending) {
+                Ok(output) => {
+                    on_output(id, output.to_owned());
+                    pending.clear();
+                }
+                Err(error) if error.valid_up_to() > 0 => {
+                    let valid = error.valid_up_to();
+                    let output = std::str::from_utf8(&pending[..valid])
+                        .expect("valid UTF-8 prefix reported by Utf8Error");
+                    on_output(id, output.to_owned());
+                    pending.drain(..valid);
+                }
+                Err(error) if error.error_len().is_none() => break,
+                Err(error) => {
+                    on_output(id, "\u{fffd}".to_owned());
+                    pending.drain(..error.error_len().unwrap());
+                }
+            }
+        }
     }
 }
 
