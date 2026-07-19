@@ -1,5 +1,7 @@
 mod workspace;
+mod workspace_lifecycle;
 pub use workspace::*;
+pub use workspace_lifecycle::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PastePayload {
