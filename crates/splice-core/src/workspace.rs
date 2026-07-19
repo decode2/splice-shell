@@ -20,6 +20,10 @@ impl WorkspaceId {
             .then_some(Self(value))
             .ok_or(WorkspaceError::InvalidWorkspaceId)
     }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentDescriptor {
@@ -67,6 +71,10 @@ pub struct WorkspaceProfile {
     pub environment: EnvironmentMetadata,
     pub agent: AgentDescriptor,
     pub session_ids: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_tab_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_closing_session_id: Option<u64>,
 }
 impl WorkspaceProfile {
     pub fn new(
@@ -93,6 +101,8 @@ impl WorkspaceProfile {
             environment,
             agent,
             session_ids: session_ids.into_iter().collect(),
+            lifecycle_tab_id: None,
+            lifecycle_closing_session_id: None,
         })
     }
 }
@@ -157,6 +167,13 @@ impl WorkspaceStore {
         Ok(self
             .read()?
             .and_then(|mut database| database.profiles.remove(id)))
+    }
+
+    pub fn list(&self) -> Result<Vec<WorkspaceProfile>, WorkspaceError> {
+        Ok(self
+            .read()?
+            .map(|database| database.profiles.into_values().collect())
+            .unwrap_or_default())
     }
 
     fn path(&self) -> PathBuf {
@@ -266,6 +283,10 @@ fn valid_profile(profile: &WorkspaceProfile) -> bool {
         && valid_label(&profile.agent.id)
         && valid_command(&profile.agent.command)
         && profile.session_ids.iter().all(|id| *id != 0)
+        && profile.lifecycle_tab_id.as_deref().is_none_or(valid_label)
+        && profile
+            .lifecycle_closing_session_id
+            .is_none_or(|id| id != 0 && profile.session_ids.contains(&id))
         && profile.session_ids.iter().collect::<BTreeSet<_>>().len() == profile.session_ids.len()
 }
 fn valid_database(database: &Database) -> bool {
