@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-active-paste-target"
+description = "Enables the active_paste_target command without any pre-configured scope."
+commands.allow = ["active_paste_target"]
+
+[[permission]]
+identifier = "deny-active-paste-target"
+description = "Denies the active_paste_target command without any pre-configured scope."
+commands.deny = ["active_paste_target"]

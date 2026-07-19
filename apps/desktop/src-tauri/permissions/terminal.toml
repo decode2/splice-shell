@@ -1,0 +1,69 @@
+[[permission]]
+identifier = "allow-app-status"
+description = "Allows the app_status command."
+commands.allow = ["app_status"]
+
+[[permission]]
+identifier = "allow-active-paste-target"
+description = "Allows the active_paste_target command."
+commands.allow = ["active_paste_target"]
+
+[[permission]]
+identifier = "allow-preview-clipboard-image-paste"
+description = "Allows the preview_clipboard_image_paste command."
+commands.allow = ["preview_clipboard_image_paste"]
+
+[[permission]]
+identifier = "allow-preview-active-clipboard-image-paste"
+description = "Allows the preview_active_clipboard_image_paste command."
+commands.allow = ["preview_active_clipboard_image_paste"]
+
+[[permission]]
+identifier = "allow-pty-spawn"
+description = "Allows the pty_spawn command."
+commands.allow = ["pty_spawn"]
+
+[[permission]]
+identifier = "allow-pty-write"
+description = "Allows the pty_write command."
+commands.allow = ["pty_write"]
+
+[[permission]]
+identifier = "allow-pty-interrupt"
+description = "Allows the pty_interrupt command."
+commands.allow = ["pty_interrupt"]
+
+[[permission]]
+identifier = "allow-pty-resize"
+description = "Allows the pty_resize command."
+commands.allow = ["pty_resize"]
+
+[[permission]]
+identifier = "allow-pty-kill"
+description = "Allows the pty_kill command."
+commands.allow = ["pty_kill"]
+
+[[permission]]
+identifier = "allow-pty-ack"
+description = "Allows the pty_ack command."
+commands.allow = ["pty_ack"]
+
+[[permission]]
+identifier = "allow-clipboard-write-text"
+description = "Allows the clipboard_write_text command."
+commands.allow = ["clipboard_write_text"]
+
+[[permission]]
+identifier = "allow-clipboard-read-text"
+description = "Allows the clipboard_read_text command."
+commands.allow = ["clipboard_read_text"]
+
+[[permission]]
+identifier = "allow-open-path"
+description = "Allows the open_path command."
+commands.allow = ["open_path"]
+
+[[permission]]
+identifier = "allow-close-paste-session"
+description = "Allows the close_paste_session command."
+commands.allow = ["close_paste_session"]

@@ -1,0 +1,23 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-terminal-windows",
+  "description": "Allows the main window to invoke the finite terminal command set on Windows.",
+  "windows": ["main"],
+  "platforms": ["windows"],
+  "permissions": [
+    "allow-app-status",
+    "allow-active-paste-target",
+    "allow-preview-clipboard-image-paste",
+    "allow-preview-active-clipboard-image-paste",
+    "allow-pty-spawn",
+    "allow-pty-write",
+    "allow-pty-interrupt",
+    "allow-pty-resize",
+    "allow-pty-kill",
+    "allow-pty-ack",
+    "allow-clipboard-write-text",
+    "allow-clipboard-read-text",
+    "allow-open-path",
+    "allow-close-paste-session"
+  ]
+}
