@@ -1,3 +1,6 @@
+mod workspace;
+pub use workspace::*;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PastePayload {
     Text(String),
