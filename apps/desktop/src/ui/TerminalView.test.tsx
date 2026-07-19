@@ -4,6 +4,7 @@ import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PTY_EXIT_EVENT, PTY_OUTPUT_EVENT, PTY_STALL_EVENT } from "../terminal/ptyClient";
 import { TerminalView } from "./TerminalView";
+import { createTerminalOptions } from "./usePtySession";
 
 // jsdom does not implement requestAnimationFrame. TerminalView's output scheduler
 // (terminalOutputScheduler.ts) relies on it to flush buffered PTY output into xterm, so the
@@ -1365,6 +1366,21 @@ describe("TerminalView settings prop", () => {
     expect(options?.fontSize).toBe(20);
     expect((options?.theme as { background?: string })?.background).toBe("#111111");
     expect(mocks.fitAddonFit.mock.calls.length).toBeGreaterThan(fitsBefore);
+  });
+});
+
+describe("TerminalView platform options", () => {
+  const settings = { background: "#000000", foreground: "#ffffff", fontSize: 14 };
+
+  it("uses ConPTY only for a Windows renderer", () => {
+    expect(createTerminalOptions(settings, "Windows NT 10.0").windowsPty).toEqual({
+      backend: "conpty",
+    });
+  });
+
+  it("does not pass Windows-only xterm options to Linux or WSL renderers", () => {
+    expect(createTerminalOptions(settings, "X11; Linux x86_64").windowsPty).toBeUndefined();
+    expect(createTerminalOptions(settings, "Linux; WSL2").windowsPty).toBeUndefined();
   });
 });
 

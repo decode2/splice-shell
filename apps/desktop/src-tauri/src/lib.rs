@@ -137,9 +137,16 @@ async fn pty_spawn(
     rows: u16,
     program: Option<String>,
     args: Option<Vec<String>>,
-) -> Result<u64, String> {
-    let size = TerminalSize::new(cols, rows).map_err(|error| format!("{error:?}"))?;
-    let command = resolve_pty_command(program, args);
+) -> Result<u64, platform::PlatformError> {
+    let platform = platform::PlatformServices::detect()?;
+    let size = TerminalSize::new(cols, rows).map_err(|error| {
+        platform::PlatformError::native_mechanism(
+            platform.target(),
+            format!("invalid terminal size: {error:?}"),
+            false,
+        )
+    })?;
+    let command = resolve_pty_command(program, args, &platform)?;
     let command_args = command.args.iter().map(String::as_str).collect::<Vec<_>>();
 
     // No predecessor `.take()`/close here: sessions are keyed by id and coexist.
@@ -217,6 +224,28 @@ async fn pty_spawn(
     let cleanup_app = app.clone();
     let exit_app = app;
     let closing_credit = Arc::clone(&credit);
+    #[cfg(unix)]
+    let session = PtySession::spawn_with_options_and_close_hook(
+        &command.program,
+        &command_args,
+        splice_pty::PtySpawnOptions {
+            cwd: None,
+            env: command.environment,
+        },
+        size,
+        move |id, output| {
+            let _ = tx.send((id, output));
+        },
+        move |id| {
+            let _ = exit_app.emit(PTY_EXIT_EVENT, id);
+            let cleanup_app = exit_app.clone();
+            std::thread::spawn(move || {
+                clear_and_close_session_by_id(&cleanup_app, id);
+            });
+        },
+        move || closing_credit.close(),
+    );
+    #[cfg(windows)]
     let session = PtySession::spawn_with_close_hook(
         &command.program,
         &command_args,
@@ -251,8 +280,14 @@ async fn pty_spawn(
         // reader parked in the blocking `send` above is always released, so a
         // never-acking (crashed/closed) webview can never wedge teardown.
         move || closing_credit.close(),
-    )
-    .map_err(|error| error.to_string())?;
+    );
+    let session = session.map_err(|error| {
+        platform::PlatformError::native_mechanism(
+            platform.target(),
+            format!("failed to start PTY: {error}"),
+            true,
+        )
+    })?;
 
     let id = session.id();
     // Publish the id so the flusher's stall reporter can attribute a stall event
@@ -260,17 +295,23 @@ async fn pty_spawn(
     stall_session_id.store(id, std::sync::atomic::Ordering::SeqCst);
 
     {
-        let mut guard = state
-            .sessions
-            .lock()
-            .map_err(|_| "PTY state lock poisoned".to_owned())?;
+        let mut guard = state.sessions.lock().map_err(|_| {
+            platform::PlatformError::native_mechanism(
+                platform.target(),
+                "PTY state lock poisoned",
+                true,
+            )
+        })?;
         guard.insert(id, Arc::new(session));
     }
     {
-        let mut guard = state
-            .credits
-            .lock()
-            .map_err(|_| "PTY credit lock poisoned".to_owned())?;
+        let mut guard = state.credits.lock().map_err(|_| {
+            platform::PlatformError::native_mechanism(
+                platform.target(),
+                "PTY credit lock poisoned",
+                true,
+            )
+        })?;
         guard.insert(id, credit);
     }
 
@@ -285,7 +326,10 @@ async fn pty_spawn(
     // id-scoped, idempotent `clear_and_close_session_by_id`, so a different
     // session is never torn down, and its `close()` runs with the state lock
     // released (no thread-join deadlock).
-    let still_running = clone_pty_session_by_id(state.inner(), id)?
+    let still_running = clone_pty_session_by_id(state.inner(), id)
+        .map_err(|message| {
+            platform::PlatformError::native_mechanism(platform.target(), message, true)
+        })?
         .and_then(|session| session.is_running().ok())
         .unwrap_or(false);
     if !still_running {
@@ -372,47 +416,29 @@ fn clear_and_close_session_by_id(app: &tauri::AppHandle, id: u64) {
 struct PtyCommand {
     program: String,
     args: Vec<String>,
+    environment: Vec<(String, String)>,
 }
 
-fn resolve_pty_command(program: Option<String>, args: Option<Vec<String>>) -> PtyCommand {
+fn resolve_pty_command(
+    program: Option<String>,
+    args: Option<Vec<String>>,
+    platform: &platform::PlatformServices,
+) -> Result<PtyCommand, platform::PlatformError> {
     match program {
-        Some(program) if !program.trim().is_empty() => PtyCommand {
+        Some(program) if !program.trim().is_empty() => Ok(PtyCommand {
             program,
             args: args.unwrap_or_default(),
-        },
-        _ => PtyCommand {
-            program: "cmd.exe".to_owned(),
-            args: default_shell_args(),
-        },
+            environment: vec![],
+        }),
+        _ => {
+            let launch = platform.pty_launch();
+            Ok(PtyCommand {
+                program: launch.command.program,
+                args: launch.command.args,
+                environment: launch.environment,
+            })
+        }
     }
-}
-
-fn default_shell_args() -> Vec<String> {
-    vec![
-        "/D".to_owned(),
-        "/K".to_owned(),
-        format!("set PATH={};%PATH%", common_cli_path_prefix()),
-    ]
-}
-
-fn common_cli_path_prefix() -> String {
-    let user_profile = std::env::var("USERPROFILE").unwrap_or_default();
-    let local_app_data = std::env::var("LOCALAPPDATA").unwrap_or_default();
-
-    [
-        format!("{user_profile}\\.local\\bin"),
-        format!("{user_profile}\\scoop\\shims"),
-        format!("{user_profile}\\scoop\\apps\\nodejs\\current\\bin"),
-        format!("{user_profile}\\scoop\\apps\\nodejs\\current"),
-        format!("{local_app_data}\\agy\\bin"),
-        format!("{local_app_data}\\Programs\\OpenCode\\bin"),
-        format!("{local_app_data}\\Programs\\opencode\\bin"),
-        format!("{local_app_data}\\OpenAI\\Codex\\bin"),
-    ]
-    .into_iter()
-    .filter(|path| !path.starts_with('\\') && !path.is_empty())
-    .collect::<Vec<_>>()
-    .join(";")
 }
 
 /// Id-scoped write core, split out so its miss path is unit-testable without a
@@ -1072,34 +1098,47 @@ mod tests {
 
     #[test]
     fn resolve_pty_command_uses_safe_default_shell() {
+        let linux = platform::PlatformServices::from_facts(platform::PlatformFacts {
+            os: "linux".into(),
+            ubuntu: Some("24.04".into()),
+            wsl: None,
+            wslg: false,
+            path: Some("/usr/local/bin:/usr/bin:/bin".into()),
+        })
+        .expect("supported Linux platform");
+
         assert_eq!(
-            resolve_pty_command(None, None),
+            resolve_pty_command(None, None, &linux).expect("Linux default command"),
             PtyCommand {
-                program: "cmd.exe".to_owned(),
-                args: default_shell_args(),
+                program: "/bin/sh".to_owned(),
+                args: vec![],
+                environment: vec![("PATH".to_owned(), "/usr/local/bin:/usr/bin:/bin".to_owned())],
             }
         );
     }
 
     #[test]
-    fn default_shell_path_includes_common_cli_locations() {
-        let path_prefix = common_cli_path_prefix();
-
-        assert!(path_prefix.contains(".local\\bin"));
-        assert!(path_prefix.contains("scoop\\shims"));
-        assert!(path_prefix.contains("agy\\bin"));
-    }
-
-    #[test]
     fn resolve_pty_command_accepts_configured_program() {
+        let linux = platform::PlatformServices::from_facts(platform::PlatformFacts {
+            os: "linux".into(),
+            ubuntu: Some("24.04".into()),
+            wsl: None,
+            wslg: false,
+            path: Some("/usr/bin:/bin".into()),
+        })
+        .expect("supported Linux platform");
+
         assert_eq!(
             resolve_pty_command(
                 Some("codex.exe".to_owned()),
-                Some(vec!["--help".to_owned()])
-            ),
+                Some(vec!["--help".to_owned()]),
+                &linux,
+            )
+            .expect("configured command"),
             PtyCommand {
                 program: "codex.exe".to_owned(),
                 args: vec!["--help".to_owned()],
+                environment: vec![],
             }
         );
     }

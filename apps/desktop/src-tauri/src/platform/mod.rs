@@ -55,6 +55,18 @@ impl PlatformError {
             retryable,
         }
     }
+    pub fn native_mechanism(
+        target: PlatformTarget,
+        message: impl Into<String>,
+        retryable: bool,
+    ) -> Self {
+        Self::target(
+            target,
+            PlatformErrorCode::NativeMechanismFailed,
+            message,
+            retryable,
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -71,6 +83,12 @@ impl ShellCommand {
             args: args.into_iter().map(Into::into).collect(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PtyLaunch {
+    pub command: ShellCommand,
+    pub environment: Vec<(String, String)>,
 }
 
 pub struct PlatformFacts {
@@ -147,6 +165,21 @@ impl PlatformServices {
     }
     pub fn path(&self) -> &str {
         &self.path
+    }
+    pub fn pty_launch(&self) -> PtyLaunch {
+        PtyLaunch {
+            command: match self.target {
+                PlatformTarget::Windows => windows::shell(),
+                PlatformTarget::NativeUbuntu => linux::shell(),
+                PlatformTarget::Wsl2Wslg => wsl::shell(),
+            },
+            environment: match self.target {
+                PlatformTarget::Windows => vec![],
+                PlatformTarget::NativeUbuntu | PlatformTarget::Wsl2Wslg => {
+                    vec![("PATH".into(), self.path.clone())]
+                }
+            },
+        }
     }
     pub fn reveal_command(&self, path: impl AsRef<Path>) -> Result<ShellCommand, PlatformError> {
         let path = path.as_ref();

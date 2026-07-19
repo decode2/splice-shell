@@ -121,22 +121,15 @@ fn target_capabilities_grant_only_the_finite_terminal_authority() {
         .expect("target capability must be valid JSON");
         assert_eq!(capability["windows"], Value::from(["main"]));
         assert_eq!(capability["platforms"], Value::from([platform]));
-        let expected_permissions: Vec<_> = TERMINAL_PERMISSIONS
-            .iter()
-            .copied()
-            .filter(|permission| platform == "windows" || *permission != "allow-pty-spawn")
-            .collect();
+        let expected_permissions: Vec<_> = TERMINAL_PERMISSIONS.to_vec();
         assert_eq!(
             capability["permissions"],
             serde_json::to_value(expected_permissions).expect("permission list must serialize")
         );
-        assert_eq!(
-            capability["permissions"]
-                .as_array()
-                .expect("target permissions must be an array")
-                .contains(&Value::from("allow-pty-spawn")),
-            platform == "windows"
-        );
+        assert!(capability["permissions"]
+            .as_array()
+            .expect("target permissions must be an array")
+            .contains(&Value::from("allow-pty-spawn")));
     }
 
     let default_capability: Value =
