@@ -13,6 +13,13 @@ on:
         description: 'Git ref to verify; defaults to the triggering ref'
         required: false
         type: string
+  workflow_dispatch:
+    inputs:
+      run_wslg_receipt:
+        description: 'Run the authoritative in-distro WSL2/WSLg receipt on the labeled self-hosted runner'
+        required: true
+        default: false
+        type: boolean
 
 # Cancel superseded runs on the same ref to save runner minutes.
 concurrency:
@@ -121,5 +128,47 @@ jobs:
 
       - name: Run platform default-shell and authority integration
         run: >-
-          cargo test -p splice-pty --test session_contract &&
-          cargo test -p splice-shell-desktop --test platform_authority
+           cargo test -p splice-pty --test session_contract &&
+           cargo test -p splice-shell-desktop --test platform_authority
+
+  wslg-runtime-receipt:
+    name: WSL2/WSLg runtime receipt (manual, authoritative)
+    # Generic Linux and hosted Windows do not prove this model. Successful real WSL2/WSLg receipt is required before support may be declared.
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_wslg_receipt }}
+    runs-on: [self-hosted, linux, x64, wsl2, wslg]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Verify in-distro WSL2 and WSLg prerequisites
+        run: >-
+          grep -q '^ID=ubuntu$' /etc/os-release &&
+          grep -Eq '^VERSION_ID="(22.04|24.04)"$' /etc/os-release &&
+          test -n "$WSL_DISTRO_NAME" &&
+          grep -qi wsl2 /proc/sys/kernel/osrelease &&
+          test -n "$WAYLAND_DISPLAY" &&
+          test -n "$XDG_RUNTIME_DIR" &&
+          test -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" &&
+          test -x /bin/sh && command -v xdg-open
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - name: Run platform authority/default-shell prerequisite
+        run: cargo test -p splice-shell-desktop --test platform_authority
+
+      - name: Run WSL2/WSLg PTY receipt harness
+        env:
+          SPLICE_WSL_RECEIPT: artifacts/wsl-runtime-receipt.json
+          SPLICE_WSL_RECEIPT_REQUIRED: 'true'
+        run: cargo test -p splice-pty --test wsl_runtime_receipt -- --nocapture
+
+      - name: Upload WSL2/WSLg machine-readable receipt
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: wsl2-wslg-runtime-receipt
+          path: artifacts/wsl-runtime-receipt.json
+          if-no-files-found: error
