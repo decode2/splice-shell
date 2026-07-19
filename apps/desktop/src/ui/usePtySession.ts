@@ -48,6 +48,36 @@ export type UsePtySessionOptions = {
   onPtyReady?: (sessionId: number) => void;
 };
 
+export function createTerminalOptions(
+  settings: TerminalSettings,
+  userAgent = navigator.userAgent,
+): NonNullable<ConstructorParameters<typeof Terminal>[0]> {
+  const options = {
+    allowProposedApi: true,
+    cursorBlink: true,
+    fontFamily:
+      '"CaskaydiaCove Nerd Font", "CaskaydiaCove NF", "JetBrainsMono Nerd Font", "FiraCode Nerd Font", "Cascadia Code", "Fira Code", Consolas, monospace',
+    fontSize: settings.fontSize,
+    theme: {
+      background: settings.background,
+      foreground: settings.foreground,
+      cursor: "#38bdf8",
+      selectionBackground: "#1e3a8a",
+    },
+    windowOptions: {
+      getCellSizePixels: true,
+      getWinSizePixels: true,
+      getWinSizeChars: true,
+    },
+  };
+
+  if (userAgent.includes("Windows")) {
+    return { ...options, windowsPty: { backend: "conpty" } };
+  }
+
+  return options;
+}
+
 // Owns the entire PTY session lifecycle: xterm construction, the spawn/restart
 // state machine, restart-storm guard, early-output queue, unmatched-exit
 // tracking, generation/session-id demultiplexing, health reporting, stall
@@ -133,27 +163,7 @@ export function usePtySession({
       return undefined;
     }
 
-    const terminal = new Terminal({
-      allowProposedApi: true,
-      cursorBlink: true,
-      fontFamily:
-        '"CaskaydiaCove Nerd Font", "CaskaydiaCove NF", "JetBrainsMono Nerd Font", "FiraCode Nerd Font", "Cascadia Code", "Fira Code", Consolas, monospace',
-      fontSize: effectiveSettings.fontSize,
-      theme: {
-        background: effectiveSettings.background,
-        foreground: effectiveSettings.foreground,
-        cursor: "#38bdf8",
-        selectionBackground: "#1e3a8a",
-      },
-      windowOptions: {
-        getCellSizePixels: true,
-        getWinSizePixels: true,
-        getWinSizeChars: true,
-      },
-      windowsPty: {
-        backend: "conpty",
-      },
-    });
+    const terminal = new Terminal(createTerminalOptions(effectiveSettings));
     terminalRef.current = terminal;
     const fitAddon = new FitAddon();
     fitAddonRef.current = fitAddon;

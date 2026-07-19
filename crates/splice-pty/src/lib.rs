@@ -285,7 +285,7 @@ impl PtySession {
         )
     }
 
-    fn spawn_with_options_and_close_hook<F, G, H>(
+    pub fn spawn_with_options_and_close_hook<F, G, H>(
         program: &str,
         args: &[&str],
         options: PtySpawnOptions,

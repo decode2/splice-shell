@@ -9,6 +9,7 @@
     "allow-active-paste-target",
     "allow-preview-clipboard-image-paste",
     "allow-preview-active-clipboard-image-paste",
+    "allow-pty-spawn",
     "allow-pty-write",
     "allow-pty-interrupt",
     "allow-pty-resize",

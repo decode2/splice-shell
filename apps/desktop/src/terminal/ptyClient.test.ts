@@ -8,6 +8,7 @@ import {
   PTY_OUTPUT_EVENT,
   PTY_STALL_EVENT,
   resizePty,
+  spawnPty,
   writePty,
 } from "./ptyClient";
 
@@ -86,5 +87,33 @@ describe("ptyClient", () => {
     invokeMock.mockResolvedValue(undefined);
     void killPty(5);
     expect(invokeMock).toHaveBeenCalledWith("pty_kill", { sessionId: 5 });
+  });
+
+  it("leaves the default shell selection to the target-aware backend", () => {
+    invokeMock.mockResolvedValue(7);
+    void spawnPty({ cols: 80, rows: 24 });
+
+    expect(invokeMock).toHaveBeenCalledWith("pty_spawn", {
+      cols: 80,
+      rows: 24,
+      program: undefined,
+      args: undefined,
+    });
+  });
+
+  it("preserves an explicit command and argv in the PTY IPC payload", () => {
+    invokeMock.mockResolvedValue(8);
+    void spawnPty({
+      cols: 100,
+      rows: 40,
+      command: { program: "/usr/bin/fish", args: ["--login"] },
+    });
+
+    expect(invokeMock).toHaveBeenCalledWith("pty_spawn", {
+      cols: 100,
+      rows: 40,
+      program: "/usr/bin/fish",
+      args: ["--login"],
+    });
   });
 });
