@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-close-paste-session"
+description = "Enables the close_paste_session command without any pre-configured scope."
+commands.allow = ["close_paste_session"]
+
+[[permission]]
+identifier = "deny-close-paste-session"
+description = "Denies the close_paste_session command without any pre-configured scope."
+commands.deny = ["close_paste_session"]
