@@ -89,6 +89,37 @@ jobs:
       - name: Test compatibility harness
         run: cargo test -p splice-compat
 
+      # This is deliberately separate from the workspace suite: native Windows
+      # is the authority for ConPTY behavior, not a cross-compiled approximation.
+      - name: ConPTY runtime regression gate (authoritative Windows)
+        if: ${{ !cancelled() }}
+        run: cargo test -p splice-pty --test conpty_smoke
+
       - name: Test
         if: ${{ !cancelled() }}
         run: cargo test --workspace
+
+  ubuntu-runtime:
+    name: Native Ubuntu PTY runtime
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - name: Install Tauri build prerequisites
+        run: >-
+          sudo apt-get update && sudo apt-get install --yes
+          libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - name: Run native Ubuntu PTY fixtures
+        run: cargo test -p splice-pty --test platform_runtime_matrix -- --nocapture
+
+      - name: Run platform default-shell and authority integration
+        run: >-
+          cargo test -p splice-pty --test session_contract &&
+          cargo test -p splice-shell-desktop --test platform_authority
