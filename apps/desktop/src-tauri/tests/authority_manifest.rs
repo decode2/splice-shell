@@ -34,6 +34,16 @@ const TERMINAL_PERMISSIONS: &[&str] = &[
     "allow-close-paste-session",
 ];
 
+const WORKSPACE_COMMANDS: &[&str] = &[
+    "workspace_list",
+    "workspace_create",
+    "workspace_select",
+    "workspace_update",
+    "workspace_close",
+    "workspace_restart",
+    "workspace_recover",
+];
+
 fn handler_commands(source: &str) -> Vec<&str> {
     source
         .split("tauri::generate_handler![")
@@ -60,12 +70,16 @@ fn manifest_commands(source: &str) -> Vec<&str> {
         .collect()
 }
 
+fn registered_commands() -> Vec<&'static str> {
+    APP_COMMANDS.to_vec()
+}
+
 #[test]
 fn authority_manifest_parsing_accepts_crlf_source() {
     let handler_source = include_str!("../src/lib.rs").replace('\n', "\r\n");
     let build_source = include_str!("../build.rs").replace('\n', "\r\n");
 
-    assert_eq!(handler_commands(&handler_source), APP_COMMANDS);
+    assert_eq!(handler_commands(&handler_source), registered_commands());
     assert_eq!(manifest_commands(&build_source), APP_COMMANDS);
 }
 
@@ -75,11 +89,20 @@ fn authority_manifest_matches_registered_handlers_and_target_capabilities() {
     let build_source = include_str!("../build.rs");
     let permissions = include_str!("../permissions/terminal.toml");
 
-    assert_eq!(handler_commands(handler_source), APP_COMMANDS);
+    assert_eq!(handler_commands(handler_source), registered_commands());
+    assert!(WORKSPACE_COMMANDS
+        .iter()
+        .all(|command| !handler_commands(handler_source).contains(command)));
 
     assert_eq!(manifest_commands(build_source), APP_COMMANDS);
     assert!(build_source
         .contains(".app_manifest(tauri_build::AppManifest::new().commands(TERMINAL_COMMANDS))"));
+    assert!(WORKSPACE_COMMANDS
+        .iter()
+        .all(|command| !build_source.contains(&format!("\"{command}\""))));
+    assert!(WORKSPACE_COMMANDS
+        .iter()
+        .all(|command| !permissions.contains(&format!("commands.allow = [\"{command}\"]"))));
     assert_eq!(
         permissions.matches("[[permission]]").count(),
         APP_COMMANDS.len()

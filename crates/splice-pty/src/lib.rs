@@ -201,7 +201,6 @@ pub fn run_conpty_command_with_resize(
     Err(PtyError::UnsupportedPlatform)
 }
 
-#[cfg(unix)]
 #[derive(Debug, Default)]
 pub struct PtySpawnOptions {
     pub cwd: Option<std::path::PathBuf>,
@@ -547,7 +546,6 @@ fn next_pty_session_id() -> u64 {
     NEXT_PTY_SESSION_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
 }
 
-#[cfg(unix)]
 fn validate_spawn_inputs(
     program: &str,
     args: &[&str],
@@ -563,11 +561,9 @@ fn validate_spawn_inputs(
     {
         return Err(PtyError::InvalidWorkingDirectory);
     }
-    if options
-        .env
-        .iter()
-        .any(|(key, value)| key.is_empty() || key.contains('\0') || value.contains('\0'))
-    {
+    if options.env.iter().any(|(key, value)| {
+        key.is_empty() || key.contains('=') || key.contains('\0') || value.contains('\0')
+    }) {
         return Err(PtyError::InvalidEnvironment);
     }
     Ok(())
@@ -695,10 +691,14 @@ impl PtySessionContract for PtySession {
 
 #[cfg(windows)]
 mod windows_conpty {
-    use super::{PtyError, PtySessionLifecycle, TerminalSize};
+    use super::{
+        validate_spawn_inputs, PtyError, PtySessionLifecycle, PtySpawnOptions, TerminalSize,
+    };
     use std::{
-        ffi::c_void,
+        collections::BTreeMap,
+        ffi::{c_void, OsString},
         mem::size_of,
+        os::windows::ffi::OsStrExt,
         ptr::null_mut,
         sync::{
             atomic::{AtomicU64, Ordering},
@@ -837,6 +837,54 @@ mod windows_conpty {
             program: &str,
             args: &[&str],
             size: TerminalSize,
+            on_output: F,
+            on_exit: G,
+            on_closing: H,
+        ) -> Result<Self, PtyError>
+        where
+            F: FnMut(u64, String) + Send + 'static,
+            G: FnOnce(u64) + Send + 'static,
+            H: Fn() + Send + Sync + 'static,
+        {
+            Self::spawn_with_options_and_close_hook(
+                program,
+                args,
+                PtySpawnOptions::default(),
+                size,
+                on_output,
+                on_exit,
+                on_closing,
+            )
+        }
+
+        pub fn spawn_with_options<F, G>(
+            program: &str,
+            args: &[&str],
+            options: PtySpawnOptions,
+            size: TerminalSize,
+            on_output: F,
+            on_exit: G,
+        ) -> Result<Self, PtyError>
+        where
+            F: FnMut(u64, String) + Send + 'static,
+            G: FnOnce(u64) + Send + 'static,
+        {
+            Self::spawn_with_options_and_close_hook(
+                program,
+                args,
+                options,
+                size,
+                on_output,
+                on_exit,
+                || {},
+            )
+        }
+
+        pub fn spawn_with_options_and_close_hook<F, G, H>(
+            program: &str,
+            args: &[&str],
+            options: PtySpawnOptions,
+            size: TerminalSize,
             mut on_output: F,
             on_exit: G,
             on_closing: H,
@@ -846,7 +894,8 @@ mod windows_conpty {
             G: FnOnce(u64) + Send + 'static,
             H: Fn() + Send + Sync + 'static,
         {
-            let handles = spawn_process(program, args, size)?;
+            validate_spawn_inputs(program, args, &options)?;
+            let handles = spawn_process(program, args, &options, size)?;
             let id = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
 
             // Start the exit waiter only AFTER `spawn_process` returned `Ok`,
@@ -1299,7 +1348,7 @@ mod windows_conpty {
         size: TerminalSize,
         resize_to: Option<TerminalSize>,
     ) -> Result<String, PtyError> {
-        let handles = spawn_process(program, args, size)?;
+        let handles = spawn_process(program, args, &PtySpawnOptions::default(), size)?;
         let input_write = handles.input_write;
         let conpty = handles.conpty;
         let process = handles.process;
@@ -1351,9 +1400,12 @@ mod windows_conpty {
     fn spawn_process(
         program: &str,
         args: &[&str],
+        options: &PtySpawnOptions,
         size: TerminalSize,
     ) -> Result<SpawnedProcess, PtyError> {
         let mut command_line = command_line(program, args)?;
+        let current_directory = options.cwd.as_ref().map(|path| wide_null(path.as_os_str()));
+        let environment = (!options.env.is_empty()).then(|| environment_block(&options.env));
         let mut input_read = HANDLE::default();
         let mut input_write = HANDLE::default();
 
@@ -1435,8 +1487,12 @@ mod windows_conpty {
                     | CREATE_UNICODE_ENVIRONMENT
                     | CREATE_SUSPENDED
                     | CREATE_BREAKAWAY_FROM_JOB,
-                None,
-                None,
+                environment.as_ref().map(|block| block.as_ptr().cast()),
+                PCWSTR(
+                    current_directory
+                        .as_ref()
+                        .map_or(std::ptr::null(), |directory| directory.as_ptr()),
+                ),
                 &startup_info.StartupInfo,
                 &mut process_info,
             )
@@ -1455,8 +1511,12 @@ mod windows_conpty {
                         EXTENDED_STARTUPINFO_PRESENT
                             | CREATE_UNICODE_ENVIRONMENT
                             | CREATE_SUSPENDED,
-                        None,
-                        None,
+                        environment.as_ref().map(|block| block.as_ptr().cast()),
+                        PCWSTR(
+                            current_directory
+                                .as_ref()
+                                .map_or(std::ptr::null(), |directory| directory.as_ptr()),
+                        ),
                         &startup_info.StartupInfo,
                         &mut process_info,
                     )
@@ -1513,6 +1573,28 @@ mod windows_conpty {
             conpty,
             job,
         })
+    }
+
+    fn wide_null(value: &std::ffi::OsStr) -> Vec<u16> {
+        value.encode_wide().chain(Some(0)).collect()
+    }
+
+    fn environment_block(overrides: &[(String, String)]) -> Vec<u16> {
+        let mut environment = std::env::vars_os().collect::<BTreeMap<OsString, OsString>>();
+        for (key, value) in overrides {
+            environment.insert(key.into(), value.into());
+        }
+        environment
+            .into_iter()
+            .flat_map(|(key, value)| {
+                key.encode_wide()
+                    .chain(Some('=' as u16))
+                    .chain(value.encode_wide())
+                    .chain(Some(0))
+                    .collect::<Vec<_>>()
+            })
+            .chain(Some(0))
+            .collect()
     }
 
     /// Duplicates the child process handle into an independent, owned handle

@@ -1,6 +1,6 @@
 use splice_core::{
     AgentDescriptor, EnvironmentMetadata, SessionId, SessionLifecycleError, SessionLifecyclePort,
-    TabId, WorkspaceController, WorkspaceId, WorkspaceProfile, WorkspaceStore,
+    TabId, WorkspaceBinding, WorkspaceController, WorkspaceId, WorkspaceProfile, WorkspaceStore,
 };
 use std::{
     collections::BTreeMap,
@@ -8,9 +8,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-#[derive(Default)]
 struct FakeState {
     next_session: u64,
+    runtime_id: String,
     running: BTreeMap<SessionId, WorkspaceId>,
     closed: Vec<SessionId>,
     start_failure: Option<SessionLifecycleError>,
@@ -20,8 +20,33 @@ struct FakeState {
     non_idempotent_close: bool,
 }
 
+impl Default for FakeState {
+    fn default() -> Self {
+        Self {
+            next_session: 0,
+            runtime_id: "test-runtime".to_owned(),
+            running: BTreeMap::new(),
+            closed: vec![],
+            start_failure: None,
+            close_failure: None,
+            remove_directory_on_start: None,
+            remove_directory_on_close: None,
+            non_idempotent_close: false,
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 struct FakeSessions(Arc<Mutex<FakeState>>);
+
+impl FakeSessions {
+    fn with_runtime_id(runtime_id: &str) -> Self {
+        Self(Arc::new(Mutex::new(FakeState {
+            runtime_id: runtime_id.to_owned(),
+            ..FakeState::default()
+        })))
+    }
+}
 
 impl SessionLifecyclePort for FakeSessions {
     fn start(&mut self, profile: &WorkspaceProfile) -> Result<SessionId, SessionLifecycleError> {
@@ -52,6 +77,14 @@ impl SessionLifecyclePort for FakeSessions {
         }
         Ok(())
     }
+
+    fn runtime_id(&self) -> String {
+        self.0
+            .lock()
+            .expect("fake state remains available")
+            .runtime_id
+            .clone()
+    }
 }
 
 fn root(name: &str) -> PathBuf {
@@ -74,6 +107,22 @@ fn profile(id: &str, directory: PathBuf, sessions: Vec<u64>) -> WorkspaceProfile
         sessions,
     )
     .expect("profile is valid")
+}
+
+fn open_profile(
+    id: &str,
+    directory: PathBuf,
+    session_id: SessionId,
+    tab_id: &str,
+    runtime_id: &str,
+) -> WorkspaceProfile {
+    WorkspaceProfile {
+        session_ids: vec![session_id.get()],
+        lifecycle_desired_open: true,
+        lifecycle_tab_id: Some(tab_id.to_owned()),
+        lifecycle_runtime_id: Some(runtime_id.to_owned()),
+        ..profile(id, directory, vec![])
+    }
 }
 
 fn session_error(
@@ -285,6 +334,7 @@ fn update_preserves_pending_start_and_close_intents() {
     store.save(&pending_start).unwrap();
     let mut pending_close = profile("beta", root.clone(), vec![7]);
     pending_close.lifecycle_closing_session_id = Some(7);
+    pending_close.lifecycle_closing_runtime_id = Some("runtime-pending-close".to_owned());
     store.save(&pending_close).unwrap();
     let mut controller = WorkspaceController::new(store, FakeSessions::default());
 
@@ -296,6 +346,10 @@ fn update_preserves_pending_start_and_close_intents() {
     assert_eq!(profiles[0].lifecycle_tab_id.as_deref(), Some("stable-tab"));
     assert_eq!(profiles[1].session_ids, vec![7]);
     assert_eq!(profiles[1].lifecycle_closing_session_id, Some(7));
+    assert_eq!(
+        profiles[1].lifecycle_closing_runtime_id.as_deref(),
+        Some("runtime-pending-close")
+    );
 }
 
 #[test]
@@ -333,6 +387,7 @@ fn recovery_continues_after_an_earlier_profile_fails() {
     let store = WorkspaceStore::new(&root).unwrap();
     let mut alpha = profile("alpha", root.clone(), vec![7]);
     alpha.lifecycle_closing_session_id = Some(7);
+    alpha.lifecycle_closing_runtime_id = Some("test-runtime".to_owned());
     store.save(&alpha).unwrap();
     store.save(&profile("beta", root, vec![9])).unwrap();
     let fake = FakeSessions::default();
@@ -368,8 +423,9 @@ fn close_failure_persists_cleanup_intent_for_reconstructed_recovery() {
         controller.list().unwrap(),
         vec![WorkspaceProfile {
             session_ids: vec![alpha.session_id.get()],
-            lifecycle_tab_id: Some("tab-alpha".to_owned()),
+            lifecycle_runtime_id: Some("test-runtime".to_owned()),
             lifecycle_closing_session_id: Some(alpha.session_id.get()),
+            lifecycle_closing_runtime_id: Some("test-runtime".to_owned()),
             ..profile("alpha", root.clone(), vec![])
         }]
     );
@@ -503,7 +559,13 @@ fn close_persistence_failure_does_not_close_and_keeps_other_workspaces_isolated(
         controller.list().unwrap(),
         vec![
             profile("alpha", working_directory.clone(), vec![]),
-            profile("beta", working_directory, vec![beta.session_id.get()]),
+            open_profile(
+                "beta",
+                working_directory,
+                beta.session_id,
+                "tab-beta",
+                "test-runtime",
+            ),
         ]
     );
 }
@@ -638,6 +700,9 @@ fn lifecycle_keeps_workspace_tab_and_session_identities_isolated() {
             profile("alpha", root.clone(), vec![]),
             WorkspaceProfile {
                 session_ids: vec![restarted_beta.session_id.get()],
+                lifecycle_desired_open: true,
+                lifecycle_tab_id: Some("tab-beta".to_owned()),
+                lifecycle_runtime_id: Some("test-runtime".to_owned()),
                 ..updated_beta
             },
         ]
@@ -675,9 +740,350 @@ fn recovery_replaces_stale_sessions_and_is_idempotent() {
     assert_eq!(
         controller.list().expect("profiles list"),
         vec![
-            profile("alpha", root.clone(), vec![recovered[0].session_id.get()]),
-            profile("beta", root, vec![recovered[1].session_id.get()]),
+            open_profile(
+                "alpha",
+                root.clone(),
+                recovered[0].session_id,
+                "alpha",
+                "test-runtime",
+            ),
+            open_profile(
+                "beta",
+                root,
+                recovered[1].session_id,
+                "beta",
+                "test-runtime",
+            ),
         ]
     );
     assert_eq!(state.lock().unwrap().running.len(), 2);
+}
+
+#[test]
+fn recovery_normalizes_all_stale_runtime_associations_before_reusing_session_ids() {
+    let root = root("recovery-atomic-normalization");
+    let store = WorkspaceStore::new(&root).expect("store root is absolute");
+    let mut alpha = profile("alpha", root.clone(), vec![2]);
+    alpha.lifecycle_tab_id = Some("tab-alpha".to_owned());
+    let mut beta = profile("beta", root.clone(), vec![1]);
+    beta.lifecycle_tab_id = Some("tab-beta".to_owned());
+    store
+        .save(&alpha)
+        .expect("alpha persisted with an old runtime ID");
+    store
+        .save(&beta)
+        .expect("beta persisted with an old runtime ID");
+    let mut controller = WorkspaceController::new(store, FakeSessions::default());
+
+    let recovered = controller
+        .recover()
+        .expect("recovery clears every stale association before allocating IDs");
+
+    assert_eq!(
+        recovered,
+        vec![
+            WorkspaceBinding {
+                workspace_id: WorkspaceId::new("alpha").unwrap(),
+                tab_id: TabId::new("tab-alpha").unwrap(),
+                session_id: SessionId::new(1).unwrap(),
+            },
+            WorkspaceBinding {
+                workspace_id: WorkspaceId::new("beta").unwrap(),
+                tab_id: TabId::new("tab-beta").unwrap(),
+                session_id: SessionId::new(2).unwrap(),
+            },
+        ]
+    );
+}
+
+#[test]
+fn explicit_close_after_natural_exit_durably_clears_recovery_intent() {
+    let root = root("explicit-close-after-natural-exit");
+    let fake = FakeSessions::default();
+    let mut controller =
+        WorkspaceController::new(WorkspaceStore::new(&root).unwrap(), fake.clone());
+    let alpha = controller
+        .create(
+            profile("alpha", root.clone(), vec![]),
+            TabId::new("tab-alpha").unwrap(),
+        )
+        .expect("alpha starts");
+    controller
+        .reconcile_terminated_session(alpha.session_id)
+        .expect("natural exit preserves recoverable intent");
+
+    controller
+        .close(&alpha.workspace_id)
+        .expect("explicit close clears the durable intent even without a binding");
+    drop(controller);
+
+    let mut reconstructed = WorkspaceController::new(WorkspaceStore::new(&root).unwrap(), fake);
+    assert!(reconstructed
+        .recover()
+        .expect("closed workspaces are never restarted")
+        .is_empty());
+    assert_eq!(
+        reconstructed.list().unwrap(),
+        vec![profile("alpha", root, vec![])]
+    );
+}
+
+#[test]
+fn successful_start_preserves_the_durable_tab_id() {
+    let root = root("start-preserves-tab-id");
+    let mut controller =
+        WorkspaceController::new(WorkspaceStore::new(&root).unwrap(), FakeSessions::default());
+
+    controller
+        .create(
+            profile("alpha", root.clone(), vec![]),
+            TabId::new("stable-tab").unwrap(),
+        )
+        .expect("start succeeds");
+
+    assert_eq!(
+        controller.list().unwrap()[0].lifecycle_tab_id.as_deref(),
+        Some("stable-tab"),
+        "a successful start must not discard the durable tab identity"
+    );
+}
+
+#[test]
+fn recovery_drops_a_stale_close_intent_from_another_runtime_without_closing_a_reused_id() {
+    let root = root("recovery-runtime-identity-mismatch");
+    let old_sessions = FakeSessions::with_runtime_id("epoch-old");
+    let old_state = old_sessions.0.clone();
+    let mut old_controller = WorkspaceController::new(
+        WorkspaceStore::new(&root).expect("store root is absolute"),
+        old_sessions,
+    );
+    let beta = old_controller
+        .create(
+            profile("beta", root.clone(), vec![]),
+            TabId::new("tab-beta").unwrap(),
+        )
+        .expect("old beta starts as session one");
+    old_state.lock().unwrap().close_failure = Some(retryable_error("session-close-failed"));
+    old_controller
+        .close(&beta.workspace_id)
+        .expect_err("old beta persists a close intent before its port failure");
+    drop(old_controller);
+
+    let current_sessions = FakeSessions::with_runtime_id("epoch-new");
+    let current_state = current_sessions.0.clone();
+    let mut controller = WorkspaceController::new(
+        WorkspaceStore::new(&root).expect("store root is absolute"),
+        current_sessions,
+    );
+    let alpha = controller
+        .create(
+            profile("alpha", root.clone(), vec![]),
+            TabId::new("tab-alpha").unwrap(),
+        )
+        .expect("new alpha reuses session one in its new runtime");
+    assert_eq!(alpha.session_id, beta.session_id);
+
+    assert_eq!(
+        controller
+            .recover()
+            .expect("stale beta cleanup is discarded"),
+        vec![alpha.clone()]
+    );
+    assert_eq!(controller.bindings(), vec![alpha.clone()]);
+    let profiles = controller.list().expect("profiles remain persisted");
+    assert_eq!(
+        profiles[0],
+        open_profile(
+            "alpha",
+            root.clone(),
+            alpha.session_id,
+            "tab-alpha",
+            "epoch-new",
+        )
+    );
+    assert_eq!(profiles[1], profile("beta", root, vec![]));
+    let state = current_state.lock().unwrap();
+    assert!(
+        state.closed.is_empty(),
+        "beta must not close alpha's reused ID"
+    );
+    assert_eq!(
+        state.running,
+        BTreeMap::from([(alpha.session_id, alpha.workspace_id)])
+    );
+}
+
+#[test]
+fn recovery_reconciles_a_close_intent_from_the_same_runtime() {
+    let root = root("recovery-runtime-identity-match");
+    let sessions = FakeSessions::with_runtime_id("epoch-current");
+    let state = sessions.0.clone();
+    let mut controller = WorkspaceController::new(
+        WorkspaceStore::new(&root).expect("store root is absolute"),
+        sessions,
+    );
+    let beta = controller
+        .create(
+            profile("beta", root.clone(), vec![]),
+            TabId::new("tab-beta").unwrap(),
+        )
+        .expect("beta starts");
+    state.lock().unwrap().close_failure = Some(retryable_error("session-close-failed"));
+    controller
+        .close(&beta.workspace_id)
+        .expect_err("close intent remains durable while the port is unavailable");
+    state.lock().unwrap().close_failure = None;
+    drop(controller);
+
+    let mut recovered = WorkspaceController::new(
+        WorkspaceStore::new(&root).expect("store root is absolute"),
+        FakeSessions(state.clone()),
+    );
+    assert!(recovered
+        .recover()
+        .expect("same-runtime close intent is reconciled")
+        .is_empty());
+    assert_eq!(
+        recovered.list().unwrap(),
+        vec![profile("beta", root, vec![])]
+    );
+    let state = state.lock().unwrap();
+    assert_eq!(state.closed, vec![beta.session_id]);
+    assert!(state.running.is_empty());
+}
+
+#[test]
+fn recovery_discards_a_legacy_close_intent_without_a_runtime_id() {
+    let root = root("recovery-legacy-runtime-identity");
+    let store = WorkspaceStore::new(&root).expect("store root is absolute");
+    let mut beta = profile("beta", root.clone(), vec![7]);
+    beta.lifecycle_tab_id = Some("tab-beta".to_owned());
+    beta.lifecycle_closing_session_id = Some(7);
+    store
+        .save(&beta)
+        .expect("profiles written before runtime identity remain readable");
+    let fake = FakeSessions::with_runtime_id("epoch-new");
+    let state = fake.0.clone();
+    let mut controller = WorkspaceController::new(store, fake);
+
+    assert!(controller
+        .recover()
+        .expect("legacy cleanup intent is safely discarded")
+        .is_empty());
+    assert_eq!(
+        controller.list().unwrap(),
+        vec![profile("beta", root, vec![])]
+    );
+    assert!(state.lock().unwrap().closed.is_empty());
+}
+
+#[test]
+fn terminated_session_reconciles_only_its_binding_and_allows_create_or_restart_to_replace_it() {
+    let root = root("terminated-session");
+    let store = WorkspaceStore::new(&root).expect("store root is absolute");
+    let fake = FakeSessions::default();
+    let mut controller = WorkspaceController::new(store, fake);
+    let alpha_id = WorkspaceId::new("alpha").expect("workspace ID is valid");
+    let beta_id = WorkspaceId::new("beta").expect("workspace ID is valid");
+
+    let alpha = controller
+        .create(
+            profile("alpha", root.clone(), vec![]),
+            TabId::new("tab-alpha").expect("tab ID is valid"),
+        )
+        .expect("alpha starts");
+    let beta = controller
+        .create(
+            profile("beta", root.clone(), vec![]),
+            TabId::new("tab-beta").expect("tab ID is valid"),
+        )
+        .expect("beta starts");
+
+    controller
+        .reconcile_terminated_session(alpha.session_id)
+        .expect("natural exit reconciles its workspace");
+    controller
+        .reconcile_terminated_session(alpha.session_id)
+        .expect("a repeated exit callback is idempotent");
+
+    assert_eq!(
+        controller.bindings(),
+        vec![beta.clone()],
+        "an exit never clears another workspace binding"
+    );
+    let profiles = controller.list().expect("profiles remain readable");
+    assert_eq!(profiles[0].id, alpha_id);
+    assert!(profiles[0].session_ids.is_empty());
+    assert_eq!(profiles[0].lifecycle_tab_id.as_deref(), Some("tab-alpha"));
+    assert_eq!(profiles[1].id, beta_id);
+    assert_eq!(profiles[1].session_ids, vec![beta.session_id.get()]);
+
+    let replacement = controller
+        .create(
+            profile("alpha", root.clone(), vec![]),
+            TabId::new("tab-alpha").expect("tab ID is valid"),
+        )
+        .expect("create replaces an exited session instead of returning its stale ID");
+    assert_ne!(replacement.session_id, alpha.session_id);
+
+    controller
+        .reconcile_terminated_session(replacement.session_id)
+        .expect("replacement exit reconciles");
+    let restarted = controller
+        .restart(&alpha_id)
+        .expect("restart replaces the reconciled session");
+    assert_ne!(restarted.session_id, replacement.session_id);
+}
+
+#[test]
+fn terminated_session_save_failure_drops_dead_binding_and_retries_after_store_recovers() {
+    let root = root("terminated-session-save-retry");
+    let fake = FakeSessions::default();
+    let state = fake.0.clone();
+    let mut controller = WorkspaceController::new(WorkspaceStore::new(&root).unwrap(), fake);
+    let original = controller
+        .create(
+            profile("alpha", root.clone(), vec![]),
+            TabId::new("tab-alpha").unwrap(),
+        )
+        .unwrap();
+
+    state.lock().unwrap().running.remove(&original.session_id);
+    let primary = root.join("workspace-profiles.v1.json");
+    let backup = root.join("workspace-profiles.v1.json.bak");
+    let _ = std::fs::remove_file(&backup);
+    std::fs::rename(&primary, &backup).unwrap();
+    std::fs::create_dir(&primary).unwrap();
+
+    let failure = controller
+        .reconcile_terminated_session(original.session_id)
+        .expect_err("a failed reconciliation save is returned");
+    assert_eq!(failure.contract().code, "workspace-store-failure");
+    assert!(failure.contract().retryable);
+    assert!(controller.bindings().is_empty());
+
+    let retry = controller
+        .create(
+            profile("alpha", root.clone(), vec![]),
+            TabId::new("tab-alpha").unwrap(),
+        )
+        .expect_err("a pending reconciliation prevents a stale session from returning");
+    assert_eq!(retry.contract().code, "workspace-store-failure");
+    assert!(retry.contract().retryable);
+
+    std::fs::remove_dir(&primary).unwrap();
+    let replacement = controller
+        .create(
+            profile("alpha", root.clone(), vec![]),
+            TabId::new("tab-alpha").unwrap(),
+        )
+        .expect("store recovery persists the termination before starting a replacement");
+
+    assert_ne!(replacement.session_id, original.session_id);
+    let state = state.lock().unwrap();
+    assert_eq!(state.next_session, replacement.session_id.get());
+    assert_eq!(
+        state.running,
+        BTreeMap::from([(replacement.session_id, replacement.workspace_id.clone())])
+    );
 }

@@ -1,5 +1,9 @@
 use serde::Serialize;
-use splice_core::{AdapterRegistry, PastePayload, PasteRoute};
+use splice_core::{
+    AdapterRegistry, LifecycleError, PastePayload, PasteRoute, SessionId, SessionLifecycleError,
+    SessionLifecyclePort, TabId, WorkspaceBinding, WorkspaceController, WorkspaceLifecycleError,
+    WorkspaceProfile, WorkspaceStore,
+};
 use splice_pty::flow::{
     run_flusher_loop_with_stall, CreditWindow, FlushControl, CREDIT_STALL_TIMEOUT,
     PTY_CREDIT_WINDOW_BYTES, PTY_OUTPUT_CHANNEL_CAPACITY,
@@ -43,6 +47,120 @@ struct PtyState {
     // *closed* by the session's close hook, which covers every teardown path
     // (kill, natural exit, write failure, and `Drop` at app shutdown).
     credits: Mutex<HashMap<u64, Arc<CreditWindow>>>,
+}
+
+struct WorkspaceCommandState<P> {
+    controller: Mutex<WorkspaceController<P>>,
+}
+
+impl<P> WorkspaceCommandState<P> {
+    fn new(controller: WorkspaceController<P>) -> Self {
+        Self {
+            controller: Mutex::new(controller),
+        }
+    }
+}
+
+fn workspace_lock_error() -> LifecycleError {
+    LifecycleError {
+        code: "workspace-state-unavailable".to_owned(),
+        message: "Workspace state is unavailable.".to_owned(),
+        platform: None,
+        retryable: true,
+    }
+}
+
+#[allow(dead_code)]
+fn parse_workspace_id(value: String) -> Result<splice_core::WorkspaceId, LifecycleError> {
+    splice_core::WorkspaceId::new(value).map_err(|_| LifecycleError {
+        code: "invalid-workspace-id".to_owned(),
+        message: "Workspace ID is invalid.".to_owned(),
+        platform: None,
+        retryable: false,
+    })
+}
+
+fn with_workspace_controller<P, T>(
+    state: &WorkspaceCommandState<P>,
+    operation: impl FnOnce(&mut WorkspaceController<P>) -> Result<T, WorkspaceLifecycleError>,
+) -> Result<T, LifecycleError>
+where
+    P: SessionLifecyclePort,
+{
+    let mut controller = state
+        .controller
+        .lock()
+        .map_err(|_| workspace_lock_error())?;
+    operation(&mut controller).map_err(|error| error.contract())
+}
+
+#[allow(dead_code)]
+fn workspace_list_impl<P: SessionLifecyclePort>(
+    state: &WorkspaceCommandState<P>,
+) -> Result<Vec<WorkspaceProfile>, LifecycleError> {
+    with_workspace_controller(state, |controller| controller.list())
+}
+
+#[allow(dead_code)]
+fn workspace_create_impl<P: SessionLifecyclePort>(
+    state: &WorkspaceCommandState<P>,
+    profile: WorkspaceProfile,
+    tab_id: String,
+) -> Result<WorkspaceBinding, LifecycleError> {
+    let tab_id = TabId::new(tab_id).map_err(|error| error.contract())?;
+    with_workspace_controller(state, |controller| controller.create(profile, tab_id))
+}
+
+#[allow(dead_code)]
+fn workspace_select_impl<P: SessionLifecyclePort>(
+    state: &WorkspaceCommandState<P>,
+    workspace_id: String,
+) -> Result<(), LifecycleError> {
+    let workspace_id = parse_workspace_id(workspace_id)?;
+    with_workspace_controller(state, |controller| controller.select(&workspace_id))
+}
+
+#[allow(dead_code)]
+fn workspace_update_impl<P: SessionLifecyclePort>(
+    state: &WorkspaceCommandState<P>,
+    profile: WorkspaceProfile,
+) -> Result<(), LifecycleError> {
+    with_workspace_controller(state, |controller| controller.update(profile))
+}
+
+#[allow(dead_code)]
+fn workspace_close_impl<P: SessionLifecyclePort>(
+    state: &WorkspaceCommandState<P>,
+    workspace_id: String,
+) -> Result<(), LifecycleError> {
+    let workspace_id = parse_workspace_id(workspace_id)?;
+    with_workspace_controller(state, |controller| controller.close(&workspace_id))
+}
+
+#[allow(dead_code)]
+fn workspace_restart_impl<P: SessionLifecyclePort>(
+    state: &WorkspaceCommandState<P>,
+    workspace_id: String,
+) -> Result<WorkspaceBinding, LifecycleError> {
+    let workspace_id = parse_workspace_id(workspace_id)?;
+    with_workspace_controller(state, |controller| controller.restart(&workspace_id))
+}
+
+#[allow(dead_code)]
+fn workspace_recover_impl<P: SessionLifecyclePort>(
+    state: &WorkspaceCommandState<P>,
+) -> Result<Vec<WorkspaceBinding>, LifecycleError> {
+    with_workspace_controller(state, |controller| controller.recover())
+}
+
+fn workspace_reconcile_terminated_session_impl<P: SessionLifecyclePort>(
+    state: &WorkspaceCommandState<P>,
+    session_id: u64,
+) -> Result<(), LifecycleError> {
+    let session_id = SessionId::new(session_id).map_err(|error| error.contract())?;
+    with_workspace_controller(state, |controller| {
+        controller.reconcile_terminated_session(session_id)
+    })
 }
 
 /// Payload for the global `pty-output` event. Every emission carries the
@@ -138,6 +256,17 @@ async fn pty_spawn(
     program: Option<String>,
     args: Option<Vec<String>>,
 ) -> Result<u64, platform::PlatformError> {
+    pty_spawn_impl(&app, state.inner(), cols, rows, program, args)
+}
+
+fn pty_spawn_impl(
+    app: &tauri::AppHandle,
+    state: &PtyState,
+    cols: u16,
+    rows: u16,
+    program: Option<String>,
+    args: Option<Vec<String>>,
+) -> Result<u64, platform::PlatformError> {
     let platform = platform::PlatformServices::detect()?;
     let size = TerminalSize::new(cols, rows).map_err(|error| {
         platform::PlatformError::native_mechanism(
@@ -147,6 +276,27 @@ async fn pty_spawn(
         )
     })?;
     let command = resolve_pty_command(program, args, &platform)?;
+    pty_spawn_with_configuration(
+        app,
+        state,
+        size,
+        PtySpawnConfiguration {
+            cwd: None,
+            environment: command.environment.clone(),
+            command,
+        },
+        &platform,
+    )
+}
+
+fn pty_spawn_with_configuration(
+    app: &tauri::AppHandle,
+    state: &PtyState,
+    size: TerminalSize,
+    configuration: PtySpawnConfiguration,
+    platform: &platform::PlatformServices,
+) -> Result<u64, platform::PlatformError> {
+    let command = configuration.command;
     let command_args = command.args.iter().map(String::as_str).collect::<Vec<_>>();
 
     // No predecessor `.take()`/close here: sessions are keyed by id and coexist.
@@ -222,15 +372,15 @@ async fn pty_spawn(
     });
 
     let cleanup_app = app.clone();
-    let exit_app = app;
+    let exit_app = app.clone();
     let closing_credit = Arc::clone(&credit);
     #[cfg(unix)]
     let session = PtySession::spawn_with_options_and_close_hook(
         &command.program,
         &command_args,
         splice_pty::PtySpawnOptions {
-            cwd: None,
-            env: command.environment,
+            cwd: configuration.cwd,
+            env: configuration.environment,
         },
         size,
         move |id, output| {
@@ -246,9 +396,13 @@ async fn pty_spawn(
         move || closing_credit.close(),
     );
     #[cfg(windows)]
-    let session = PtySession::spawn_with_close_hook(
+    let session = PtySession::spawn_with_options_and_close_hook(
         &command.program,
         &command_args,
+        splice_pty::PtySpawnOptions {
+            cwd: configuration.cwd,
+            env: configuration.environment,
+        },
         size,
         move |id, output| {
             // Deliberately BLOCKING when the channel is full: this is the brake.
@@ -326,14 +480,16 @@ async fn pty_spawn(
     // id-scoped, idempotent `clear_and_close_session_by_id`, so a different
     // session is never torn down, and its `close()` runs with the state lock
     // released (no thread-join deadlock).
-    let still_running = clone_pty_session_by_id(state.inner(), id)
+    let still_running = clone_pty_session_by_id(state, id)
         .map_err(|message| {
             platform::PlatformError::native_mechanism(platform.target(), message, true)
         })?
         .and_then(|session| session.is_running().ok())
         .unwrap_or(false);
     if !still_running {
-        clear_and_close_session_by_id(&cleanup_app, id);
+        std::thread::spawn(move || {
+            clear_and_close_session_by_id(&cleanup_app, id);
+        });
     }
 
     Ok(id)
@@ -410,6 +566,9 @@ fn clear_and_close_session_by_id(app: &tauri::AppHandle, id: u64) {
     // Session close hook calling sweep_temp_images (CLIP-3)
     let temp_dir = std::env::temp_dir().join("splice-shell").join("clipboard");
     let _ = splice_clipboard::sweep_temp_images(&temp_dir);
+    if let Err(error) = reconcile_desktop_workspace_session(app, id) {
+        log::warn!("failed to reconcile terminated workspace session {id}: {error:?}");
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -445,7 +604,12 @@ fn resolve_pty_command(
 /// Tauri `State`. A miss returns the EXACT string `"PTY session is not
 /// running"`, which the frontend's `isClosedPtyInputError` matches verbatim —
 /// changing it is a regression.
-fn pty_write_impl(state: &PtyState, session_id: u64, data: &str) -> Result<(), String> {
+fn pty_write_impl(
+    state: &PtyState,
+    session_id: u64,
+    data: &str,
+    reconcile_terminated_session: impl FnOnce(u64) -> Result<(), String>,
+) -> Result<(), String> {
     let session = clone_pty_session_by_id(state, session_id)?
         .ok_or_else(|| "PTY session is not running".to_owned())?;
 
@@ -456,6 +620,11 @@ fn pty_write_impl(state: &PtyState, session_id: u64, data: &str) -> Result<(), S
         Err(error) if error.is_terminal_closed() => {
             clear_pty_session_if_current(state, &session);
             session.close();
+            // The PTY registry locks are released by `clear_pty_session_if_current`
+            // and `close` has completed before this controller operation. This is
+            // the same convergence path as kill/natural exit, while avoiding a
+            // reentrant workspace-controller lock if their callbacks race.
+            reconcile_terminated_session(session_id)?;
             Err("PTY session closed; start a new terminal session".to_owned())
         }
         Err(error) => Err(error.to_string()),
@@ -464,11 +633,15 @@ fn pty_write_impl(state: &PtyState, session_id: u64, data: &str) -> Result<(), S
 
 #[tauri::command]
 async fn pty_write(
+    app: tauri::AppHandle,
     state: State<'_, PtyState>,
     session_id: u64,
     data: String,
 ) -> Result<(), String> {
-    pty_write_impl(state.inner(), session_id, &data)
+    pty_write_impl(state.inner(), session_id, &data, |terminated_session_id| {
+        reconcile_desktop_workspace_session(&app, terminated_session_id)
+            .map_err(|error| error.message)
+    })
 }
 
 #[tauri::command]
@@ -502,8 +675,220 @@ fn pty_kill_impl(state: &PtyState, session_id: u64) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn pty_kill(state: State<'_, PtyState>, session_id: u64) -> Result<(), String> {
-    pty_kill_impl(state.inner(), session_id)
+async fn pty_kill(
+    app: tauri::AppHandle,
+    state: State<'_, PtyState>,
+    session_id: u64,
+) -> Result<(), String> {
+    pty_kill_impl(state.inner(), session_id)?;
+    reconcile_desktop_workspace_session(&app, session_id).map_err(|error| error.message)
+}
+
+struct DesktopWorkspaceSessions {
+    app: tauri::AppHandle,
+    runtime_id: String,
+}
+
+fn desktop_runtime_id() -> String {
+    static RUNTIME_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    RUNTIME_ID
+        .get_or_init(|| {
+            let started_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos());
+            format!("runtime-{}-{started_at}", std::process::id())
+        })
+        .clone()
+}
+
+impl SessionLifecyclePort for DesktopWorkspaceSessions {
+    fn start(&mut self, profile: &WorkspaceProfile) -> Result<SessionId, SessionLifecycleError> {
+        let state = self.app.state::<PtyState>();
+        let platform = platform::PlatformServices::detect().map_err(workspace_session_error)?;
+        let configuration = workspace_spawn_configuration(profile, &platform)?;
+        let session_id = pty_spawn_with_configuration(
+            &self.app,
+            state.inner(),
+            TerminalSize::new(80, 24).map_err(|error| SessionLifecycleError {
+                code: "invalid-terminal-size".to_owned(),
+                message: format!("invalid terminal size: {error:?}"),
+                platform: None,
+                retryable: false,
+            })?,
+            configuration,
+            &platform,
+        )
+        .map_err(workspace_session_error)?;
+        SessionId::new(session_id).map_err(|_| SessionLifecycleError {
+            code: "invalid-session-id".to_owned(),
+            message: "PTY returned an invalid session ID.".to_owned(),
+            platform: None,
+            retryable: false,
+        })
+    }
+
+    fn close(&mut self, session: SessionId) -> Result<(), SessionLifecycleError> {
+        let state = self.app.state::<PtyState>();
+        pty_kill_impl(state.inner(), session.get()).map_err(|message| SessionLifecycleError {
+            code: "pty-close-failed".to_owned(),
+            message,
+            platform: None,
+            retryable: true,
+        })
+    }
+
+    fn runtime_id(&self) -> String {
+        self.runtime_id.clone()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PtySpawnConfiguration {
+    command: PtyCommand,
+    cwd: Option<std::path::PathBuf>,
+    environment: Vec<(String, String)>,
+}
+
+fn workspace_spawn_configuration(
+    profile: &WorkspaceProfile,
+    platform: &platform::PlatformServices,
+) -> Result<PtySpawnConfiguration, SessionLifecycleError> {
+    if !profile.working_directory.is_absolute() || !profile.working_directory.is_dir() {
+        return Err(SessionLifecycleError {
+            code: "invalid-working-directory".to_owned(),
+            message: format!(
+                "Workspace working directory is unavailable: {}",
+                profile.working_directory.display()
+            ),
+            platform: None,
+            retryable: false,
+        });
+    }
+
+    let launch = platform.pty_launch();
+    let command = if profile.agent.id == "generic-tui" {
+        PtyCommand {
+            program: launch.command.program,
+            args: launch.command.args,
+            environment: vec![],
+        }
+    } else {
+        PtyCommand {
+            program: profile.agent.command.clone(),
+            args: vec![],
+            environment: vec![],
+        }
+    };
+    let mut environment = std::collections::BTreeMap::from_iter(launch.environment);
+    for name in &profile.environment.variable_names {
+        let value = std::env::var(name).map_err(|_| SessionLifecycleError {
+            code: "missing-environment".to_owned(),
+            message: format!("Workspace environment variable is unavailable: {name}"),
+            platform: None,
+            retryable: false,
+        })?;
+        environment.insert(name.clone(), value);
+    }
+
+    Ok(PtySpawnConfiguration {
+        command,
+        cwd: Some(profile.working_directory.clone()),
+        environment: environment.into_iter().collect(),
+    })
+}
+
+fn workspace_session_error(error: platform::PlatformError) -> SessionLifecycleError {
+    let code = match error.code {
+        platform::PlatformErrorCode::InvalidPath => "invalid-path",
+        platform::PlatformErrorCode::MissingPath => "missing-path",
+        platform::PlatformErrorCode::MissingEnvironment => "missing-environment",
+        platform::PlatformErrorCode::NativeMechanismFailed => "native-mechanism-failed",
+        platform::PlatformErrorCode::UnsupportedTarget => "unsupported-target",
+        platform::PlatformErrorCode::WslgUnavailable => "wslg-unavailable",
+    };
+    let platform = error.platform.map(|target| match target {
+        platform::PlatformTarget::Windows => "windows",
+        platform::PlatformTarget::NativeUbuntu => "native-ubuntu",
+        platform::PlatformTarget::Wsl2Wslg => "wsl2-wslg",
+    });
+    SessionLifecycleError {
+        code: code.to_owned(),
+        message: error.message,
+        platform: platform.map(str::to_owned),
+        retryable: error.retryable,
+    }
+}
+
+type DesktopWorkspaceState = WorkspaceCommandState<DesktopWorkspaceSessions>;
+
+fn reconcile_desktop_workspace_session(
+    app: &tauri::AppHandle,
+    session_id: u64,
+) -> Result<(), LifecycleError> {
+    let state = app.state::<DesktopWorkspaceState>();
+    workspace_reconcile_terminated_session_impl(state.inner(), session_id)
+}
+
+#[tauri::command]
+#[allow(dead_code)]
+fn workspace_list(
+    state: State<'_, DesktopWorkspaceState>,
+) -> Result<Vec<WorkspaceProfile>, LifecycleError> {
+    workspace_list_impl(state.inner())
+}
+
+#[tauri::command]
+#[allow(dead_code)]
+fn workspace_create(
+    state: State<'_, DesktopWorkspaceState>,
+    profile: WorkspaceProfile,
+    tab_id: String,
+) -> Result<WorkspaceBinding, LifecycleError> {
+    workspace_create_impl(state.inner(), profile, tab_id)
+}
+
+#[tauri::command]
+#[allow(dead_code)]
+fn workspace_select(
+    state: State<'_, DesktopWorkspaceState>,
+    workspace_id: String,
+) -> Result<(), LifecycleError> {
+    workspace_select_impl(state.inner(), workspace_id)
+}
+
+#[tauri::command]
+#[allow(dead_code)]
+fn workspace_update(
+    state: State<'_, DesktopWorkspaceState>,
+    profile: WorkspaceProfile,
+) -> Result<(), LifecycleError> {
+    workspace_update_impl(state.inner(), profile)
+}
+
+#[tauri::command]
+#[allow(dead_code)]
+fn workspace_close(
+    state: State<'_, DesktopWorkspaceState>,
+    workspace_id: String,
+) -> Result<(), LifecycleError> {
+    workspace_close_impl(state.inner(), workspace_id)
+}
+
+#[tauri::command]
+#[allow(dead_code)]
+fn workspace_restart(
+    state: State<'_, DesktopWorkspaceState>,
+    workspace_id: String,
+) -> Result<WorkspaceBinding, LifecycleError> {
+    workspace_restart_impl(state.inner(), workspace_id)
+}
+
+#[tauri::command]
+#[allow(dead_code)]
+fn workspace_recover(
+    state: State<'_, DesktopWorkspaceState>,
+) -> Result<Vec<WorkspaceBinding>, LifecycleError> {
+    workspace_recover_impl(state.inner())
 }
 
 #[tauri::command]
@@ -792,6 +1177,21 @@ pub fn run() {
             let _ = std::fs::remove_dir_all(&temp_dir);
             let _ = splice_clipboard::sweep_temp_images(&temp_dir);
 
+            let workspace_root = app
+                .path()
+                .app_data_dir()
+                .map_err(|error| std::io::Error::other(error.to_string()))?
+                .join("workspaces");
+            let store = WorkspaceStore::new(workspace_root)
+                .map_err(|_| std::io::Error::other("workspace store path is invalid"))?;
+            app.manage(DesktopWorkspaceState::new(WorkspaceController::new(
+                store,
+                DesktopWorkspaceSessions {
+                    app: app.handle().clone(),
+                    runtime_id: desktop_runtime_id(),
+                },
+            )));
+
             // Webview-teardown reaping. When the WebView2 process dies (window
             // close, hard reload, or a renderer crash that also tears the window
             // down), the JS cleanup that calls `killPty` never runs, leaking
@@ -876,6 +1276,408 @@ pub fn run() {
 mod tests {
     use super::*;
 
+    struct RecordingWorkspaceSessions {
+        next: u64,
+        runtime_id: String,
+    }
+
+    impl Default for RecordingWorkspaceSessions {
+        fn default() -> Self {
+            Self {
+                next: 0,
+                runtime_id: "desktop-test-runtime".to_owned(),
+            }
+        }
+    }
+
+    impl splice_core::SessionLifecyclePort for RecordingWorkspaceSessions {
+        fn start(
+            &mut self,
+            _profile: &splice_core::WorkspaceProfile,
+        ) -> Result<splice_core::SessionId, splice_core::SessionLifecycleError> {
+            self.next += 1;
+            Ok(splice_core::SessionId::new(self.next).expect("test session ID is non-zero"))
+        }
+
+        fn close(
+            &mut self,
+            _session: splice_core::SessionId,
+        ) -> Result<(), splice_core::SessionLifecycleError> {
+            Ok(())
+        }
+
+        fn runtime_id(&self) -> String {
+            self.runtime_id.clone()
+        }
+    }
+
+    fn workspace_test_root(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("splice-workspace-command-{name}"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("working")).expect("working directory can be created");
+        root
+    }
+
+    fn workspace_test_state(
+        root: &std::path::Path,
+    ) -> WorkspaceCommandState<RecordingWorkspaceSessions> {
+        WorkspaceCommandState::new(splice_core::WorkspaceController::new(
+            splice_core::WorkspaceStore::new(root.join("store"))
+                .expect("absolute store root is valid"),
+            RecordingWorkspaceSessions::default(),
+        ))
+    }
+
+    fn workspace_profile(id: &str, directory: &std::path::Path) -> splice_core::WorkspaceProfile {
+        splice_core::WorkspaceProfile::new(
+            splice_core::WorkspaceId::new(id).expect("workspace ID is valid"),
+            id,
+            directory.to_path_buf(),
+            splice_core::EnvironmentMetadata::new("development", ["PATH"])
+                .expect("environment metadata is valid"),
+            splice_core::AgentDescriptor::new("codex", "codex").expect("agent descriptor is valid"),
+            vec![],
+        )
+        .expect("workspace profile is valid")
+    }
+
+    fn workspace_test_platform() -> platform::PlatformServices {
+        platform::PlatformServices::from_facts(platform::PlatformFacts {
+            os: "linux".to_owned(),
+            ubuntu: Some("24.04".to_owned()),
+            wsl: None,
+            wslg: false,
+            path: std::env::var("PATH").ok(),
+        })
+        .expect("test platform facts are supported")
+    }
+
+    #[test]
+    fn desktop_runtime_id_is_stable_and_valid_for_persisted_labels() {
+        let first = desktop_runtime_id();
+        let second = desktop_runtime_id();
+
+        assert_eq!(first, second);
+        assert!(!first.is_empty() && first.len() <= 64);
+        assert!(first
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')));
+    }
+
+    #[test]
+    fn workspace_command_state_drives_create_select_update_restart_and_close() {
+        let root = workspace_test_root("lifecycle");
+        let state = workspace_test_state(&root);
+        let profile = workspace_profile("workspace-one", &root.join("working"));
+
+        assert!(workspace_list_impl(&state)
+            .expect("empty store can be listed")
+            .is_empty());
+
+        let created = workspace_create_impl(&state, profile, "tab-main".to_owned())
+            .expect("workspace creation starts a session");
+        assert_eq!(created.workspace_id.as_str(), "workspace-one");
+        assert_eq!(created.tab_id.as_str(), "tab-main");
+        assert_eq!(created.session_id.get(), 1);
+
+        workspace_select_impl(&state, "workspace-one".to_owned())
+            .expect("created workspace can be selected");
+        let mut updated = workspace_list_impl(&state)
+            .expect("created profile can be listed")
+            .pop()
+            .expect("created profile is present");
+        updated.name = "Renamed workspace".to_owned();
+        workspace_update_impl(&state, updated).expect("profile metadata can be updated");
+
+        let restarted = workspace_restart_impl(&state, "workspace-one".to_owned())
+            .expect("selected workspace can restart");
+        assert_eq!(restarted.tab_id.as_str(), "tab-main");
+        assert_eq!(restarted.session_id.get(), 2);
+
+        workspace_close_impl(&state, "workspace-one".to_owned())
+            .expect("workspace close converges");
+        let listed = workspace_list_impl(&state).expect("closed profile remains persisted");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "Renamed workspace");
+        assert!(listed[0].session_ids.is_empty());
+    }
+
+    #[test]
+    fn workspace_command_state_recovers_persisted_intent_and_returns_structured_errors() {
+        let root = workspace_test_root("recovery");
+        let store = splice_core::WorkspaceStore::new(root.join("store"))
+            .expect("absolute store root is valid");
+        let mut profile = workspace_profile("workspace-recovery", &root.join("working"));
+        profile.session_ids = vec![77];
+        profile.lifecycle_tab_id = Some("tab-recovery".to_owned());
+        store
+            .save(&profile)
+            .expect("recovery intent can be persisted");
+        let state = WorkspaceCommandState::new(splice_core::WorkspaceController::new(
+            store,
+            RecordingWorkspaceSessions::default(),
+        ));
+
+        let missing = workspace_select_impl(&state, "missing".to_owned())
+            .expect_err("unknown workspace must not select");
+        assert_eq!(missing.code, "workspace-not-found");
+        assert_eq!(missing.platform, None);
+        assert!(!missing.retryable);
+
+        let recovered = workspace_recover_impl(&state).expect("persisted intent recovers");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].workspace_id.as_str(), "workspace-recovery");
+        assert_eq!(recovered[0].tab_id.as_str(), "tab-recovery");
+        assert_eq!(recovered[0].session_id.get(), 1);
+    }
+
+    #[test]
+    fn workspace_spawn_configuration_uses_profile_cwd_environment_and_selected_agent() {
+        let root = workspace_test_root("spawn-configuration");
+        let profile = workspace_profile("workspace-agent", &root.join("working"));
+        let platform = workspace_test_platform();
+
+        let configuration = workspace_spawn_configuration(&profile, &platform)
+            .expect("a valid workspace profile creates a PTY configuration");
+
+        assert_eq!(configuration.cwd, Some(root.join("working")));
+        assert_eq!(configuration.command.program, "codex");
+        assert!(configuration.command.args.is_empty());
+        assert_eq!(
+            configuration
+                .environment
+                .iter()
+                .find(|(key, _)| key == "PATH")
+                .map(|(_, value)| value),
+            std::env::var("PATH").ok().as_ref()
+        );
+    }
+
+    #[test]
+    fn workspace_spawn_configuration_keeps_the_platform_shell_for_generic_tui() {
+        let root = workspace_test_root("default-shell-configuration");
+        let mut profile = workspace_profile("workspace-default", &root.join("working"));
+        profile.agent = splice_core::AgentDescriptor::new("generic-tui", "default-shell")
+            .expect("generic fallback descriptor is valid");
+        let platform = workspace_test_platform();
+        let expected = platform.pty_launch();
+
+        let configuration = workspace_spawn_configuration(&profile, &platform)
+            .expect("generic fallback keeps the platform launch");
+
+        assert_eq!(configuration.command.program, expected.command.program);
+        assert_eq!(configuration.command.args, expected.command.args);
+    }
+
+    #[test]
+    fn workspace_spawn_configuration_reports_invalid_cwd_and_missing_environment() {
+        let root = workspace_test_root("invalid-spawn-configuration");
+        let mut profile = workspace_profile("workspace-invalid", &root.join("working"));
+        profile.working_directory = std::path::PathBuf::from("relative");
+
+        let invalid_cwd = workspace_spawn_configuration(&profile, &workspace_test_platform())
+            .expect_err("a persisted relative directory must not reach the PTY");
+        assert_eq!(invalid_cwd.code, "invalid-working-directory");
+        assert!(!invalid_cwd.retryable);
+
+        profile.working_directory = root.join("working");
+        profile.environment =
+            splice_core::EnvironmentMetadata::new("development", ["SPLICE_MISSING_WORKSPACE_ENV"])
+                .expect("test environment metadata is valid");
+        let missing_environment =
+            workspace_spawn_configuration(&profile, &workspace_test_platform())
+                .expect_err("a selected but unavailable environment variable must be reported");
+        assert_eq!(missing_environment.code, "missing-environment");
+        assert!(!missing_environment.retryable);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_profile_configuration_reaches_a_live_pty_spawn() {
+        use std::{
+            os::unix::fs::PermissionsExt,
+            sync::mpsc,
+            time::{Duration, Instant},
+        };
+
+        let root = workspace_test_root("live-profile-spawn");
+        let script = root.join("workspace-agent");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf 'cwd=%s path=%s\\n' \"$PWD\" \"$PATH\"\n",
+        )
+        .expect("agent script can be written");
+        let mut permissions = std::fs::metadata(&script)
+            .expect("agent script metadata is readable")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions)
+            .expect("agent script can be made executable");
+        let mut profile = workspace_profile("workspace-live", &root.join("working"));
+        profile.agent =
+            splice_core::AgentDescriptor::new("workspace-agent", script.to_string_lossy())
+                .expect("agent descriptor is valid");
+        let configuration = workspace_spawn_configuration(&profile, &workspace_test_platform())
+            .expect("profile configuration is valid");
+        let args = configuration
+            .command
+            .args
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let (sender, receiver) = mpsc::channel();
+        let session = PtySession::spawn_with_options(
+            &configuration.command.program,
+            &args,
+            splice_pty::PtySpawnOptions {
+                cwd: configuration.cwd,
+                env: configuration.environment,
+            },
+            TerminalSize::new(80, 24).expect("terminal size is valid"),
+            move |_, output| {
+                let _ = sender.send(output);
+            },
+            |_| {},
+        )
+        .expect("profile configuration starts a live PTY");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut output = String::new();
+        while Instant::now() < deadline && !output.contains("cwd=") {
+            if let Ok(chunk) = receiver.recv_timeout(Duration::from_millis(50)) {
+                output.push_str(&chunk);
+            }
+        }
+        session.close();
+        assert!(output.contains(&format!("cwd={}", root.join("working").display())));
+        assert!(output.contains("path="));
+    }
+
+    #[test]
+    fn workspace_terminated_session_reconciliation_replaces_the_dead_binding() {
+        let root = workspace_test_root("terminated-session");
+        let state = workspace_test_state(&root);
+        let profile = workspace_profile("workspace-exit", &root.join("working"));
+
+        let created = workspace_create_impl(&state, profile.clone(), "tab-exit".to_owned())
+            .expect("workspace starts");
+        workspace_reconcile_terminated_session_impl(&state, created.session_id.get())
+            .expect("a PTY exit converges the workspace controller");
+        workspace_reconcile_terminated_session_impl(&state, created.session_id.get())
+            .expect("a duplicate PTY exit remains idempotent");
+
+        let persisted = workspace_list_impl(&state).expect("workspace remains persisted");
+        assert!(persisted[0].session_ids.is_empty());
+        assert_eq!(persisted[0].lifecycle_tab_id.as_deref(), Some("tab-exit"));
+
+        let replacement = workspace_create_impl(&state, profile, "tab-exit".to_owned())
+            .expect("create replaces the terminated PTY session");
+        assert_ne!(replacement.session_id, created.session_id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_closed_write_reconciles_the_workspace_binding_before_recovery() {
+        use std::{
+            sync::{
+                atomic::{AtomicUsize, Ordering},
+                Arc,
+            },
+            time::{Duration, Instant},
+        };
+
+        let pty_state = PtyState::default();
+        let session = Arc::new(
+            PtySession::spawn(
+                "/bin/sh",
+                &["-c", "exit 0"],
+                TerminalSize::new(80, 24).expect("terminal size is valid"),
+                |_, _| {},
+                |_| {},
+            )
+            .expect("exiting PTY starts"),
+        );
+        let session_id = session.id();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while session.is_running().expect("PTY liveness is observable") && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !session.is_running().expect("PTY liveness is observable"),
+            "the exited shell deterministically makes the next write terminal-closed"
+        );
+        // Model the write-teardown race precisely: a terminal that has already
+        // exited is explicitly closed before its deferred natural-exit callback
+        // can reconcile the workspace. `close` suppresses that callback, so the
+        // following write must provide the missing convergence itself.
+        session.close();
+        pty_state
+            .sessions
+            .lock()
+            .expect("PTY state lock works")
+            .insert(session_id, Arc::clone(&session));
+
+        let root = workspace_test_root("terminal-closed-write");
+        let profile = workspace_profile("workspace-write-close", &root.join("working"));
+        let workspace_state = WorkspaceCommandState::new(splice_core::WorkspaceController::new(
+            splice_core::WorkspaceStore::new(root.join("store"))
+                .expect("absolute store root is valid"),
+            RecordingWorkspaceSessions {
+                next: session_id - 1,
+                runtime_id: "desktop-test-runtime".to_owned(),
+            },
+        ));
+        let binding = workspace_create_impl(
+            &workspace_state,
+            profile.clone(),
+            "tab-write-close".to_owned(),
+        )
+        .expect("workspace session is associated with the PTY");
+        assert_eq!(binding.session_id.get(), session_id);
+
+        let reconciliation_calls = Arc::new(AtomicUsize::new(0));
+        let reconciliation_calls_for_write = Arc::clone(&reconciliation_calls);
+        let error = pty_write_impl(&pty_state, session_id, "echo stale\n", |id| {
+            reconciliation_calls_for_write.fetch_add(1, Ordering::SeqCst);
+            workspace_reconcile_terminated_session_impl(&workspace_state, id)
+                .map_err(|error| error.message)
+        })
+        .expect_err("writing to an exited PTY reports terminal closure");
+        assert_eq!(error, "PTY session closed; start a new terminal session");
+        assert_eq!(
+            reconciliation_calls.load(Ordering::SeqCst),
+            1,
+            "a terminal-closed write invokes workspace reconciliation exactly once"
+        );
+        assert!(
+            clone_pty_session_by_id(&pty_state, session_id)
+                .expect("PTY lookup works")
+                .is_none(),
+            "the closed PTY is removed before workspace recovery"
+        );
+
+        let persisted = workspace_list_impl(&workspace_state).expect("workspace remains persisted");
+        assert!(persisted[0].session_ids.is_empty());
+        assert_eq!(persisted[0].lifecycle_runtime_id, None);
+
+        workspace_reconcile_terminated_session_impl(&workspace_state, session_id)
+            .expect("a racing natural-exit callback is idempotent");
+        let replacement =
+            workspace_create_impl(&workspace_state, profile, "tab-write-close".to_owned())
+                .expect("workspace can create a replacement after write teardown");
+        assert_ne!(replacement.session_id.get(), session_id);
+
+        let recovered = workspace_recover_impl(&workspace_state)
+            .expect("later recovery does not restore the dead PTY binding");
+        assert!(
+            recovered
+                .iter()
+                .all(|binding| binding.session_id.get() != session_id),
+            "recovery must never return the terminal-closed session ID"
+        );
+    }
+
     #[test]
     fn app_status_describes_scaffold_state() {
         assert_eq!(app_status(), "Splice Shell scaffold ready");
@@ -953,8 +1755,8 @@ mod tests {
         // `isClosedPtyInputError` on the frontend matches this EXACT string;
         // changing it is a regression (spec: Missing-id write preserves the
         // exact error string).
-        let error =
-            pty_write_impl(&state, 7, "echo hi").expect_err("writing to an unknown id must fail");
+        let error = pty_write_impl(&state, 7, "echo hi", |_| Ok(()))
+            .expect_err("writing to an unknown id must fail");
         assert_eq!(error, "PTY session is not running");
     }
 
@@ -1336,7 +2138,7 @@ mod tests {
             let state_clone = Arc::clone(&state);
             let t = thread::spawn(move || {
                 for _ in 0..50 {
-                    let _ = pty_write_impl(&state_clone, id, "echo hello\r");
+                    let _ = pty_write_impl(&state_clone, id, "echo hello\r", |_| Ok(()));
                     let _ = clone_pty_session_by_id(&state_clone, id);
                 }
             });
