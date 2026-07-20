@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use splice_core::{
     AdapterRegistry, LifecycleError, PastePayload, PasteRoute, SessionId, SessionLifecycleError,
     SessionLifecyclePort, TabId, WorkspaceBinding, WorkspaceController, WorkspaceLifecycleError,
@@ -51,6 +51,141 @@ struct PtyState {
 
 struct WorkspaceCommandState<P> {
     controller: Mutex<WorkspaceController<P>>,
+}
+
+const OUTPUT_ADOPTION_VERSION: u16 = 1;
+const OUTPUT_ADOPTION_ROUTE_BYTES: usize = 1024 * 1024;
+const OUTPUT_ADOPTION_ROUTE_COUNT: usize = 32;
+const OUTPUT_ADOPTION_TOTAL_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceProtocolRequest {
+    version: u16,
+    activation_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceProtocolLimits {
+    per_route_bytes: usize,
+    route_count: usize,
+    total_bytes: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceProtocolNegotiation {
+    boot_id: String,
+    selected: u16,
+    limits: WorkspaceProtocolLimits,
+    commands: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceProtocolActivation {
+    activation_id: String,
+}
+
+struct ActiveWorkspaceProtocol {
+    consumer_instance_id: String,
+    activation_id: String,
+}
+
+struct WorkspaceProtocolState {
+    boot_id: String,
+    activation: Mutex<Option<ActiveWorkspaceProtocol>>,
+}
+
+impl WorkspaceProtocolState {
+    fn new() -> Self {
+        let started_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        Self {
+            boot_id: format!("workspace-adoption-{}-{started_at}", std::process::id()),
+            activation: Mutex::new(None),
+        }
+    }
+}
+
+fn output_adoption_unsupported() -> LifecycleError {
+    LifecycleError {
+        code: "output-adoption-unsupported".to_owned(),
+        message: "Workspace output adoption protocol v1 is unavailable.".to_owned(),
+        platform: None,
+        retryable: false,
+    }
+}
+
+fn workspace_protocol_negotiate_impl(
+    state: &WorkspaceProtocolState,
+    output_adoption: Vec<u16>,
+) -> Result<WorkspaceProtocolNegotiation, LifecycleError> {
+    if !output_adoption.contains(&OUTPUT_ADOPTION_VERSION) {
+        return Err(output_adoption_unsupported());
+    }
+    Ok(WorkspaceProtocolNegotiation {
+        boot_id: state.boot_id.clone(),
+        selected: OUTPUT_ADOPTION_VERSION,
+        limits: WorkspaceProtocolLimits {
+            per_route_bytes: OUTPUT_ADOPTION_ROUTE_BYTES,
+            route_count: OUTPUT_ADOPTION_ROUTE_COUNT,
+            total_bytes: OUTPUT_ADOPTION_TOTAL_BYTES,
+        },
+        commands: vec![
+            "workspace_create".to_owned(),
+            "workspace_recover".to_owned(),
+        ],
+    })
+}
+
+fn workspace_protocol_activate_impl(
+    state: &WorkspaceProtocolState,
+    boot_id: String,
+    version: u16,
+    consumer_instance_id: String,
+) -> Result<WorkspaceProtocolActivation, LifecycleError> {
+    if boot_id != state.boot_id || version != OUTPUT_ADOPTION_VERSION {
+        return Err(output_adoption_unsupported());
+    }
+    let mut activation = state
+        .activation
+        .lock()
+        .map_err(|_| workspace_lock_error())?;
+    if let Some(active) = activation.as_ref() {
+        if active.consumer_instance_id != consumer_instance_id {
+            return Err(output_adoption_unsupported());
+        }
+        return Ok(WorkspaceProtocolActivation {
+            activation_id: active.activation_id.clone(),
+        });
+    }
+    let activation_id = format!("{}-v{version}", state.boot_id);
+    *activation = Some(ActiveWorkspaceProtocol {
+        consumer_instance_id,
+        activation_id: activation_id.clone(),
+    });
+    Ok(WorkspaceProtocolActivation { activation_id })
+}
+
+fn validate_workspace_protocol(
+    state: &WorkspaceProtocolState,
+    protocol: Option<&WorkspaceProtocolRequest>,
+) -> Result<(), LifecycleError> {
+    let Some(protocol) = protocol else {
+        return Ok(());
+    };
+    let activation = state
+        .activation
+        .lock()
+        .map_err(|_| workspace_lock_error())?;
+    let valid = protocol.version == OUTPUT_ADOPTION_VERSION
+        && activation
+            .as_ref()
+            .is_some_and(|active| active.activation_id == protocol.activation_id);
+    valid.then_some(()).ok_or_else(output_adoption_unsupported)
 }
 
 impl<P> WorkspaceCommandState<P> {
@@ -111,6 +246,17 @@ fn workspace_create_impl<P: SessionLifecyclePort>(
     with_workspace_controller(state, |controller| controller.create(profile, tab_id))
 }
 
+fn workspace_create_with_protocol_impl<P: SessionLifecyclePort>(
+    state: &WorkspaceCommandState<P>,
+    protocol_state: &WorkspaceProtocolState,
+    profile: WorkspaceProfile,
+    tab_id: String,
+    protocol: Option<WorkspaceProtocolRequest>,
+) -> Result<WorkspaceBinding, LifecycleError> {
+    validate_workspace_protocol(protocol_state, protocol.as_ref())?;
+    workspace_create_impl(state, profile, tab_id)
+}
+
 #[allow(dead_code)]
 fn workspace_select_impl<P: SessionLifecyclePort>(
     state: &WorkspaceCommandState<P>,
@@ -151,6 +297,15 @@ fn workspace_recover_impl<P: SessionLifecyclePort>(
     state: &WorkspaceCommandState<P>,
 ) -> Result<Vec<WorkspaceBinding>, LifecycleError> {
     with_workspace_controller(state, |controller| controller.recover())
+}
+
+fn workspace_recover_with_protocol_impl<P: SessionLifecyclePort>(
+    state: &WorkspaceCommandState<P>,
+    protocol_state: &WorkspaceProtocolState,
+    protocol: Option<WorkspaceProtocolRequest>,
+) -> Result<Vec<WorkspaceBinding>, LifecycleError> {
+    validate_workspace_protocol(protocol_state, protocol.as_ref())?;
+    workspace_recover_impl(state)
 }
 
 fn workspace_reconcile_terminated_session_impl<P: SessionLifecyclePort>(
@@ -820,6 +975,7 @@ fn workspace_session_error(error: platform::PlatformError) -> SessionLifecycleEr
 }
 
 type DesktopWorkspaceState = WorkspaceCommandState<DesktopWorkspaceSessions>;
+type DesktopWorkspaceProtocolState = WorkspaceProtocolState;
 
 fn reconcile_desktop_workspace_session(
     app: &tauri::AppHandle,
@@ -827,6 +983,24 @@ fn reconcile_desktop_workspace_session(
 ) -> Result<(), LifecycleError> {
     let state = app.state::<DesktopWorkspaceState>();
     workspace_reconcile_terminated_session_impl(state.inner(), session_id)
+}
+
+#[tauri::command]
+fn workspace_protocol_negotiate(
+    state: State<'_, DesktopWorkspaceProtocolState>,
+    output_adoption: Vec<u16>,
+) -> Result<WorkspaceProtocolNegotiation, LifecycleError> {
+    workspace_protocol_negotiate_impl(state.inner(), output_adoption)
+}
+
+#[tauri::command]
+fn workspace_protocol_activate(
+    state: State<'_, DesktopWorkspaceProtocolState>,
+    boot_id: String,
+    version: u16,
+    consumer_instance_id: String,
+) -> Result<WorkspaceProtocolActivation, LifecycleError> {
+    workspace_protocol_activate_impl(state.inner(), boot_id, version, consumer_instance_id)
 }
 
 #[tauri::command]
@@ -839,10 +1013,18 @@ fn workspace_list(
 #[tauri::command]
 fn workspace_create(
     state: State<'_, DesktopWorkspaceState>,
+    protocol_state: State<'_, DesktopWorkspaceProtocolState>,
     profile: WorkspaceProfile,
     tab_id: String,
+    protocol: Option<WorkspaceProtocolRequest>,
 ) -> Result<WorkspaceBinding, LifecycleError> {
-    workspace_create_impl(state.inner(), profile, tab_id)
+    workspace_create_with_protocol_impl(
+        state.inner(),
+        protocol_state.inner(),
+        profile,
+        tab_id,
+        protocol,
+    )
 }
 
 #[tauri::command]
@@ -880,8 +1062,10 @@ fn workspace_restart(
 #[tauri::command]
 fn workspace_recover(
     state: State<'_, DesktopWorkspaceState>,
+    protocol_state: State<'_, DesktopWorkspaceProtocolState>,
+    protocol: Option<WorkspaceProtocolRequest>,
 ) -> Result<Vec<WorkspaceBinding>, LifecycleError> {
-    workspace_recover_impl(state.inner())
+    workspace_recover_with_protocol_impl(state.inner(), protocol_state.inner(), protocol)
 }
 
 #[tauri::command]
@@ -1184,6 +1368,7 @@ pub fn run() {
                     runtime_id: desktop_runtime_id(),
                 },
             )));
+            app.manage(DesktopWorkspaceProtocolState::new());
 
             // Webview-teardown reaping. When the WebView2 process dies (window
             // close, hard reload, or a renderer crash that also tears the window
@@ -1248,6 +1433,8 @@ pub fn run() {
             clipboard_read_text,
             open_path,
             close_paste_session,
+            workspace_protocol_negotiate,
+            workspace_protocol_activate,
             workspace_list,
             workspace_create,
             workspace_select,
@@ -1362,6 +1549,65 @@ mod tests {
         assert!(first
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')));
+    }
+
+    #[test]
+    fn workspace_protocol_negotiates_v1_once_and_rejects_unsupported_versions() {
+        let protocol = WorkspaceProtocolState::new();
+
+        let negotiated = workspace_protocol_negotiate_impl(&protocol, vec![1])
+            .expect("v1 peers negotiate the supported protocol");
+        assert_eq!(negotiated.selected, 1);
+        assert_eq!(negotiated.limits.per_route_bytes, 1024 * 1024);
+
+        let first = workspace_protocol_activate_impl(
+            &protocol,
+            negotiated.boot_id.clone(),
+            1,
+            "workspace-ui-v1".to_owned(),
+        )
+        .expect("v1 activation succeeds");
+        let repeated = workspace_protocol_activate_impl(
+            &protocol,
+            negotiated.boot_id,
+            1,
+            "workspace-ui-v1".to_owned(),
+        )
+        .expect("the same boot activation is idempotent");
+        assert_eq!(first.activation_id, repeated.activation_id);
+
+        let unsupported = workspace_protocol_negotiate_impl(&protocol, vec![2])
+            .expect_err("mixed versions fail closed");
+        assert_eq!(unsupported.code, "output-adoption-unsupported");
+    }
+
+    #[test]
+    fn workspace_protocol_requires_a_valid_token_but_preserves_legacy_omission() {
+        let root = workspace_test_root("protocol-gate");
+        let state = workspace_test_state(&root);
+        let protocol = WorkspaceProtocolState::new();
+        let profile = workspace_profile("workspace-protocol", &root.join("working"));
+
+        let legacy = workspace_create_with_protocol_impl(
+            &state,
+            &protocol,
+            profile.clone(),
+            "tab-legacy".to_owned(),
+            None,
+        )
+        .expect("legacy callers may omit an unpublished protocol token");
+        assert_eq!(legacy.session_id.get(), 1);
+
+        let rejected = workspace_recover_with_protocol_impl(
+            &state,
+            &protocol,
+            Some(WorkspaceProtocolRequest {
+                version: 1,
+                activation_id: "stale-token".to_owned(),
+            }),
+        )
+        .expect_err("a v1 request without the active token is rejected");
+        assert_eq!(rejected.code, "output-adoption-unsupported");
     }
 
     #[test]

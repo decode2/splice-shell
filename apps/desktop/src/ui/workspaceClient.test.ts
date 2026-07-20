@@ -29,31 +29,52 @@ const binding: WorkspaceBinding = {
 };
 
 describe("workspace client", () => {
-  it("maps lifecycle requests to only the workspace Tauri commands", async () => {
+  it("negotiates one v1 activation and propagates its token before create and recover", async () => {
     const invoke = vi.fn(async (command: string) => {
-      if (command === "workspace_list") return [profile];
+      if (command === "workspace_protocol_negotiate") return { bootId: "boot-1", selected: 1, limits: { perRouteBytes: 1048576, routeCount: 32, totalBytes: 33554432 }, commands: ["workspace_create", "workspace_recover"] };
+      if (command === "workspace_protocol_activate") return { activationId: "activation-1" };
+      if (command === "workspace_create") return binding;
       if (command === "workspace_recover") return [binding];
-      if (command === "workspace_create" || command === "workspace_restart") return binding;
       return undefined;
     });
     const client = createWorkspaceClient(invoke);
+    const recoveringClient = createWorkspaceClient(invoke);
 
-    await expect(client.list()).resolves.toEqual([profile]);
-    await expect(client.create(profile, tabId)).resolves.toEqual(binding);
-    await expect(client.select(workspaceId)).resolves.toBeUndefined();
-    await expect(client.close(workspaceId)).resolves.toBeUndefined();
-    await expect(client.restart(workspaceId)).resolves.toEqual(binding);
-    await expect(client.recover()).resolves.toEqual([binding]);
+    await expect(Promise.all([client.create(profile, tabId), recoveringClient.recover()])).resolves.toEqual([binding, [binding]]);
 
     expect(invoke.mock.calls).toEqual([
-      ["workspace_list"],
-      ["workspace_create", { profile, tabId }],
-      ["workspace_select", { workspaceId }],
-      ["workspace_close", { workspaceId }],
-      ["workspace_restart", { workspaceId }],
-      ["workspace_recover"],
+      ["workspace_protocol_negotiate", { outputAdoption: [1] }],
+      ["workspace_protocol_activate", { bootId: "boot-1", version: 1, consumerInstanceId: "workspace-ui-v1" }],
+      ["workspace_create", { profile, tabId, protocol: { version: 1, activationId: "activation-1" } }],
+      ["workspace_recover", { protocol: { version: 1, activationId: "activation-1" } }],
     ]);
-    expect(invoke).not.toHaveBeenCalledWith("pty_spawn", expect.anything());
+  });
+
+  it("fails closed without creating or recovering when negotiation is unsupported", async () => {
+    const invoke = vi.fn(async (command: string) => {
+      if (command === "workspace_protocol_negotiate") {
+        throw new Error("command not found");
+      }
+      return command === "workspace_create" ? binding : [binding];
+    });
+    const client = createWorkspaceClient(invoke);
+
+    await expect(client.create(profile, tabId)).rejects.toMatchObject({ code: "output-adoption-unsupported", retryable: false });
+    await expect(client.recover()).rejects.toMatchObject({ code: "output-adoption-unsupported" });
+    expect(invoke).not.toHaveBeenCalledWith("workspace_create", expect.anything());
+    expect(invoke).not.toHaveBeenCalledWith("workspace_recover", expect.anything());
+  });
+
+  it("requires exact negotiated limits and commands before activation", async () => {
+    const exactLimits = { perRouteBytes: 1048576, routeCount: 32, totalBytes: 33554432 };
+    const exactCommands = ["workspace_create", "workspace_recover"];
+    for (const [limits, commands] of [[undefined, exactCommands], [{}, exactCommands], [{ ...exactLimits, perRouteBytes: 1 }, exactCommands], [{ ...exactLimits, routeCount: 1 }, exactCommands], [{ ...exactLimits, totalBytes: 1 }, exactCommands], [exactLimits, undefined], [exactLimits, []], [exactLimits, ["workspace_create"]], [exactLimits, ["workspace_recover"]]]) {
+      const invoke = vi.fn(async (command: string) => command === "workspace_protocol_negotiate" ? { bootId: "boot-invalid", selected: 1, limits, commands } : binding);
+      const client = createWorkspaceClient(invoke);
+
+      await expect(Promise.all([client.create(profile, tabId), client.recover()])).rejects.toMatchObject({ code: "output-adoption-unsupported" });
+      expect(invoke.mock.calls).toEqual([["workspace_protocol_negotiate", { outputAdoption: [1] }]]);
+    }
   });
 
   it("keeps workspace, session, and UI tab identities distinct and validates each boundary", () => {

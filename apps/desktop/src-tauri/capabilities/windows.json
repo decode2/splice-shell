@@ -19,6 +19,8 @@
     "allow-clipboard-read-text",
     "allow-open-path",
     "allow-close-paste-session",
+    "allow-workspace-protocol-negotiate",
+    "allow-workspace-protocol-activate",
     "allow-workspace-list",
     "allow-workspace-create",
     "allow-workspace-select",
