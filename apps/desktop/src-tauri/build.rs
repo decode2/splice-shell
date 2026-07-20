@@ -13,6 +13,13 @@ const TERMINAL_COMMANDS: &[&str] = &[
     "clipboard_read_text",
     "open_path",
     "close_paste_session",
+    "workspace_list",
+    "workspace_create",
+    "workspace_select",
+    "workspace_update",
+    "workspace_close",
+    "workspace_restart",
+    "workspace_recover",
 ];
 
 fn main() {
