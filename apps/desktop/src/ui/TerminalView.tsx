@@ -26,6 +26,7 @@ type TerminalViewProps = {
   onTextPaste?: (text: string) => void | Promise<void>;
   onResize?: (size: { cols: number; rows: number }) => void;
   onPtyReady?: (sessionId: number) => void;
+  adoptedSessionId?: number;
 };
 
 // Presentational shell for a single terminal tab. All PTY session lifecycle
@@ -43,6 +44,7 @@ export function TerminalView({
   onTextPaste,
   onPtyReady,
   onResize,
+  adoptedSessionId,
 }: TerminalViewProps) {
   const { terminalElementRef } = usePtySession({
     active,
@@ -54,6 +56,7 @@ export function TerminalView({
     onTextPaste,
     onPtyReady,
     onResize,
+    adoptedSessionId,
   });
 
   return (

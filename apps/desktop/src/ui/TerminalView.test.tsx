@@ -371,6 +371,46 @@ describe("TerminalView PTY lifecycle", () => {
     expect(getInvokeCallsFor("pty_kill").length).toBeGreaterThanOrEqual(1);
     expect(mocks.terminalDispose.mock.calls.length).toBeGreaterThanOrEqual(1);
   });
+
+  it("adopts a backend-owned session across StrictMode without spawning or killing it", async () => {
+    const onPtyReady = vi.fn<(sessionId: number) => void>();
+    const { unmount } = render(
+      <React.StrictMode>
+        <TerminalView adoptedSessionId={42} onPtyReady={onPtyReady} />
+      </React.StrictMode>,
+    );
+
+    await waitFor(() => {
+      expect(onPtyReady).toHaveBeenCalledWith(42);
+    });
+    expect(onPtyReady).toHaveBeenCalledTimes(1);
+
+    expect(getInvokeCallsFor("pty_spawn")).toHaveLength(0);
+
+    emitPtyOutput(42, "backend-owned output\r\n");
+    await waitFor(() => {
+      expect(mocks.terminalWrite).toHaveBeenCalledWith("backend-owned output\r\n");
+    });
+
+    act(() => {
+      unmount();
+    });
+
+    expect(getInvokeCallsFor("pty_kill")).toHaveLength(0);
+  });
+
+  it("does not replace an adopted backend session with a generic shell after exit", async () => {
+    render(<TerminalView adoptedSessionId={42} />);
+
+    await waitFor(() => {
+      expect(capturedExitHandlers.length).toBeGreaterThan(0);
+    });
+
+    emitPtyExit(42);
+    await flushAsync();
+
+    expect(getInvokeCallsFor("pty_spawn")).toHaveLength(0);
+  });
 });
 
 describe("TerminalView pty-exit driven restart", () => {

@@ -46,6 +46,7 @@ export type UsePtySessionOptions = {
   onTextPaste?: (text: string) => void | Promise<void>;
   onResize?: (size: { cols: number; rows: number }) => void;
   onPtyReady?: (sessionId: number) => void;
+  adoptedSessionId?: number;
 };
 
 export function createTerminalOptions(
@@ -95,6 +96,7 @@ export function usePtySession({
   onTextPaste,
   onPtyReady,
   onResize,
+  adoptedSessionId,
 }: UsePtySessionOptions) {
   const terminalElementRef = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<Terminal | null>(null);
@@ -174,6 +176,10 @@ export function usePtySession({
     let restartInFlight = false;
     let ptyGeneration = 0;
     let currentSessionId: number | undefined;
+    // Generic sessions are spawned and therefore owned by this view. An adopted
+    // workspace session already belongs to the backend lifecycle controller: the
+    // view may render and write to it, but must never kill or replace it.
+    let ownsCurrentSession = false;
     // Tauri's `pty-output`/`pty-exit` events are GLOBAL: with N mounted
     // TerminalViews, every instance's listeners receive EVERY session's events.
     // `spawnInFlight` scopes this instance's willingness to retain
@@ -400,6 +406,7 @@ export function usePtySession({
         return;
       }
       currentSessionId = spawnedSessionId;
+      ownsCurrentSession = true;
       spawnTime = Date.now();
       ptyGeneration += 1;
       inputClosed = false;
@@ -442,8 +449,17 @@ export function usePtySession({
       closeSpawnWindow();
       reportSessionHealth("healthy");
     };
+    const adoptPty = (sessionId: number) => {
+      currentSessionId = sessionId;
+      ownsCurrentSession = false;
+      spawnTime = Date.now();
+      ptyGeneration += 1;
+      inputClosed = false;
+      handlersRef.current.onPtyReady?.(sessionId);
+      reportSessionHealth("healthy");
+    };
     const restartPty = async () => {
-      if (disposed) {
+      if (disposed || !ownsCurrentSession) {
         return;
       }
 
@@ -598,7 +614,9 @@ export function usePtySession({
 
       if (payload === currentSessionId) {
         inputClosed = true;
-        void restartPty();
+        if (ownsCurrentSession) {
+          void restartPty();
+        }
         return;
       }
 
@@ -760,9 +778,13 @@ export function usePtySession({
         unlistenPtyOutput = outputUnlisten;
         unlistenPtyExit = exitUnlisten;
         unlistenPtyStall = stallUnlisten;
-        void startPty().catch((error) => {
-          terminal.write(`\r\nFailed to start ConPTY session: ${String(error)}\r\n`);
-        });
+        if (adoptedSessionId !== undefined) {
+          adoptPty(adoptedSessionId);
+        } else {
+          void startPty().catch((error) => {
+            terminal.write(`\r\nFailed to start ConPTY session: ${String(error)}\r\n`);
+          });
+        }
       })
       .catch((error) => {
         terminal.write(`\r\nFailed to subscribe to PTY events: ${String(error)}\r\n`);
@@ -779,10 +801,11 @@ export function usePtySession({
       unlistenPtyOutput?.();
       unlistenPtyExit?.();
       unlistenPtyStall?.();
-      // Only kill a session that was actually recorded. A spawn still in flight
-      // at teardown is handled by `startPty`'s post-await disposed check, which
+      // Only kill a recorded session this view spawned. Adopted sessions remain
+      // owned by the backend lifecycle controller. A spawn still in flight at
+      // teardown is handled by `startPty`'s post-await disposed check, which
       // kills the orphan by its resolved id.
-      if (currentSessionId !== undefined) {
+      if (ownsCurrentSession && currentSessionId !== undefined) {
         void killPty(currentSessionId);
       }
       fileLinkProvider.dispose();
