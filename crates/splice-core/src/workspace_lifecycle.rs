@@ -1,8 +1,8 @@
 use crate::{WorkspaceError, WorkspaceId, WorkspaceProfile, WorkspaceStore};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct SessionId(u64);
 
 impl SessionId {
@@ -17,7 +17,7 @@ impl SessionId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TabId(String);
 
 impl TabId {
@@ -28,7 +28,7 @@ impl TabId {
             .ok_or(WorkspaceLifecycleError::InvalidTabId)
     }
 
-    fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &str {
         &self.0
     }
 }
@@ -67,6 +67,7 @@ impl SessionLifecycleError {
 pub trait SessionLifecyclePort {
     fn start(&mut self, profile: &WorkspaceProfile) -> Result<SessionId, SessionLifecycleError>;
     fn close(&mut self, session: SessionId) -> Result<(), SessionLifecycleError>;
+    fn runtime_id(&self) -> String;
 }
 
 #[derive(Debug)]
@@ -124,17 +125,29 @@ fn contract(code: &str, message: &str, retryable: bool) -> LifecycleError {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WorkspaceBinding {
     pub workspace_id: WorkspaceId,
     pub tab_id: TabId,
     pub session_id: SessionId,
 }
 
+#[derive(Clone)]
+/// A definitively terminated PTY awaiting a successful persistence update.
+///
+/// This state is process-local: if the process exits before the store accepts
+/// the update, reconstruction can recover only the durable lifecycle intent.
+struct PendingTermination {
+    session_id: SessionId,
+    tab_id: TabId,
+}
+
 pub struct WorkspaceController<P> {
     store: WorkspaceStore,
     sessions: P,
     bindings: BTreeMap<WorkspaceId, WorkspaceBinding>,
+    pending_terminations: BTreeMap<WorkspaceId, PendingTermination>,
     selected: Option<WorkspaceId>,
 }
 
@@ -144,6 +157,7 @@ impl<P: SessionLifecyclePort> WorkspaceController<P> {
             store,
             sessions,
             bindings: BTreeMap::new(),
+            pending_terminations: BTreeMap::new(),
             selected: None,
         }
     }
@@ -165,20 +179,34 @@ impl<P: SessionLifecyclePort> WorkspaceController<P> {
         mut profile: WorkspaceProfile,
         tab_id: TabId,
     ) -> Result<WorkspaceBinding, WorkspaceLifecycleError> {
+        self.reconcile_pending_termination(&profile.id)?;
         if let Some(existing) = self.store.load(&profile.id)? {
+            let existing_id = existing.id.clone();
             let retrying_live_binding = self
                 .bindings
                 .get(&existing.id)
                 .is_some_and(|binding| binding.tab_id == tab_id);
-            if existing.lifecycle_tab_id.as_deref() != Some(tab_id.as_str())
+            if existing.lifecycle_desired_open
+                && existing.lifecycle_tab_id.as_deref() != Some(tab_id.as_str())
                 && !retrying_live_binding
             {
                 return Err(WorkspaceLifecycleError::Conflict(profile.id));
             }
-            return self.start(&existing.id, tab_id);
+            if !existing.lifecycle_desired_open {
+                profile = existing;
+                profile.lifecycle_desired_open = true;
+                profile.lifecycle_tab_id = Some(tab_id.as_str().to_owned());
+                clear_runtime_association(&mut profile);
+                self.store.save(&profile)?;
+            }
+            return self.start(&existing_id, tab_id);
         }
         profile.session_ids.clear();
+        profile.lifecycle_desired_open = true;
         profile.lifecycle_tab_id = Some(tab_id.as_str().to_owned());
+        profile.lifecycle_runtime_id = None;
+        profile.lifecycle_closing_session_id = None;
+        profile.lifecycle_closing_runtime_id = None;
         self.store.save(&profile)?;
         let binding = self.start(&profile.id, tab_id)?;
         self.selected = Some(binding.workspace_id.clone());
@@ -186,59 +214,71 @@ impl<P: SessionLifecyclePort> WorkspaceController<P> {
     }
 
     pub fn select(&mut self, id: &WorkspaceId) -> Result<(), WorkspaceLifecycleError> {
+        self.reconcile_pending_termination(id)?;
         self.require_profile(id)?;
         self.selected = Some(id.clone());
         Ok(())
     }
 
     pub fn update(&mut self, mut profile: WorkspaceProfile) -> Result<(), WorkspaceLifecycleError> {
+        self.reconcile_pending_termination(&profile.id)?;
         let current = self.require_profile(&profile.id)?;
         profile.session_ids = current.session_ids;
+        profile.lifecycle_desired_open = current.lifecycle_desired_open;
         profile.lifecycle_tab_id = current.lifecycle_tab_id;
+        profile.lifecycle_runtime_id = current.lifecycle_runtime_id;
         profile.lifecycle_closing_session_id = current.lifecycle_closing_session_id;
+        profile.lifecycle_closing_runtime_id = current.lifecycle_closing_runtime_id;
         self.store.save(&profile)?;
         Ok(())
     }
 
     pub fn close(&mut self, id: &WorkspaceId) -> Result<(), WorkspaceLifecycleError> {
+        self.reconcile_pending_termination(id)?;
         let mut profile = self.require_profile(id)?;
-        let closing_session = profile
+        let runtime_id = self.sessions.runtime_id();
+        let binding_session = self.bindings.get(id).map(|binding| binding.session_id);
+        let persisted_close = profile
             .lifecycle_closing_session_id
             .map(SessionId::new)
-            .transpose()?
-            .or_else(|| self.bindings.get(id).map(|binding| binding.session_id));
+            .transpose()?;
+        let closing_session = binding_session.or_else(|| {
+            (profile.lifecycle_closing_runtime_id.as_deref() == Some(runtime_id.as_str()))
+                .then_some(persisted_close)
+                .flatten()
+        });
+        profile.lifecycle_desired_open = false;
+        profile.lifecycle_tab_id = None;
         if let Some(session_id) = closing_session {
-            if profile.lifecycle_closing_session_id.is_none() {
-                let binding = self.bindings.get(id).expect("a live session has a binding");
+            if binding_session.is_some() {
                 profile.session_ids = vec![session_id.get()];
-                profile.lifecycle_tab_id = Some(binding.tab_id.as_str().to_owned());
+                profile.lifecycle_runtime_id = Some(runtime_id.clone());
                 profile.lifecycle_closing_session_id = Some(session_id.get());
+                profile.lifecycle_closing_runtime_id = Some(runtime_id);
                 self.store.save(&profile)?;
+            } else if profile.lifecycle_closing_runtime_id.as_deref() != Some(runtime_id.as_str()) {
+                clear_runtime_association(&mut profile);
+                self.store.save(&profile)?;
+                self.bindings.remove(id);
+                return self.clear_selection(id);
             }
             if let Err(error) = self.sessions.close(session_id) {
                 if !error.closes_convergently() {
                     return Err(WorkspaceLifecycleError::Session(error));
                 }
             }
-            profile.session_ids.clear();
-            profile.lifecycle_tab_id = None;
-            profile.lifecycle_closing_session_id = None;
+            clear_runtime_association(&mut profile);
+            self.store.save(&profile)?;
+            self.bindings.remove(id);
+        } else {
+            clear_runtime_association(&mut profile);
             self.store.save(&profile)?;
             self.bindings.remove(id);
         }
-        self.reconcile_close(id)
+        self.clear_selection(id)
     }
 
-    fn reconcile_close(&mut self, id: &WorkspaceId) -> Result<(), WorkspaceLifecycleError> {
-        let mut profile = self.require_profile(id)?;
-        if !profile.session_ids.is_empty()
-            && profile.lifecycle_closing_session_id.is_none()
-            && !self.bindings.contains_key(id)
-        {
-            profile.session_ids.clear();
-            profile.lifecycle_tab_id = None;
-            self.store.save(&profile)?;
-        }
+    fn clear_selection(&mut self, id: &WorkspaceId) -> Result<(), WorkspaceLifecycleError> {
         if self.selected.as_ref() == Some(id) {
             self.selected = None;
         }
@@ -249,6 +289,7 @@ impl<P: SessionLifecyclePort> WorkspaceController<P> {
         &mut self,
         id: &WorkspaceId,
     ) -> Result<WorkspaceBinding, WorkspaceLifecycleError> {
+        self.reconcile_pending_termination(id)?;
         let profile = self.require_profile(id)?;
         let tab_id = self
             .bindings
@@ -269,6 +310,7 @@ impl<P: SessionLifecyclePort> WorkspaceController<P> {
             self.close(id)?;
         }
         let mut profile = self.require_profile(id)?;
+        profile.lifecycle_desired_open = true;
         profile.lifecycle_tab_id = Some(tab_id.as_str().to_owned());
         self.store.save(&profile)?;
         let binding = self.start(id, tab_id)?;
@@ -280,18 +322,92 @@ impl<P: SessionLifecyclePort> WorkspaceController<P> {
 
     pub fn recover(&mut self) -> Result<Vec<WorkspaceBinding>, WorkspaceLifecycleError> {
         let mut first_error = None;
+        let runtime_id = self.sessions.runtime_id();
+        let profiles = self.store.list()?;
+        let pending_ids = self
+            .pending_terminations
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let mut cleaned_ids = BTreeSet::new();
+
+        for profile in &profiles {
+            if self.bindings.contains_key(&profile.id) || pending_ids.contains(&profile.id) {
+                continue;
+            }
+            let actionable = profile.lifecycle_runtime_id.as_deref() == Some(runtime_id.as_str())
+                || profile.lifecycle_closing_runtime_id.as_deref() == Some(runtime_id.as_str());
+            if !actionable {
+                continue;
+            }
+            let mut all_sessions_closed = true;
+            for session in &profile.session_ids {
+                let session = SessionId::new(*session)?;
+                match self.sessions.close(session) {
+                    Ok(()) => {}
+                    Err(error) if error.closes_convergently() => {}
+                    Err(error) => {
+                        all_sessions_closed = false;
+                        first_error.get_or_insert(WorkspaceLifecycleError::Session(error));
+                    }
+                }
+            }
+            if all_sessions_closed {
+                cleaned_ids.insert(profile.id.clone());
+            }
+        }
+
+        let blocked_ids = profiles
+            .iter()
+            .filter(|profile| {
+                !self.bindings.contains_key(&profile.id)
+                    && !pending_ids.contains(&profile.id)
+                    && (profile.lifecycle_runtime_id.as_deref() == Some(runtime_id.as_str())
+                        || profile.lifecycle_closing_runtime_id.as_deref()
+                            == Some(runtime_id.as_str()))
+                    && !cleaned_ids.contains(&profile.id)
+                    && !profile.session_ids.is_empty()
+            })
+            .map(|profile| profile.id.clone())
+            .collect::<BTreeSet<_>>();
+
+        self.store.update_all(|profiles| {
+            for profile in profiles.values_mut() {
+                migrate_legacy_intent(profile);
+                let stale_active = !profile.session_ids.is_empty()
+                    && profile.lifecycle_runtime_id.as_deref() != Some(runtime_id.as_str());
+                let stale_close = profile.lifecycle_closing_session_id.is_some()
+                    && profile.lifecycle_closing_runtime_id.as_deref() != Some(runtime_id.as_str());
+                if pending_ids.contains(&profile.id)
+                    || cleaned_ids.contains(&profile.id)
+                    || (!blocked_ids.contains(&profile.id) && (stale_active || stale_close))
+                {
+                    clear_runtime_association(profile);
+                    if stale_close {
+                        profile.lifecycle_desired_open = false;
+                        profile.lifecycle_tab_id = None;
+                    }
+                }
+            }
+        })?;
+        for id in pending_ids {
+            self.pending_terminations.remove(&id);
+        }
+
         for profile in self.store.list()? {
-            let result = if profile.lifecycle_closing_session_id.is_some() {
-                self.close(&profile.id)
-            } else if profile.session_ids.is_empty() && profile.lifecycle_tab_id.is_none() {
-                Ok(())
-            } else {
-                let tab_id = profile
-                    .lifecycle_tab_id
-                    .as_deref()
-                    .unwrap_or(profile.id.as_str());
-                self.start(&profile.id, TabId::new(tab_id)?).map(drop)
-            };
+            if blocked_ids.contains(&profile.id)
+                || self.bindings.contains_key(&profile.id)
+                || !profile.lifecycle_desired_open
+            {
+                continue;
+            }
+            let result = profile
+                .lifecycle_tab_id
+                .as_deref()
+                .map(TabId::new)
+                .transpose()?
+                .ok_or_else(|| WorkspaceLifecycleError::NotFound(profile.id.clone()))
+                .and_then(|tab_id| self.start(&profile.id, tab_id).map(drop));
             if let Err(error) = result {
                 first_error.get_or_insert(error);
             }
@@ -299,17 +415,74 @@ impl<P: SessionLifecyclePort> WorkspaceController<P> {
         first_error.map_or_else(|| Ok(self.bindings()), Err)
     }
 
+    /// Converge controller state after a PTY ended outside the controller's
+    /// explicit `close` path. The callback is id-scoped and idempotent: a stale
+    /// exit notification cannot remove a newer binding for the same workspace.
+    pub fn reconcile_terminated_session(
+        &mut self,
+        session_id: SessionId,
+    ) -> Result<(), WorkspaceLifecycleError> {
+        let Some(binding) = self
+            .bindings
+            .values()
+            .find(|binding| binding.session_id == session_id)
+            .cloned()
+        else {
+            let pending_workspace = self
+                .pending_terminations
+                .iter()
+                .find(|(_, pending)| pending.session_id == session_id)
+                .map(|(id, _)| id.clone());
+            return pending_workspace.map_or(Ok(()), |id| self.reconcile_pending_termination(&id));
+        };
+
+        // PTY teardown is already definitive. Remove the binding before
+        // persistence so no later lifecycle operation can return this dead ID.
+        let workspace_id = binding.workspace_id.clone();
+        self.bindings.remove(&workspace_id);
+        self.pending_terminations.insert(
+            workspace_id.clone(),
+            PendingTermination {
+                session_id,
+                tab_id: binding.tab_id.clone(),
+            },
+        );
+        self.reconcile_pending_termination(&workspace_id)
+    }
+
+    fn reconcile_pending_termination(
+        &mut self,
+        id: &WorkspaceId,
+    ) -> Result<(), WorkspaceLifecycleError> {
+        let Some(pending) = self.pending_terminations.get(id).cloned() else {
+            return Ok(());
+        };
+        let mut profile = self.require_profile(id)?;
+        clear_runtime_association(&mut profile);
+        profile.lifecycle_desired_open = true;
+        // Retain the tab identity as restart intent. A subsequent create or
+        // restart then starts a new session rather than returning the dead id.
+        profile.lifecycle_tab_id = Some(pending.tab_id.as_str().to_owned());
+        self.store.save(&profile)?;
+        self.pending_terminations.remove(id);
+        Ok(())
+    }
+
     fn start(
         &mut self,
         id: &WorkspaceId,
         tab_id: TabId,
     ) -> Result<WorkspaceBinding, WorkspaceLifecycleError> {
+        self.reconcile_pending_termination(id)?;
         if let Some(binding) = self.bindings.get(id) {
             let mut profile = self.require_profile(id)?;
             if !profile.session_ids.contains(&binding.session_id.get()) {
                 profile.session_ids = vec![binding.session_id.get()];
-                profile.lifecycle_tab_id = Some(binding.tab_id.as_str().to_owned());
+                profile.lifecycle_desired_open = false;
+                profile.lifecycle_tab_id = None;
+                profile.lifecycle_runtime_id = Some(self.sessions.runtime_id());
                 profile.lifecycle_closing_session_id = Some(binding.session_id.get());
+                profile.lifecycle_closing_runtime_id = profile.lifecycle_runtime_id.clone();
                 self.store.save(&profile)?;
             }
             return Ok(binding.clone());
@@ -320,7 +493,11 @@ impl<P: SessionLifecyclePort> WorkspaceController<P> {
             .start(&profile)
             .map_err(WorkspaceLifecycleError::Session)?;
         profile.session_ids = vec![session_id.get()];
-        profile.lifecycle_tab_id = None;
+        profile.lifecycle_desired_open = true;
+        profile.lifecycle_tab_id = Some(tab_id.as_str().to_owned());
+        profile.lifecycle_runtime_id = Some(self.sessions.runtime_id());
+        profile.lifecycle_closing_session_id = None;
+        profile.lifecycle_closing_runtime_id = None;
         if let Err(error) = self.store.save(&profile) {
             if let Err(close) = self.sessions.close(session_id) {
                 let binding = WorkspaceBinding {
@@ -352,5 +529,24 @@ impl<P: SessionLifecyclePort> WorkspaceController<P> {
         self.store
             .load(id)?
             .ok_or_else(|| WorkspaceLifecycleError::NotFound(id.clone()))
+    }
+}
+
+fn clear_runtime_association(profile: &mut WorkspaceProfile) {
+    profile.session_ids.clear();
+    profile.lifecycle_runtime_id = None;
+    profile.lifecycle_closing_session_id = None;
+    profile.lifecycle_closing_runtime_id = None;
+}
+
+fn migrate_legacy_intent(profile: &mut WorkspaceProfile) {
+    if !profile.lifecycle_desired_open
+        && profile.lifecycle_closing_session_id.is_none()
+        && (profile.lifecycle_tab_id.is_some() || !profile.session_ids.is_empty())
+    {
+        profile.lifecycle_desired_open = true;
+        profile
+            .lifecycle_tab_id
+            .get_or_insert_with(|| profile.id.as_str().to_owned());
     }
 }

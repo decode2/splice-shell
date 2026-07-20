@@ -10,6 +10,9 @@ use std::{
 const SCHEMA_VERSION: u32 = 1;
 const STORE_FILE: &str = "workspace-profiles.v1.json";
 const LOCK_FILE: &str = "workspace-profiles.v1.lock";
+fn is_false(value: &bool) -> bool {
+    !value
+}
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct WorkspaceId(String);
@@ -71,10 +74,16 @@ pub struct WorkspaceProfile {
     pub environment: EnvironmentMetadata,
     pub agent: AgentDescriptor,
     pub session_ids: Vec<u64>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub lifecycle_desired_open: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifecycle_tab_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_runtime_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifecycle_closing_session_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_closing_runtime_id: Option<String>,
 }
 impl WorkspaceProfile {
     pub fn new(
@@ -101,8 +110,11 @@ impl WorkspaceProfile {
             environment,
             agent,
             session_ids: session_ids.into_iter().collect(),
+            lifecycle_desired_open: false,
             lifecycle_tab_id: None,
+            lifecycle_runtime_id: None,
             lifecycle_closing_session_id: None,
+            lifecycle_closing_runtime_id: None,
         })
     }
 }
@@ -157,6 +169,31 @@ impl WorkspaceStore {
         database
             .profiles
             .insert(profile.id.clone(), profile.clone());
+        if !valid_database(&database) {
+            return Err(WorkspaceError::InvalidProfile);
+        }
+        self.write(&database)
+    }
+
+    /// Applies a complete lifecycle normalization under one store lock and one
+    /// database write. Recovery uses this before it asks a runtime for IDs.
+    pub fn update_all(
+        &self,
+        update: impl FnOnce(&mut BTreeMap<WorkspaceId, WorkspaceProfile>),
+    ) -> Result<(), WorkspaceError> {
+        fs::create_dir_all(&self.root)?;
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.root.join(LOCK_FILE))?;
+        lock.lock_exclusive()?;
+        let mut database = self.read()?.unwrap_or(Database {
+            schema_version: SCHEMA_VERSION,
+            profiles: BTreeMap::new(),
+        });
+        update(&mut database.profiles);
         if !valid_database(&database) {
             return Err(WorkspaceError::InvalidProfile);
         }
@@ -283,12 +320,24 @@ fn valid_profile(profile: &WorkspaceProfile) -> bool {
         && valid_label(&profile.agent.id)
         && valid_command(&profile.agent.command)
         && profile.session_ids.iter().all(|id| *id != 0)
+        && (!profile.lifecycle_desired_open || profile.lifecycle_tab_id.is_some())
         && profile.lifecycle_tab_id.as_deref().is_none_or(valid_label)
+        && profile
+            .lifecycle_runtime_id
+            .as_deref()
+            .is_none_or(|runtime_id| !profile.session_ids.is_empty() && valid_label(runtime_id))
         && profile
             .lifecycle_closing_session_id
             .is_none_or(|id| id != 0 && profile.session_ids.contains(&id))
+        && profile
+            .lifecycle_closing_runtime_id
+            .as_deref()
+            .is_none_or(|runtime_id| {
+                profile.lifecycle_closing_session_id.is_some() && valid_label(runtime_id)
+            })
         && profile.session_ids.iter().collect::<BTreeSet<_>>().len() == profile.session_ids.len()
 }
+
 fn valid_database(database: &Database) -> bool {
     let mut session_ids = BTreeSet::new();
     database.profiles.iter().all(|(id, profile)| {
@@ -297,6 +346,7 @@ fn valid_database(database: &Database) -> bool {
             && profile
                 .session_ids
                 .iter()
+                .filter(|session| profile.lifecycle_closing_session_id != Some(**session))
                 .all(|session| session_ids.insert(session))
     })
 }
