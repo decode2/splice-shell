@@ -830,7 +830,6 @@ fn reconcile_desktop_workspace_session(
 }
 
 #[tauri::command]
-#[allow(dead_code)]
 fn workspace_list(
     state: State<'_, DesktopWorkspaceState>,
 ) -> Result<Vec<WorkspaceProfile>, LifecycleError> {
@@ -838,7 +837,6 @@ fn workspace_list(
 }
 
 #[tauri::command]
-#[allow(dead_code)]
 fn workspace_create(
     state: State<'_, DesktopWorkspaceState>,
     profile: WorkspaceProfile,
@@ -848,7 +846,6 @@ fn workspace_create(
 }
 
 #[tauri::command]
-#[allow(dead_code)]
 fn workspace_select(
     state: State<'_, DesktopWorkspaceState>,
     workspace_id: String,
@@ -857,7 +854,6 @@ fn workspace_select(
 }
 
 #[tauri::command]
-#[allow(dead_code)]
 fn workspace_update(
     state: State<'_, DesktopWorkspaceState>,
     profile: WorkspaceProfile,
@@ -866,7 +862,6 @@ fn workspace_update(
 }
 
 #[tauri::command]
-#[allow(dead_code)]
 fn workspace_close(
     state: State<'_, DesktopWorkspaceState>,
     workspace_id: String,
@@ -875,7 +870,6 @@ fn workspace_close(
 }
 
 #[tauri::command]
-#[allow(dead_code)]
 fn workspace_restart(
     state: State<'_, DesktopWorkspaceState>,
     workspace_id: String,
@@ -884,7 +878,6 @@ fn workspace_restart(
 }
 
 #[tauri::command]
-#[allow(dead_code)]
 fn workspace_recover(
     state: State<'_, DesktopWorkspaceState>,
 ) -> Result<Vec<WorkspaceBinding>, LifecycleError> {
@@ -1254,7 +1247,14 @@ pub fn run() {
             clipboard_write_text,
             clipboard_read_text,
             open_path,
-            close_paste_session
+            close_paste_session,
+            workspace_list,
+            workspace_create,
+            workspace_select,
+            workspace_update,
+            workspace_close,
+            workspace_restart,
+            workspace_recover
         ])
         .build(tauri::generate_context!())
         .expect("failed to build Splice Shell desktop app");

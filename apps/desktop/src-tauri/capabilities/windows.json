@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main-terminal-windows",
-  "description": "Allows the main window to invoke the finite terminal command set on Windows.",
+  "description": "Allows the main window to invoke the finite terminal and workspace command set on Windows.",
   "windows": ["main"],
   "platforms": ["windows"],
   "permissions": [
@@ -18,6 +18,13 @@
     "allow-clipboard-write-text",
     "allow-clipboard-read-text",
     "allow-open-path",
-    "allow-close-paste-session"
+    "allow-close-paste-session",
+    "allow-workspace-list",
+    "allow-workspace-create",
+    "allow-workspace-select",
+    "allow-workspace-update",
+    "allow-workspace-close",
+    "allow-workspace-restart",
+    "allow-workspace-recover"
   ]
 }

@@ -67,3 +67,38 @@ commands.allow = ["open_path"]
 identifier = "allow-close-paste-session"
 description = "Allows the close_paste_session command."
 commands.allow = ["close_paste_session"]
+
+[[permission]]
+identifier = "allow-workspace-list"
+description = "Allows the workspace_list command."
+commands.allow = ["workspace_list"]
+
+[[permission]]
+identifier = "allow-workspace-create"
+description = "Allows the workspace_create command."
+commands.allow = ["workspace_create"]
+
+[[permission]]
+identifier = "allow-workspace-select"
+description = "Allows the workspace_select command."
+commands.allow = ["workspace_select"]
+
+[[permission]]
+identifier = "allow-workspace-update"
+description = "Allows the workspace_update command."
+commands.allow = ["workspace_update"]
+
+[[permission]]
+identifier = "allow-workspace-close"
+description = "Allows the workspace_close command."
+commands.allow = ["workspace_close"]
+
+[[permission]]
+identifier = "allow-workspace-restart"
+description = "Allows the workspace_restart command."
+commands.allow = ["workspace_restart"]
+
+[[permission]]
+identifier = "allow-workspace-recover"
+description = "Allows the workspace_recover command."
+commands.allow = ["workspace_recover"]
