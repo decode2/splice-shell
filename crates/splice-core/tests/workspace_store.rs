@@ -283,6 +283,7 @@ fn rejects_unknown_schema_without_replacing_the_existing_store() {
 #[test]
 fn loads_legacy_profiles_without_runtime_or_durable_intent_fields() {
     let root = temp_root("legacy-lifecycle-defaults");
+    let canonical_root = std::fs::canonicalize(&root).unwrap();
     let path = root.join("workspace-profiles.v1.json");
     let legacy = serde_json::json!({
         "schema_version": 1,
@@ -290,7 +291,7 @@ fn loads_legacy_profiles_without_runtime_or_durable_intent_fields() {
             "alpha": {
                 "id": "alpha",
                 "name": "alpha",
-                "working_directory": root,
+                "working_directory": canonical_root,
                 "environment": { "profile": "development", "variable_names": ["PATH"] },
                 "agent": { "id": "codex", "command": "codex" },
                 "session_ids": []
@@ -304,6 +305,6 @@ fn loads_legacy_profiles_without_runtime_or_durable_intent_fields() {
             .unwrap()
             .load(&WorkspaceId::new("alpha").unwrap())
             .unwrap(),
-        Some(profile("alpha", root, vec![]))
+        Some(profile("alpha", canonical_root, vec![]))
     );
 }
