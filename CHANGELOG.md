@@ -1,5 +1,46 @@
 # Changelog
 
+## [0.3.0](https://github.com/decode2/splice-shell/compare/v0.2.0...v0.3.0) (2026-07-20)
+
+
+### Features
+
+* **compat:** add AI CLI compatibility harness ([42fcaf3](https://github.com/decode2/splice-shell/commit/42fcaf3ddf6d8a111c8c8af4a4e489dc55bbfc52))
+* **compat:** add finite AI CLI compatibility harness ([1c02999](https://github.com/decode2/splice-shell/commit/1c02999a75f2e120f971648f05535dc4c0640287))
+* **platform:** add target-aware desktop services ([0ac54b8](https://github.com/decode2/splice-shell/commit/0ac54b85523852836e2f4ba273390883eca51841))
+* **platform:** add target-aware desktop services ([bd373ab](https://github.com/decode2/splice-shell/commit/bd373ab5f886c5ecddddf2bda89e95c5292b8eb5))
+* **platform:** enforce Tauri command authority ([1843218](https://github.com/decode2/splice-shell/commit/18432184d4466e5c4c3b80e89f12ca40520f13de))
+* **platform:** enforce Tauri command authority ([85ecd1c](https://github.com/decode2/splice-shell/commit/85ecd1cb02d8b6ed6f412e0102652735eb9d01ba))
+* **platform:** wire target-aware PTY sessions ([be9cbc7](https://github.com/decode2/splice-shell/commit/be9cbc7ae08eb99b96eb0de880190b36afb8816e))
+* **platform:** wire target-aware PTY sessions ([cfa2254](https://github.com/decode2/splice-shell/commit/cfa2254f9e44b2aeb3db26ebce97b053c7543079))
+* **pty:** add platform-neutral session contract ([23af77a](https://github.com/decode2/splice-shell/commit/23af77a0659f1c51c9ed28b596cadfb9dcad5710))
+* **pty:** add platform-neutral session contract ([cf7306b](https://github.com/decode2/splice-shell/commit/cf7306b01114a66b7c53641ef8546ba1f4b31d62))
+* **pty:** add Unix PTY spawn and I/O ([4acd330](https://github.com/decode2/splice-shell/commit/4acd330acae69282b2b652454a21227ca9a546d4))
+* **pty:** add Unix PTY spawn and I/O ([f0a2baf](https://github.com/decode2/splice-shell/commit/f0a2baf6f59c67d04e124d84cb437d438b32878c))
+* **pty:** harden Unix PTY lifecycle ([7a3b65d](https://github.com/decode2/splice-shell/commit/7a3b65d2f96beee37c9b506af101b4cb24bd99c5))
+* **pty:** harden Unix PTY lifecycle ([f18e59d](https://github.com/decode2/splice-shell/commit/f18e59d6ca0f69f0c5de62dc344844fa7a628362))
+* **workspace:** add lifecycle controller ([907bb8b](https://github.com/decode2/splice-shell/commit/907bb8ba6c4050c5b1e3ba73a1ff61e4a18900c3))
+* **workspace:** add lifecycle controller ([4c3b487](https://github.com/decode2/splice-shell/commit/4c3b487e836196232d2258e1530d9d0eb30dbf87))
+* **workspace:** add lifecycle switcher ([f1506d5](https://github.com/decode2/splice-shell/commit/f1506d5c3b9b859acf3556a7f3721820bf8ffc19))
+* **workspace:** add lifecycle switcher ([f514911](https://github.com/decode2/splice-shell/commit/f51491180dc448d86c18ce3898f10ed1beea62a8))
+* **workspace:** add local profile persistence ([18adad9](https://github.com/decode2/splice-shell/commit/18adad95eb1d8ed83d22b5fb5911042871a83081))
+* **workspace:** add local profile persistence ([e2e60fb](https://github.com/decode2/splice-shell/commit/e2e60fbb5c78feb853aceccce65b3ef4da565580))
+* **workspace:** add typed desktop client ([fc1aeb2](https://github.com/decode2/splice-shell/commit/fc1aeb24da1403d3e72bab4e1c92cafab18ef2e9))
+* **workspace:** add typed desktop client ([7ae5b6b](https://github.com/decode2/splice-shell/commit/7ae5b6b9dfa6e8227de218ac8bc900907c3d7dca))
+* **workspace:** expose lifecycle command authority ([e15a427](https://github.com/decode2/splice-shell/commit/e15a427ae3326a05484fe70305a8f529f59ca553))
+* **workspace:** expose lifecycle command authority ([29d1b64](https://github.com/decode2/splice-shell/commit/29d1b64339874abb86255c60e1294692070c807d))
+* **workspace:** negotiate output adoption ([7c8a3d0](https://github.com/decode2/splice-shell/commit/7c8a3d0b141c35a8ddd41aa08ab3f3547b1718df))
+* **workspace:** negotiate output adoption protocol ([21c6c51](https://github.com/decode2/splice-shell/commit/21c6c512534242936a0d5eedc7223a193d75d031))
+* **workspace:** wire lifecycle commands ([753d0b8](https://github.com/decode2/splice-shell/commit/753d0b8fae9f3f292804c1ad7cbbbfb5d3e91153))
+* **workspace:** wire lifecycle commands ([e9f521d](https://github.com/decode2/splice-shell/commit/e9f521d52c6bf83b8432ce4a681b1531c44d098f))
+
+
+### Bug Fixes
+
+* **compat:** satisfy Windows Clippy ([e9269a9](https://github.com/decode2/splice-shell/commit/e9269a9c9aa4d84100541682e417d2456723d6ac))
+* **workspace:** preserve adopted sessions in strict mode ([5efe328](https://github.com/decode2/splice-shell/commit/5efe328d77f86cfc641c0803e2419e9d5ccddac1))
+* **workspace:** preserve adopted sessions in StrictMode ([c99bf49](https://github.com/decode2/splice-shell/commit/c99bf4953117aeaf707a5f5cc12201fea18c158e))
+
 ## [0.2.0](https://github.com/decode2/splice-shell/compare/v0.1.0...v0.2.0) (2026-07-14)
 
 
