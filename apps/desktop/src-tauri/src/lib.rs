@@ -1315,7 +1315,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("splice-workspace-command-{name}"));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("working")).expect("working directory can be created");
-        root
+        std::fs::canonicalize(root).expect("test root can be canonicalized")
     }
 
     fn workspace_test_state(
