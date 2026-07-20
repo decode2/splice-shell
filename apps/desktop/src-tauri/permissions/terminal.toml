@@ -69,6 +69,16 @@ description = "Allows the close_paste_session command."
 commands.allow = ["close_paste_session"]
 
 [[permission]]
+identifier = "allow-workspace-protocol-negotiate"
+description = "Allows the workspace_protocol_negotiate command."
+commands.allow = ["workspace_protocol_negotiate"]
+
+[[permission]]
+identifier = "allow-workspace-protocol-activate"
+description = "Allows the workspace_protocol_activate command."
+commands.allow = ["workspace_protocol_activate"]
+
+[[permission]]
 identifier = "allow-workspace-list"
 description = "Allows the workspace_list command."
 commands.allow = ["workspace_list"]

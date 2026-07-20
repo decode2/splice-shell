@@ -13,6 +13,8 @@ const TERMINAL_COMMANDS: &[&str] = &[
     "clipboard_read_text",
     "open_path",
     "close_paste_session",
+    "workspace_protocol_negotiate",
+    "workspace_protocol_activate",
     "workspace_list",
     "workspace_create",
     "workspace_select",

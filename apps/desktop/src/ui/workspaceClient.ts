@@ -30,6 +30,20 @@ export type WorkspaceLifecycleError = {
   retryable: boolean;
 };
 
+export type WorkspaceProtocolRequest = {
+  version: 1;
+  activationId: string;
+};
+
+type WorkspaceProtocolNegotiation = {
+  bootId: string;
+  selected: number;
+  limits: { perRouteBytes: number; routeCount: number; totalBytes: number };
+  commands: string[];
+};
+
+type WorkspaceProtocolActivation = { activationId: string };
+
 export type WorkspaceCapability = "unknown" | "available" | "unavailable";
 export type WorkspaceUiState = {
   status: "idle" | "loading" | "ready" | "error";
@@ -46,8 +60,56 @@ export type WorkspaceUiAction =
 
 type WorkspaceInvoke = (command: string, args?: Record<string, unknown>) => Promise<unknown>;
 
+const protocolActivationByInvoke = new WeakMap<WorkspaceInvoke, Promise<WorkspaceProtocolRequest>>();
+const protocolLimits = { perRouteBytes: 1024 * 1024, routeCount: 32, totalBytes: 32 * 1024 * 1024 };
+const protocolCommands = ["workspace_create", "workspace_recover"];
+
 const invokeWorkspace: WorkspaceInvoke = (command, args) =>
   args === undefined ? invoke(command) : invoke(command, args);
+
+function unsupportedProtocol(): WorkspaceLifecycleError {
+  return { code: "output-adoption-unsupported", message: "Workspace output adoption protocol v1 is unavailable.", retryable: false };
+}
+
+async function activateWorkspaceProtocol(invokeCommand: WorkspaceInvoke): Promise<WorkspaceProtocolRequest> {
+  let negotiated: WorkspaceProtocolNegotiation;
+  try {
+    negotiated = (await invokeCommand("workspace_protocol_negotiate", {
+      outputAdoption: [1],
+    })) as WorkspaceProtocolNegotiation;
+  } catch {
+    throw unsupportedProtocol();
+  }
+  if (negotiated?.selected !== 1 || typeof negotiated.bootId !== "string" ||
+    Object.entries(protocolLimits).some(([limit, value]) => negotiated.limits?.[limit as keyof typeof protocolLimits] !== value) ||
+    !protocolCommands.every((command) => negotiated.commands?.includes(command))) {
+    throw unsupportedProtocol();
+  }
+
+  let activated: WorkspaceProtocolActivation;
+  try {
+    activated = (await invokeCommand("workspace_protocol_activate", {
+      bootId: negotiated.bootId,
+      version: 1,
+      consumerInstanceId: "workspace-ui-v1",
+    })) as WorkspaceProtocolActivation;
+  } catch {
+    throw unsupportedProtocol();
+  }
+  if (typeof activated?.activationId !== "string" || activated.activationId.length === 0) {
+    throw unsupportedProtocol();
+  }
+  return { version: 1, activationId: activated.activationId };
+}
+
+function workspaceProtocolActivation(invokeCommand: WorkspaceInvoke) {
+  let activation = protocolActivationByInvoke.get(invokeCommand);
+  if (!activation) {
+    activation = activateWorkspaceProtocol(invokeCommand);
+    protocolActivationByInvoke.set(invokeCommand, activation);
+  }
+  return activation;
+}
 
 export function asWorkspaceId(value: string): WorkspaceId {
   if (!/^[a-zA-Z0-9_-]{1,64}$/.test(value)) {
@@ -96,13 +158,20 @@ export function createWorkspaceClient(invokeCommand: WorkspaceInvoke = invokeWor
 
   return {
     list: () => request<WorkspaceProfile[]>("workspace_list"),
-    create: (profile: WorkspaceProfile, tabId: WorkspaceTabId) =>
-      request<WorkspaceBinding>("workspace_create", { profile, tabId }),
+    create: async (profile: WorkspaceProfile, tabId: WorkspaceTabId) =>
+      request<WorkspaceBinding>("workspace_create", {
+        profile,
+        tabId,
+        protocol: await workspaceProtocolActivation(invokeCommand),
+      }),
     select: (workspaceId: WorkspaceId) => request<void>("workspace_select", { workspaceId }),
     close: (workspaceId: WorkspaceId) => request<void>("workspace_close", { workspaceId }),
     restart: (workspaceId: WorkspaceId) =>
       request<WorkspaceBinding>("workspace_restart", { workspaceId }),
-    recover: () => request<WorkspaceBinding[]>("workspace_recover"),
+    recover: async () =>
+      request<WorkspaceBinding[]>("workspace_recover", {
+        protocol: await workspaceProtocolActivation(invokeCommand),
+      }),
   };
 }
 
