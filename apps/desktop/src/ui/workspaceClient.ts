@@ -46,7 +46,8 @@ export type WorkspaceUiAction =
 
 type WorkspaceInvoke = (command: string, args?: Record<string, unknown>) => Promise<unknown>;
 
-const invokeWorkspace: WorkspaceInvoke = (command, args) => invoke(command, args);
+const invokeWorkspace: WorkspaceInvoke = (command, args) =>
+  args === undefined ? invoke(command) : invoke(command, args);
 
 export function asWorkspaceId(value: string): WorkspaceId {
   if (!/^[a-zA-Z0-9_-]{1,64}$/.test(value)) {
@@ -104,3 +105,5 @@ export function createWorkspaceClient(invokeCommand: WorkspaceInvoke = invokeWor
     recover: () => request<WorkspaceBinding[]>("workspace_recover"),
   };
 }
+
+export type WorkspaceClient = ReturnType<typeof createWorkspaceClient>;

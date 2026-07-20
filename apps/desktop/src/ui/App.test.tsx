@@ -123,6 +123,35 @@ describe("App tab mounting", () => {
   });
 });
 
+describe("App workspace controls", () => {
+  it("renders workspace controls separately from terminal tabs without issuing pty_spawn", async () => {
+    mocks.invoke.mockImplementation((command) => {
+      if (command === "active_paste_target") {
+        return Promise.resolve({ processName: "pwsh.exe", adapterName: null, supported: false });
+      }
+      if (command === "workspace_list") {
+        return Promise.resolve([
+          {
+            id: "project-alpha",
+            name: "Project Alpha",
+            working_directory: "/projects/alpha",
+            environment: { profile: "default", variable_names: [] },
+            agent: { id: "generic-tui", command: "bash" },
+            session_ids: [],
+          },
+        ]);
+      }
+      return Promise.resolve(undefined);
+    });
+
+    render(<App />);
+
+    expect(await screen.findByRole("button", { name: "Project Alpha" })).toBeTruthy();
+    expect(mocks.invoke).toHaveBeenCalledWith("workspace_list");
+    expect(mocks.invoke.mock.calls.some(([command]) => command === "pty_spawn")).toBe(false);
+  });
+});
+
 describe("App tab chords (window capture)", () => {
   it("Ctrl+T creates, Ctrl+W closes, and Ctrl+W on the last tab yields a fresh one (app stays open)", async () => {
     render(<App />);
