@@ -14,6 +14,7 @@ import { TerminalSettingsPanel } from "./TerminalSettingsPanel";
 import { DEFAULT_TERMINAL_SETTINGS, type TerminalSettings } from "./terminalSettings";
 import { TitleBar, type SessionHealth } from "./TitleBar";
 import { useSessions } from "./useSessions";
+import { WorkspaceSwitcher } from "./WorkspaceSwitcher";
 
 const TerminalView = lazy(() =>
   import("./TerminalView").then((module) => ({ default: module.TerminalView })),
@@ -212,6 +213,9 @@ export function App() {
         chrome={chrome}
       />
       <div className="terminal-stack">
+        <aside className="workspace-switcher">
+          <WorkspaceSwitcher />
+        </aside>
         <Suspense
           fallback={<div className="terminal-frame terminal-loading">Loading terminal UI…</div>}
         >

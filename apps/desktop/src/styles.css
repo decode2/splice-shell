@@ -78,6 +78,19 @@ body {
   z-index: 0;
 }
 
+.workspace-switcher {
+  position: absolute;
+  top: 0.75rem;
+  right: 0.75rem;
+  z-index: 2;
+  max-width: min(22rem, calc(100% - 1.5rem));
+  max-height: calc(100% - 1.5rem);
+  overflow: auto;
+  padding: 0.75rem;
+  background: #020617;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+}
+
 .terminal-loading {
   padding: 1.5rem;
   color: #94a3b8;
